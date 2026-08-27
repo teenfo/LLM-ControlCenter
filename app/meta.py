@@ -38,8 +38,14 @@ ERROR_CODES: tuple[tuple[str, int, bool], ...] = (
     ("not_found", 404, False),
     ("method_not_allowed", 405, False),
     ("job_running", 409, False),
+    # 같은 id 로 다시 만들려 했다. PK 충돌이 500 으로 나가면 소비자는
+    # "서버가 고장났다" 로 읽고 재시도한다.
+    ("already_exists", 409, False),
     ("payload_too_large", 413, False),
     ("guard_blocked", 422, False),
+    # 측정 없이 규칙을 `block` 으로 켜려 했다. 재시도해도 같으므로 재시도 불가 —
+    # `audit` 로 며칠 재고 오탐률을 낮춘 뒤에야 통과한다.
+    ("promotion_blocked", 409, False),
     ("capacity_impossible", 422, False),
     # 재시도 불가 — 가드가 좁힌 경계나 역할의 internal_only 때문에 어떤 노드로도
     # 갈 수 없다. 관리자도 못 푸는 조건이라 503(재시도 가능)이 아니다.

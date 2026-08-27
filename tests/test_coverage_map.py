@@ -276,6 +276,8 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
             "test_roles_endpoint_lists_only_allowed_roles",
             "test_internal_roles_are_invisible_even_with_wildcard",
             "test_openapi_never_exposes_model_names",
+            # meta·openapi 가 공들여 숨긴 것을 `/v1/status` 가 흘리고 있었다(감사 M20).
+            "test_status_does_not_name_internal_roles_or_nodes",
         ),
     ),
     30: (
@@ -302,6 +304,13 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
             "test_promotion_blocked_when_false_positive_rate_is_high",
             "test_promotion_allowed_when_clean_and_well_sampled",
             "test_promotion_blocked_without_enough_reviews",
+            # 판정 엔드포인트가 있는데 **저장 경로가 강제하지 않으면** 그것은
+            # 게이트가 아니라 안내문이다(감사 M17).
+            "test_a_new_rule_cannot_start_at_block",
+            "test_a_new_rule_can_start_at_a_masking_grade",
+            "test_the_gate_applies_per_boundary",
+            "test_an_unknown_rule_is_judged_as_a_brand_new_one",
+            "test_masking_grades_are_not_gated",
         ),
     ),
     33: (

@@ -40,7 +40,14 @@ from .auth import (
     rotate_token,
 )
 from .cluster import Cluster
-from .config import EXTERNAL, INTERNAL, Config, ConfigError, validate_role_fields
+from .config import (
+    EXTERNAL,
+    INTERNAL,
+    MAX_KEEP_TAIL,
+    Config,
+    ConfigError,
+    validate_role_fields,
+)
 from .cost import CostAccountant
 from .crypto import KeyDestroyed, KeyVault, Sealed
 from .evals import Evaluator
@@ -50,11 +57,24 @@ from .identity import new_salt
 from .models import ModelRegistrar
 from .notify import Notifier, channels_from_env
 from .observability import collect, diagnostic_bundle, render_metrics
-from .pipeline import GUARD_ROLE, Pipeline, Submission, is_public_role
+from .pipeline import (
+    GUARD_ROLE,
+    MAX_WAIT_SECONDS,
+    Pipeline,
+    Submission,
+    is_public_role,
+)
 from .scheduler import Scheduler
 from .store import PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
 
 VERSION = "0.1.0"
+
+#: 요청 본문의 절대 상한(바이트).
+#:
+#: `max_prompt_chars`(기본 200,000자)가 UTF-8 한글이면 최대 600KB 다. 여기에
+#: system 프롬프트와 metadata 여유를 더해 2MB 로 잡는다 — 정상 요청은 절대
+#: 닿지 않고, 메모리를 노린 본문은 파싱 전에 걸린다.
+MAX_BODY_BYTES = 2 * 1024 * 1024
 
 #: 상태 조회는 제출과 다른 한도로 잰다. 대기 중인 소비자가 정상적으로 폴링하는 것을
 #: 제출 한도로 막으면 안 되고, 그렇다고 무제한이면 큐가 길어질 때 컨트롤 플레인이
@@ -271,7 +291,27 @@ def _principal(request: Request) -> Principal:
 
 
 async def _body(request: Request) -> dict[str, Any]:
+    """요청 본문을 dict 로. **크기 상한이 여기 걸린다.**
+
+    `max_prompt_chars` 는 `prompt` 필드에만 적용되고, 그마저도 본문을 전량
+    메모리에 읽은 **뒤에** 검사한다. 그래서 거대한 `metadata` 나 알 수 없는
+    필드로 메모리를 소진시킬 수 있었다 — 인증된 토큰 하나면 충분하다.
+    상한을 파싱 앞에 두면 JSON 디코딩 비용도 안 낸다.
+    """
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
+        raise ApiError(
+            "payload_too_large", status=413,
+            params={"size": length, "limit": str(MAX_BODY_BYTES)},
+        )
+
     raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        # `content-length` 가 없거나 거짓말인 경우(청크 전송). 읽은 뒤에도 본다.
+        raise ApiError(
+            "payload_too_large", status=413,
+            params={"size": str(len(raw)), "limit": str(MAX_BODY_BYTES)},
+        )
     if not raw:
         return {}
     try:
@@ -280,6 +320,52 @@ async def _body(request: Request) -> dict[str, Any]:
         raise ApiError("invalid_json", status=400)
     if not isinstance(parsed, dict):
         raise ApiError("invalid_json", status=400)
+    return parsed
+
+
+def _int(
+    value: Any, field: str, *, default: int = 0,
+    minimum: int | None = None, maximum: int | None = None,
+) -> int:
+    """요청에서 온 정수. **`int()` 를 직접 부르지 않는다.**
+
+    `int("abc")` 의 `ValueError` 가 그대로 올라가면 400 이어야 할 것이 500 이 된다.
+    소비자는 "서버가 고장났다" 로 읽고 재시도하며, 실제로는 자기 요청이 틀린 것이다.
+    오류 계약(§5.4)이 `retryable` 로 분기하라고 못박아 둔 만큼 이 구분이 중요하다.
+    """
+    if value is None or value == "":
+        parsed = default
+    else:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            raise ApiError("invalid_field", status=400, params={"field": field})
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _float(
+    value: Any, field: str, *, default: float = 0.0,
+    minimum: float | None = None, maximum: float | None = None,
+) -> float:
+    """요청에서 온 실수. `_int` 와 같은 이유다."""
+    if value is None or value == "":
+        parsed = default
+    else:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            raise ApiError("invalid_field", status=400, params={"field": field})
+        if parsed != parsed or parsed in (float("inf"), float("-inf")):
+            # NaN·Infinity 는 JSON 으로 다시 나갈 수 없고 비교도 이상하게 돈다.
+            raise ApiError("invalid_field", status=400, params={"field": field})
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
     return parsed
 
 
@@ -365,9 +451,14 @@ async def generate(request: Request) -> Response:
         prompt=str(_need(body, "prompt")),
         system=body.get("system"),
         end_user=body.get("end_user"),
-        priority=int(body.get("priority", 0) or 0),
+        priority=_int(body.get("priority"), "priority", minimum=-100, maximum=100),
         metadata=body.get("metadata") or {},
-        wait=body.get("wait"),
+        # 통합 `wait` 도 요청 값이다 — 여기서 400 으로 걸러야 파이프라인 안에서
+        # `float("조금")` 이 500 으로 터지지 않는다.
+        wait=(
+            None if body.get("wait") is None
+            else _float(body.get("wait"), "wait", minimum=0.0, maximum=MAX_WAIT_SECONDS)
+        ),
     )
     return _submission_response(request, submission)
 
@@ -378,8 +469,14 @@ async def embed(request: Request) -> Response:
     body = await _body(request)
 
     raw = _need(body, "input")
-    inputs = [raw] if isinstance(raw, str) else list(raw)
-    if not all(isinstance(t, str) for t in inputs):
+    # **dict 를 주면 조용히 키 목록이 된다.** `list({"a": 1})` == `["a"]` 이라
+    # 소비자는 자기가 보낸 값과 무관한 임베딩을 받고도 200 을 본다.
+    # 받을 모양을 명시적으로 정하고 나머지는 400 이다.
+    if isinstance(raw, str):
+        inputs = [raw]
+    elif isinstance(raw, list) and all(isinstance(t, str) for t in raw):
+        inputs = list(raw)
+    else:
         raise ApiError("invalid_field", status=400, params={"field": "input"})
 
     result = await ctx.pipeline.embed(
@@ -404,7 +501,7 @@ async def job_get(request: Request) -> Response:
     submission = await ctx.pipeline.wait_for(
         principal.scope(),
         request.path_params["job_id"],
-        seconds=float(wait) if wait else 0.0,
+        seconds=_float(wait, "wait", minimum=0.0, maximum=MAX_WAIT_SECONDS),
     )
     return _submission_response(request, submission)
 
@@ -452,8 +549,12 @@ async def status(request: Request) -> Response:
             "healthy": sum(1 for n in nodes if n["status"] == "healthy"),
             "draining": sum(1 for n in nodes if n["status"] == "draining"),
         },
-        # 자동 복제를 하지 않으므로 사람이 판단할 재료를 준다.
-        "single_homed_roles": ctx.cluster.single_homed_roles(),
+        # **수만 준다.** 원래는 `역할 → 노드` 매핑을 그대로 돌려줬는데, 그러면
+        # `_guard_classify` 같은 내부 역할 이름과 클러스터 토폴로지가 서비스
+        # 토큰에 노출된다 — meta·openapi 가 공들여 숨긴 것을 이 엔드포인트가 흘린다.
+        # 소비자가 "왜 느린가" 를 답하는 데 필요한 것은 **그런 역할이 몇 개인가**
+        # 이지 그것이 무엇이고 어느 기계에 있는지가 아니다.
+        "single_homed_roles": len(ctx.cluster.single_homed_roles()),
         "airgap": ctx.airgap,
     })
 
@@ -651,6 +752,9 @@ async def tenant_services(request: Request) -> Response:
         raise ApiError("unknown_role", status=404, params={"role": ", ".join(hidden)})
 
     service_id = str(_need(body, "id"))
+    if ctx.store.get_service(scope, service_id) is not None:
+        # PK 충돌이 500 으로 나가면 소비자는 "서버가 고장났다" 로 읽고 재시도한다.
+        raise ApiError("already_exists", status=409, params={"id": service_id})
     ctx.store.create_service(
         scope, service_id, str(body.get("name") or service_id),
         allow_roles=allow,
@@ -708,7 +812,7 @@ async def tenant_token_rotate(request: Request) -> Response:
     new_id, raw = rotate_token(
         ctx.store, scope, request.path_params["token_id"],
         actor=principal.token_id,
-        grace_seconds=float(body.get("grace_seconds", 0) or 0),
+        grace_seconds=_float(body.get("grace_seconds"), "grace_seconds", minimum=0.0),
         now=ctx.now,
     )
     return _ok(request, {
@@ -759,13 +863,37 @@ async def tenant_guard_rules(request: Request) -> Response:
         "label": body.get("label") or "",
         "pattern": body.get("pattern"),
         "checksum": body.get("checksum"),
-        "keep_tail": int(body.get("keep_tail", 0) or 0),
+        "keep_tail": _int(body.get("keep_tail"), "keep_tail", minimum=0, maximum=MAX_KEEP_TAIL),
         "description": body.get("description"),
         "locale_pack": str(body.get("locale_pack") or "tenant"),
     }
     if rule["kind"] == "pattern" and not rule["pattern"]:
         raise ApiError("missing_field", status=400, params={"field": "pattern"})
     ctx.guard.validate_rule(rule)
+
+    # **승격 게이트를 여기서 실제로 검사한다.**
+    #
+    # promote 엔드포인트는 판정만 하고 적용은 이 PUT 이 한다. 그 독스트링은
+    # "그쪽이 게이트를 다시 검사한다" 고 적어 놨는데 **검사하지 않았다** —
+    # 그래서 측정 없이 새 규칙을 바로 `block` 으로 저장할 수 있었고,
+    # 게이트는 화면에 숫자를 보여주는 장식이 됐다.
+    #
+    # 판정 엔드포인트가 있는데 강제가 없으면 그것은 게이트가 아니라 안내문이다.
+    for boundary in (INTERNAL, EXTERNAL):
+        target = (
+            rule["action"] if isinstance(rule["action"], str)
+            else rule["action"].get(boundary, "audit")
+        )
+        verdict = ctx.evaluator.can_promote(scope, rule["id"], target)
+        if not verdict.allowed:
+            raise ApiError(
+                "promotion_blocked", status=409,
+                params={
+                    "rule": rule["id"], "reason": verdict.reason,
+                    "rate": f"{verdict.rate:.3f}", "reviewed": str(verdict.reviewed),
+                    "limit": f"{verdict.limit:.3f}",
+                },
+            )
 
     ctx.store.set_tenant_guard_rule(scope, rule, updated_by=principal.token_id)
     ctx.store.audit(
@@ -793,7 +921,7 @@ async def tenant_guard_events(request: Request) -> Response:
         scope,
         action=params.get("action"),
         unreviewed_only=params.get("unreviewed") == "1",
-        limit=min(int(params.get("limit", 100)), 500),
+        limit=_int(params.get("limit"), "limit", default=100, minimum=1, maximum=500),
     )
     return _ok(request, {"events": [
         # **매칭된 값은 애초에 저장하지 않는다.** 오프셋과 횟수만 나간다.
@@ -814,7 +942,8 @@ async def tenant_guard_review(request: Request) -> Response:
     verdict = str(_need(body, "verdict"))
     if verdict not in ("true_positive", "false_positive"):
         raise ApiError("invalid_field", status=400, params={"field": "verdict"})
-    if not ctx.evaluator.review(scope, int(request.path_params["event_id"]), verdict):
+    event_id = _int(request.path_params["event_id"], "event_id", minimum=1)
+    if not ctx.evaluator.review(scope, event_id, verdict):
         raise ApiError("not_found", status=404)
     return _ok(request, {"reviewed": True})
 
@@ -872,7 +1001,10 @@ async def tenant_settings(request: Request) -> Response:
             raise ApiError("invalid_field", status=400, params={"field": "locale"})
         ctx.store.set_tenant_locale(scope, str(body["locale"]))
     if "raw_prompt_retention_days" in body:
-        days = int(body["raw_prompt_retention_days"])
+        # 여기서는 **자르지 않고 거절한다.** 음수 보관 기간은 오타이지 의도가
+        # 아니고, 조용히 0 으로 자르면 관리자는 설정했다고 믿는 채로 원문이
+        # 즉시 사라지는 것을 보게 된다.
+        days = _int(body["raw_prompt_retention_days"], "raw_prompt_retention_days")
         if days < 0:
             raise ApiError("invalid_field", status=400, params={"field": "raw_prompt_retention_days"})
         ctx.store.set_tenant_setting(scope, ctx.store.RAW_RETENTION_KEY, days)
@@ -927,7 +1059,7 @@ async def tenant_jobs(request: Request) -> Response:
     rows = ctx.store.list_jobs(
         scope, status=params.get("status"),
         end_user_hash=params.get("end_user_hash"),
-        limit=min(int(params.get("limit", 50)), 200),
+        limit=_int(params.get("limit"), "limit", default=50, minimum=1, maximum=200),
     )
     return _ok(request, {"jobs": [
         {
@@ -1016,7 +1148,7 @@ async def tenant_job_raw(request: Request) -> Response:
 async def tenant_usage(request: Request) -> Response:
     ctx, principal, scope = _tenant_admin(request)
     params = request.query_params
-    since = float(params.get("since") or (ctx.now() - 30 * 86400))
+    since = _float(params.get("since"), "since", default=ctx.now() - 30 * 86400, minimum=0.0)
     axis = params.get("by", "service_id")
     if axis not in ctx.store.USAGE_AXES:
         raise ApiError("invalid_field", status=400, params={"field": "by"})
@@ -1044,7 +1176,10 @@ async def tenant_usage(request: Request) -> Response:
 
 async def tenant_audit(request: Request) -> Response:
     ctx, principal, scope = _tenant_admin(request)
-    rows = ctx.store.list_audit(scope, limit=min(int(request.query_params.get("limit", 100)), 500))
+    rows = ctx.store.list_audit(
+        scope,
+        limit=_int(request.query_params.get("limit"), "limit", default=100, minimum=1, maximum=500),
+    )
     return _ok(request, {"audit": [dict(row) for row in rows]})
 
 
@@ -1108,6 +1243,8 @@ async def platform_tenants(request: Request) -> Response:
     if locale not in ctx.translator.available:
         raise ApiError("invalid_field", status=400, params={"field": "locale"})
 
+    if ctx.store.get_tenant(tenant_id) is not None:
+        raise ApiError("already_exists", status=409, params={"id": tenant_id})
     ctx.store.create_tenant(
         tenant_id, str(body.get("name") or tenant_id), locale=locale,
         end_user_salt=new_salt(), dek_wrapped=ctx.vault.create_dek(),
@@ -1136,6 +1273,16 @@ async def platform_tenant_purge(request: Request) -> Response:
     """
     ctx, principal = _platform_admin(request)
     tenant_id = request.path_params["tenant_id"]
+
+    # **예약 테넌트는 파기할 수 없다.**
+    #
+    # 플랫폼 콘솔의 토큰과 플랫폼 설정(`guard_grace_mode` 포함)이 이 테넌트에
+    # 매달려 있다. 확인값만 맞으면 그것을 지울 수 있었고, 지우고 나면 되돌릴
+    # 관리 접근 자체가 사라진다 — 확인 절차가 있어도 **되돌릴 수 없는 자기 잠금**은
+    # 사람이 실수할 수 있는 자리에 두면 안 된다.
+    if tenant_id == ctx.store.PLATFORM_SETTINGS_TENANT:
+        raise ApiError("invalid_field", status=400, params={"field": "tenant_id"})
+
     body = await _body(request)
     _confirm(request, body, tenant_id)
 
@@ -1254,7 +1401,10 @@ async def platform_overview(request: Request) -> Response:
     ctx, principal = _platform_admin(request)
     reason = request.query_params.get("reason", "platform console")
     scope = PlatformScope(principal.token_id, reason)
-    since = float(request.query_params.get("since") or (ctx.now() - 30 * 86400))
+    since = _float(
+        request.query_params.get("since"), "since",
+        default=ctx.now() - 30 * 86400, minimum=0.0,
+    )
 
     lanes = ctx.scheduler.snapshot() if ctx.scheduler else {}
     return _ok(request, {

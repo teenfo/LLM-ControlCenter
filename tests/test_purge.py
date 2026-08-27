@@ -328,7 +328,8 @@ def test_export_never_crosses_tenants(client, acme, globex):
 def test_export_includes_the_settings_needed_to_rebuild(client, acme):
     client.put(
         "/v1/admin/guard/rules",
-        json={"id": "mine", "action": "block", "pattern": "X-\\d+"},
+        # 마스킹 등급을 쓴다 — 이 테스트가 보는 것은 내보내기이지 승격 게이트가 아니다.
+        json={"id": "mine", "action": "full", "pattern": "X-\\d+"},
         headers=auth(acme["tenant_admin"]),
     )
     client.put(

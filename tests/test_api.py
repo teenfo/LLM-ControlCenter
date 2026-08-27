@@ -376,8 +376,22 @@ def test_guard_rules_are_per_tenant(client, acme, globex):
 # ── 테넌트는 조일 수만 있다 ──────────────────────────────────────────────────
 
 
+def _seed_clean_reviews(store, scope, rule_id: str, count: int = 25) -> None:
+    """오탐 0건으로 검토를 채운다. 승격 게이트를 통과할 표본을 만든다."""
+    for _ in range(count):
+        store.record_filter_event(scope, rule_id=rule_id, stage="pattern", action="audit")
+        event = store.list_filter_events(scope, unreviewed_only=True, limit=1)[0]
+        store.review_filter_event(scope, event["id"], "true_positive")
+
+
 def test_tenant_can_tighten_a_baseline_rule(harness, client, acme):
-    """`email` 은 베이스라인이 `partial` 이다. `block` 으로 올리는 것은 허용된다."""
+    """`email` 은 베이스라인이 `partial` 이다. `block` 으로 올리는 것은 허용된다.
+
+    다만 **측정을 마친 뒤에** 허용된다 — 새 규칙을 바로 차단으로 켜면 오탐이
+    프로덕션을 세우고, 그러면 관리자가 규칙을 통째로 꺼버린다(C3·C7).
+    """
+    _seed_clean_reviews(harness.store, TenantScope("acme"), "email")
+
     response = client.put(
         "/v1/admin/guard/rules",
         json={"id": "email", "action": "block", "pattern": r"\b[\w.+-]+@[\w-]+\.[\w.]+\b"},
@@ -1074,3 +1088,172 @@ def test_one_tenant_cannot_resolve_anothers_review(harness, client, acme, globex
     )
     assert response.status_code == 404
     assert harness.store.get_job(scope, job_id).status == "needs_review"
+
+
+# ── 감사 M16~M21 — API 계층 ─────────────────────────────────────────────────
+
+
+def test_a_bad_number_is_a_400_not_a_500(client, acme):
+    """**500 은 "서버가 고장났다" 는 뜻이다** — 소비자는 그 말을 믿고 재시도한다.
+
+    오류 계약(§5.4)이 `retryable` 로 분기하라고 못박아 둔 만큼 이 구분이 중요하다.
+    """
+    response = client.post(
+        "/v1/generate",
+        json={"role": "summarize", "prompt": "안녕", "priority": "높음", "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["code"] == "invalid_field"
+    assert response.json()["retryable"] is False
+
+
+def test_a_bad_query_number_is_a_400_too(client, acme):
+    response = client.get(
+        "/v1/admin/jobs?limit=많이", headers=auth(acme["tenant_admin"])
+    )
+    assert response.status_code == 400
+
+
+def test_a_bad_wait_is_a_400(client, acme):
+    response = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": "조금"},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code == 400
+
+
+def test_embed_refuses_a_dict_instead_of_silently_using_its_keys(client, acme):
+    """`list({"a": 1})` == `["a"]` 다.
+
+    소비자는 자기가 보낸 값과 **무관한 임베딩**을 받고도 200 을 본다.
+    """
+    response = client.post(
+        "/v1/embed", json={"role": "vec", "input": {"문장": "안녕"}},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+def test_keep_tail_cannot_keep_the_whole_value(harness, client, acme):
+    """`keep_tail: 100` 이면 값 전체가 남는 "마스킹" 이 된다."""
+    from app.config import MAX_KEEP_TAIL
+
+    _seed_clean_reviews(harness.store, TenantScope("acme"), "mine")
+    client.put(
+        "/v1/admin/guard/rules",
+        json={"id": "mine", "action": "partial", "pattern": r"X-\d+", "keep_tail": 999},
+        headers=auth(acme["tenant_admin"]),
+    )
+    stored = harness.store.list_tenant_guard_rules(TenantScope("acme"))[0]
+    assert stored["keep_tail"] <= MAX_KEEP_TAIL
+
+
+def test_a_new_rule_cannot_start_at_block(client, acme):
+    """**측정 없이 차단으로 켜면 오탐이 프로덕션을 세운다.**
+
+    promote 엔드포인트가 판정만 하고 PUT 이 게이트를 안 봤다 — 판정 엔드포인트가
+    있는데 강제가 없으면 그것은 게이트가 아니라 안내문이다.
+    """
+    response = client.put(
+        "/v1/admin/guard/rules",
+        json={"id": "새규칙", "action": "block", "pattern": r"X-\d+"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "promotion_blocked"
+
+
+def test_a_new_rule_can_start_at_a_masking_grade(client, acme):
+    """마스킹은 요청을 멈추지 않는다 — 막으면 규칙을 켤 방법 자체가 없어진다."""
+    response = client.put(
+        "/v1/admin/guard/rules",
+        json={"id": "새규칙", "action": "full", "pattern": r"X-\d+"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 201
+
+
+def test_the_gate_applies_per_boundary(client, acme):
+    """티어별 등급에서도 `block` 쪽은 게이트를 지나야 한다."""
+    response = client.put(
+        "/v1/admin/guard/rules",
+        json={
+            "id": "새규칙", "pattern": r"X-\d+",
+            "action": {"internal": "audit", "external": "block"},
+        },
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 409
+
+
+def test_creating_a_duplicate_tenant_is_a_409(client, acme):
+    """PK 충돌이 500 으로 나가면 소비자는 재시도한다."""
+    response = client.post(
+        "/v1/platform/tenants", json={"id": "acme", "name": "Acme"},
+        headers=auth(acme["platform_admin"]),
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "already_exists"
+
+
+def test_creating_a_duplicate_service_is_a_409(client, acme):
+    response = client.post(
+        "/v1/admin/services", json={"id": "acme-web", "name": "web"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 409
+
+
+def test_the_reserved_platform_tenant_cannot_be_purged(harness, client, acme):
+    """**되돌릴 수 없는 자기 잠금**은 사람이 실수할 수 있는 자리에 두면 안 된다.
+
+    플랫폼 콘솔의 토큰과 플랫폼 설정이 이 테넌트에 매달려 있다.
+    """
+    reserved = harness.store.PLATFORM_SETTINGS_TENANT
+    response = client.request(
+        "DELETE", f"/v1/platform/tenants/{reserved}",
+        json={"confirm": reserved},
+        headers=auth(acme["platform_admin"]),
+    )
+    assert response.status_code == 400
+
+
+def test_status_does_not_name_internal_roles_or_nodes(client, acme):
+    """meta·openapi 가 공들여 숨긴 것을 이 엔드포인트가 흘리면 안 된다."""
+    body = client.get("/v1/status", headers=auth(acme["service"])).json()
+
+    assert isinstance(body["single_homed_roles"], int)
+    dumped = json.dumps(body, ensure_ascii=False)
+    assert "_guard_classify" not in dumped
+    assert "in-1" not in dumped and "in-2" not in dumped
+
+
+def test_a_huge_body_is_refused_before_it_is_parsed(client, acme):
+    """`max_prompt_chars` 는 `prompt` 에만 걸리고 그마저 전량을 읽은 뒤다.
+
+    거대한 `metadata` 로 메모리를 소진시킬 수 있었다 — 인증된 토큰 하나면 충분하다.
+    """
+    from app.main import MAX_BODY_BYTES
+
+    response = client.post(
+        "/v1/generate",
+        content=json.dumps({
+            "role": "summarize", "prompt": "안녕",
+            "metadata": {"x": "a" * (MAX_BODY_BYTES + 1000)},
+        }),
+        headers={**auth(acme["service"]), "content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert response.json()["code"] == "payload_too_large"
+
+
+def test_a_normal_request_is_nowhere_near_the_body_limit(client, acme):
+    """상한이 정상 요청을 건드리면 그 상한은 틀린 것이다."""
+    response = client.post(
+        "/v1/generate",
+        json={"role": "summarize", "prompt": "가" * 100_000, "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code == 200

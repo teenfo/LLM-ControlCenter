@@ -12,6 +12,7 @@
   "error.wrong_kind": "Role '{role}' is of kind '{kind}' and cannot be called on this endpoint.",
   "error.empty_input": "The input is empty.",
   "error.job_running": "A running job cannot be cancelled.",
+  "error.already_exists": "'{id}' already exists.",
   "error.invalid_json": "The request body is not valid JSON.",
   "error.missing_field": "A required field is missing: {field}",
   "error.invalid_field": "The value of field '{field}' is not valid.",

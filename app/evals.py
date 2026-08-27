@@ -26,7 +26,6 @@ from typing import Any, Awaitable, Callable, Sequence
 
 from .config import Config, GuardRule
 from .guard import ACTION_STRENGTH, Guard
-from .i18n import ApiError
 from .store import SqliteStore, TenantScope
 
 KIND_RULES = "rules"
@@ -412,14 +411,26 @@ class Evaluator:
         current = next(
             (r for r in self._config.guard_rules if r.id == rule_id), None
         )
-        if current is None:
-            raise ApiError("unknown_role", status=404, params={"role": rule_id})
+        # **베이스라인에 없는 규칙도 판정 대상이다.** 없으면 404 로 끝내던 탓에
+        # 테넌트가 새로 만드는 규칙은 게이트를 아예 지나지 않았고, 측정 없이
+        # 바로 `block` 으로 켤 수 있었다 — 게이트가 막으려던 그 경우다.
+        # 현재 강도가 없다는 것은 0 이라는 뜻이지 판정 불가라는 뜻이 아니다.
+        current_strength = (
+            ACTION_STRENGTH.get(current.action_for_boundary("internal"), 0)
+            if current is not None
+            else 0
+        )
 
         # 약하게 만드는 것은 게이트 대상이 아니라 아예 금지다(테넌트는 조일 수만 있다).
-        if ACTION_STRENGTH.get(target_action, 0) <= ACTION_STRENGTH.get(
-            current.action_for_boundary("internal"), 0
-        ):
+        if ACTION_STRENGTH.get(target_action, 0) <= current_strength:
             return PromotionVerdict(True, "not_a_promotion", limit=limit)
+
+        # **마스킹은 게이트하지 않는다.** 게이트가 있는 이유는 "새 규칙을 바로
+        # `block` 으로 켜면 오탐이 프로덕션을 세운다" 는 것이고, `partial`·`full` 은
+        # 텍스트를 바꿀 뿐 요청을 멈추지 않는다. 마스킹까지 막으면 관리자가 규칙을
+        # 켤 방법 자체가 없어져서 결국 게이트를 통째로 우회하게 된다.
+        if target_action != "block":
+            return PromotionVerdict(True, "not_a_block", limit=limit)
 
         rate = self.review_rate(scope, rule_id)
 

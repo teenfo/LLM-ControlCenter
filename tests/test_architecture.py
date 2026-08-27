@@ -210,3 +210,46 @@ def test_the_plan_body_is_the_original():
     ]
     assert not stray, f"머리말이 인용 블록을 벗어났다: {stray[:3]}"
     assert body, "계획서 본문이 없다"
+
+
+# ── 요청 입력 강제 ───────────────────────────────────────────────────────────
+
+
+def test_handlers_do_not_coerce_request_numbers_directly():
+    """**`int()` 의 `ValueError` 가 그대로 올라가면 400 이어야 할 것이 500 이 된다.**
+
+    소비자는 "서버가 고장났다" 로 읽고 재시도하며, 실제로는 자기 요청이 틀린 것이다.
+    오류 계약(§5.4)이 `retryable` 로 분기하라고 못박아 둔 만큼 이 구분이 중요하다.
+
+    `_int()` · `_float()` 을 쓰면 같은 값이 `invalid_field` 400 으로 나간다.
+    이것을 규율로 두면 다음 핸들러에서 다시 깨진다.
+    """
+    source = (APP / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    lines = source.splitlines()
+
+    #: 요청에서 온 값을 나타내는 이름들. 상수·리터럴 변환은 대상이 아니다.
+    REQUEST_NAMES = ("body", "params", "request", "raw")
+
+    offenders = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id not in ("int", "float") or not node.args:
+            continue
+        argument = ast.dump(node.args[0])
+        if any(name in argument for name in REQUEST_NAMES):
+            offenders.append(f"{node.lineno}: {lines[node.lineno - 1].strip()}")
+    assert not offenders, "요청 값을 직접 형변환한다:\n" + "\n".join(offenders)
+
+
+def test_partial_masking_cannot_keep_the_whole_value():
+    """상한이 없으면 `keep_tail: 100` 이 **값 전체를 남기는 "마스킹"** 이 된다.
+
+    관제 화면에는 마스킹 규칙으로 표시되면서. 안 켜진 필터보다 나쁜 것이
+    켜져 있다고 표시되는 안 듣는 필터다.
+    """
+    from app.config import MAX_KEEP_TAIL
+
+    assert 0 < MAX_KEEP_TAIL <= 8
+    assert "MAX_KEEP_TAIL" in (APP / "main.py").read_text(encoding="utf-8")

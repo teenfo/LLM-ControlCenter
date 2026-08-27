@@ -295,11 +295,26 @@ def test_lowering_the_grade_is_not_a_promotion(evaluator):
     assert verdict.reason == "not_a_promotion"
 
 
-def test_promotion_of_unknown_rule_raises(evaluator):
-    from app.i18n import ApiError
+def test_an_unknown_rule_is_judged_as_a_brand_new_one(evaluator):
+    """**베이스라인에 없는 규칙도 판정 대상이다.**
 
-    with pytest.raises(ApiError):
-        evaluator.can_promote(ACME, "does-not-exist", "block")
+    404 로 끝내던 탓에 테넌트가 새로 만드는 규칙은 게이트를 아예 지나지 않았고,
+    측정 없이 바로 `block` 으로 켤 수 있었다 — 게이트가 막으려던 그 경우다.
+    """
+    verdict = evaluator.can_promote(ACME, "does-not-exist", "block")
+
+    assert verdict.allowed is False
+    assert verdict.reason == "insufficient_reviews"
+
+
+def test_masking_grades_are_not_gated(evaluator):
+    """게이트의 이유는 "차단이 프로덕션을 세운다" 이다.
+
+    `partial`·`full` 은 텍스트를 바꿀 뿐 요청을 멈추지 않는다. 마스킹까지 막으면
+    관리자가 규칙을 켤 방법 자체가 없어져서 결국 게이트를 통째로 우회하게 된다.
+    """
+    assert evaluator.can_promote(ACME, "새-규칙", "full").allowed is True
+    assert evaluator.can_promote(ACME, "새-규칙", "partial").allowed is True
 
 
 def test_promotion_gate_is_per_tenant(evaluator, store):

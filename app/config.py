@@ -33,6 +33,13 @@ DEFAULT_MAX_PROMPT_CHARS = 200_000
 
 GUARD_ACTIONS = ("off", "audit", "partial", "full", "block")
 
+#: `partial` 등급이 남길 수 있는 뒷자리의 상한.
+#:
+#: 상한이 없으면 `keep_tail: 100` 같은 값이 통과하고, 그 규칙은 **값 전체를 남기는
+#: "마스킹"** 이 된다 — 관제 화면에는 마스킹 규칙으로 표시되면서. 안 켜진 필터보다
+#: 나쁜 것이 켜져 있다고 표시되는 안 듣는 필터다.
+MAX_KEEP_TAIL = 8
+
 #: 런타임 오버라이드로 덮어쓸 수 있는 역할 필드.
 OVERRIDABLE_ROLE_FIELDS = frozenset(
     {"model", "lane", "timeout", "options", "max_prompt_chars", "placement", "tier_models"}
