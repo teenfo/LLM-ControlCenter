@@ -134,6 +134,20 @@ def place(cluster: Cluster, role_name: str, **kwargs):
     return cluster.place(**defaults)
 
 
+def fill(cluster: Cluster, node: str, count: int, *, mem_gb: float = 0.0) -> None:
+    """노드의 슬롯을 `count` 개 채운다.
+
+    예전에는 `state.running = N` 한 줄이었다. 점유가 DB 로 갔으므로 리스를 직접
+    잡는다 — **테스트가 점유를 만드는 방법도 제품과 같아야** 두 장부가 갈리지 않는다.
+    """
+    for index in range(count):
+        assert cluster._store.try_acquire_node_lease(
+            lease_id=f"fill-{node}-{index}", node=node, mem_gb=mem_gb,
+            now=cluster._now(), ttl_seconds=3600,
+            max_concurrent=10**6, mem_budget_gb=None,
+        )
+
+
 # ── 데이터 경계 ──────────────────────────────────────────────────────────────
 
 
@@ -255,13 +269,13 @@ def test_single_slot_node_accepts_exactly_one(store, clock):
 
 def test_memory_budget_is_reserved_not_just_checked(cluster):
     """20GB 잔여를 두 잡이 각각 확인하고 각각 올리면 안 된다."""
-    node = cluster.nodes["in-2"]  # 20GB, 슬롯 1개
+    # in-2 는 20GB, 슬롯 1개. 나머지를 죽여 그리로만 가게 만든다.
     for other in ("in-1", "out-1"):
         cluster.nodes[other].status = UNHEALTHY
 
     first = place(cluster, "classify", job_id="a")
     assert first.outcome == PLACED
-    assert node.reserved_mem_gb == 5.0
+    assert cluster.occupancy().reserved_mem_gb("in-2") == 5.0
 
     second = place(cluster, "classify", job_id="b")
     assert second.outcome == WAIT
@@ -296,17 +310,16 @@ def test_concurrent_placement_does_not_oversubscribe(store, clock):
 
     placed = [r for r in results if r.outcome == PLACED]
     assert len(placed) == 5, f"슬롯 5개에 {len(placed)}개가 배치됐다"
-    assert cluster.nodes["n"].running == 5
+    assert cluster.occupancy().running("n") == 5
 
 
 def test_release_returns_slot_and_memory(cluster):
-    node = cluster.nodes["in-1"]
     result = place(cluster, "classify")
 
-    assert node.running == 1
+    assert cluster.occupancy().running("in-1") == 1
     cluster.release(result.placement)
-    assert node.running == 0
-    assert node.reserved_mem_gb == 0.0
+    assert cluster.occupancy().running("in-1") == 0
+    assert cluster.occupancy().reserved_mem_gb("in-1") == 0.0
 
 
 # ── 용량 불가 vs 행정적 부재 ─────────────────────────────────────────────────
@@ -345,9 +358,47 @@ def test_disabled_node_causes_wait_not_hard_failure(cluster):
     assert result.reason == "disabled"
 
 
+def test_losing_the_lease_race_waits_instead_of_failing(cluster, monkeypatch):
+    """**경합에 지는 것은 대기지 실패가 아니다.**
+
+    스냅샷에는 자리가 있었는데 커밋 시점에 다른 워커가 채운 경우다. 여기서 하드
+    실패를 돌려주면 클러스터가 잠깐 붐볐다는 이유로 잡이 버려진다 — 그 잡은
+    1초 뒤에 돌 수 있었다.
+    """
+    monkeypatch.setattr(
+        cluster._store, "try_acquire_node_lease", lambda **_: False
+    )
+
+    result = place(cluster, "summarize")
+
+    assert result.outcome == WAIT, f"경합 패배가 {result.outcome} 이 됐다"
+    assert result.reason == "no_slot"
+
+
+def test_the_winner_of_the_race_is_the_only_one_charged(cluster, monkeypatch):
+    """**슬롯을 못 잡았으면 예산도 안 먹어야 한다.**
+
+    순서가 뒤집히면(예약 먼저, 슬롯 나중) 경합에서 진 배치가 예산만 깎고 사라진다 —
+    아무도 안 쓴 돈이 테넌트 한도에서 빠지고, 그 차이는 정산에서도 안 드러난다.
+    """
+    charged = []
+    original = cluster._store.update_job
+
+    def watching(scope, job_id, **fields):
+        if "cost_reserved_usd" in fields:
+            charged.append(fields["cost_reserved_usd"])
+        return original(scope, job_id, **fields)
+
+    monkeypatch.setattr(cluster._store, "update_job", watching)
+    monkeypatch.setattr(cluster._store, "try_acquire_node_lease", lambda **_: False)
+
+    assert place(cluster, "summarize").outcome == WAIT
+    assert not charged, f"슬롯을 못 잡았는데 예산을 {charged} 만큼 예약했다"
+
+
 def test_busy_nodes_cause_wait(cluster):
     for state in cluster.nodes.values():
-        state.running = state.node.max_concurrent
+        fill(cluster, state.name, state.node.max_concurrent)
 
     result = place(cluster, "summarize")
     assert result.outcome == WAIT
@@ -409,8 +460,8 @@ def test_warm_model_wins_within_the_same_tier(cluster):
 
 
 def test_least_loaded_wins_when_warmth_is_equal(cluster):
-    cluster.nodes["in-1"].running = 1   # 2개 중 1개 = 0.5
-    cluster.nodes["in-2"].running = 0   # 1개 중 0개 = 0.0
+    fill(cluster, "in-1", 1)   # 2개 중 1개 = 0.5
+    # in-2 는 비워 둔다 — 1개 중 0개 = 0.0
 
     result = place(cluster, "classify")
     assert result.placement.node == "in-2"
@@ -561,7 +612,7 @@ def test_draining_blocks_new_but_keeps_running_jobs(cluster):
 
     cluster.drain("in-1")
 
-    assert cluster.nodes["in-1"].running == 1, "실행 중인 잡을 즉시 버렸다"
+    assert cluster.occupancy().running("in-1") == 1, "실행 중인 잡을 즉시 버렸다"
     assert cluster.nodes["in-1"].status == DRAINING
 
     again = place(cluster, "classify", job_id="j2")
@@ -596,13 +647,13 @@ def test_force_drain_does_not_lose_the_running_count(cluster):
     placed = place(cluster, "classify", job_id="a")
     cluster.drain("in-1", force=True)
 
-    assert cluster.nodes["in-1"].running == 1, "실행 중인 잡을 잊었다"
+    assert cluster.occupancy().running("in-1") == 1, "실행 중인 잡을 잊었다"
 
     cluster.undrain("in-1")
     cluster.nodes["in-1"].status = HEALTHY
     cluster.release(placed.placement)          # 그 잡이 이제 끝난다
 
-    assert cluster.nodes["in-1"].running == 0, "해제가 두 번 세어졌다"
+    assert cluster.occupancy().running("in-1") == 0, "해제가 두 번 세어졌다"
 
 
 def test_undrain_does_not_oversubscribe(cluster):

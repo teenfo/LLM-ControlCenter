@@ -217,8 +217,9 @@ async def test_embed_releases_the_slot_even_on_failure(harness, acme_principal):
     with pytest.raises(Exception):
         await harness.pipeline.embed(acme_principal, role="vec", inputs=["가"])
 
-    assert harness.cluster.state("in-1").running == 0
-    assert harness.cluster.state("in-2").running == 0
+    occupancy = harness.cluster.occupancy()
+    assert occupancy.running("in-1") == 0
+    assert occupancy.running("in-2") == 0
 
 
 async def test_embed_frees_the_reservation_when_placement_fails(harness, acme_principal):
@@ -314,7 +315,8 @@ async def test_classifier_releases_its_slot(harness):
     classify = harness.pipeline.make_classifier()
     rules = (GuardRule(id="deal", kind="llm", action="block", description="인수합병"),)
     await classify("문장", rules)
-    assert all(s.running == 0 for s in harness.cluster.nodes.values())
+    occupancy = harness.cluster.occupancy()
+    assert all(occupancy.running(name) == 0 for name in harness.cluster.nodes)
 
 
 def test_build_app_wires_the_classifier(config, store, clock):

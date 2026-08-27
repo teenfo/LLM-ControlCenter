@@ -45,6 +45,14 @@ DRAINING = "draining"
 #: 금지가 아니다. 노드 한 대짜리 구성에서 금지는 곧 재시도 불능이다.
 LAST_FAILED = "last_failed_node"
 
+#: 리스 만료에 얹는 여유. 만료 시각은 역할 `timeout` + 이 값이다.
+#:
+#: 여유를 두는 이유: 만료가 요청보다 **먼저** 오면 아직 도는 추론의 슬롯이 풀려
+#: 다음 배치가 그 위에 얹힌다 — 초과 구독을 막으려고 넣은 장치가 초과 구독을 만든다.
+#: 반대 방향(요청이 끝났는데 리스가 남는 것)은 `release()` 가 즉시 지우므로,
+#: 여유가 실제로 쓰이는 경우는 워커가 죽어서 `release()` 를 못 부른 때뿐이다.
+LEASE_MARGIN_SECONDS = 30.0
+
 #: **이 잡의 생애 동안 변하지 않는** 탈락 사유. 관리자가 무엇을 해도 풀리지 않는다 —
 #: 역할의 `internal_only` 는 오버라이드 불가 필드이고, 가드 판정은 제출 시점에 잡에
 #: 박힌다. 전부 이것뿐이면 기다릴 이유가 없으므로 즉시 실패시킨다.
@@ -74,8 +82,6 @@ class NodeState:
     consecutive_successes: int = 0
     models: frozenset[str] = frozenset()
     loaded_model: str | None = None
-    running: int = 0
-    reserved_mem_gb: float = 0.0
     last_probe_at: float | None = None
     last_error: str | None = None
     #: 강제 드레이닝됐는가. 실행 중인 잡을 세는 것과는 별개다 — 그 둘을 섞으면
@@ -87,22 +93,40 @@ class NodeState:
         return self.node.name
 
     @property
-    def available_slots(self) -> int:
-        return max(0, self.node.max_concurrent - self.running)
-
-    @property
-    def free_mem_gb(self) -> float:
-        if self.node.mem_budget_gb is None:
-            return float("inf")
-        return max(0.0, self.node.mem_budget_gb - self.reserved_mem_gb)
-
-    @property
-    def load_ratio(self) -> float:
-        return self.running / max(1, self.node.max_concurrent)
-
-    @property
     def is_metered(self) -> bool:
         return self.provider.capabilities.metered
+
+
+@dataclass(frozen=True)
+class Occupancy:
+    """노드 점유 스냅샷. **`NodeState` 의 필드가 아닌 것이 핵심이다.**
+
+    예전에는 `NodeState.running` 과 `reserved_mem_gb` 가 필드였다. 그러면 장부가
+    프로세스마다 하나씩 생기고, API 워커 N 개는 같은 노드를 각자 비어 있다고 본다 —
+    `max_concurrent=1` 노드에 N 건이 올라간다. 레이트리밋 카운터를 DB 로 옮긴 것과
+    같은 이유다(`store.py` 의 `rate_counters` 주석).
+
+    필드를 **지운** 것도 의도다. 남겨 두면 언젠가 누군가 낡은 쪽을 읽는다.
+    """
+
+    by_node: Mapping[str, tuple[int, float]] = field(default_factory=dict)
+
+    def running(self, name: str) -> int:
+        return self.by_node.get(name, (0, 0.0))[0]
+
+    def reserved_mem_gb(self, name: str) -> float:
+        return self.by_node.get(name, (0, 0.0))[1]
+
+    def available_slots(self, state: NodeState) -> int:
+        return max(0, state.node.max_concurrent - self.running(state.name))
+
+    def free_mem_gb(self, state: NodeState) -> float:
+        if state.node.mem_budget_gb is None:
+            return float("inf")
+        return max(0.0, state.node.mem_budget_gb - self.reserved_mem_gb(state.name))
+
+    def load_ratio(self, state: NodeState) -> float:
+        return self.running(state.name) / max(1, state.node.max_concurrent)
 
 
 @dataclass(frozen=True)
@@ -252,7 +276,10 @@ class Cluster:
     ) -> PlacementResult:
         """(잡, 노드) 쌍을 고르고 슬롯·메모리·비용을 즉시 차감한다.
 
-        동기 함수다. 안에서 await 하지 않으므로 확인과 차감 사이에 아무도 끼어들지 못한다.
+        동기 함수다. 안에서 await 하지 않으므로 확인과 차감 사이에 이 프로세스의
+        다른 코루틴은 끼어들지 못한다. **다른 프로세스는 끼어든다** — 그래서 락은
+        원자성의 근거가 아니고, 확정은 `try_acquire_node_lease()` 가 DB 트랜잭션
+        안에서 한다. 점유 스냅샷은 후보를 거르고 순위를 매기는 데만 쓴다.
         """
         tiers = self.effective_placement(role, placement_snapshot)
         if not tiers:
@@ -264,6 +291,8 @@ class Cluster:
         scope = TenantScope(tenant_id)
         rejections: dict[str, str] = {}
         boundaries = frozenset(allowed_boundaries)
+        now = self._now()
+        occupancy = self.occupancy(now)
 
         with self._lock:
             # **예산 현황은 락 안에서 한 번만 읽는다.**
@@ -285,7 +314,8 @@ class Cluster:
 
                     model = role.model_for_tier(tier)
                     verdict = self._reject_reason(
-                        state, role, model, tenant_id, last_failed_node, boundaries
+                        state, role, model, tenant_id, last_failed_node, boundaries,
+                        occupancy,
                     )
                     if verdict and verdict != LAST_FAILED:
                         rejections.setdefault(state.name, verdict)
@@ -332,44 +362,61 @@ class Cluster:
             if not candidates:
                 return self._no_candidate_result(role, tiers, rejections)
 
-            tier_index, state, model, tier, cost, mem = min(
-                candidates, key=lambda c: self._rank(c[0], c[1], c[2])
-            )
-
-            # 차감 — 여기까지 락 안이다.
-            state.running += 1
-            state.reserved_mem_gb += mem
-
-            # **비용 예약도 락 안에서 한다.**
+            # **순위대로 훑으며 DB 에서 슬롯을 잡는다.**
             #
-            # 밖에서 하면 확인과 차감 사이가 벌어져, 동시 배치 두 건이 각각
-            # "예산 남음" 을 보고 둘 다 예약한다 — 락을 둔 이유가 정확히
-            # 그것을 막는 것인데(B3-1) 비용만 그 밖에 있었다.
-            if cost > 0:
-                self._store.update_job(scope, job_id, cost_reserved_usd=cost)
+            # 스냅샷은 "누가 유력한가" 만 말한다. 그 사이 다른 워커가 같은 노드를
+            # 채웠을 수 있으므로 확정은 트랜잭션 안에서 다시 확인해야 하고, 지면
+            # 그 노드를 버리고 다음으로 간다. 경합에서 지는 것은 오류가 아니라
+            # 정상 경로다 — 그래서 예외가 아니라 `False` 다.
+            ttl = float(role.timeout) + LEASE_MARGIN_SECONDS
+            for tier_index, state, model, tier, cost, mem in sorted(
+                candidates, key=lambda c: self._rank(c[0], c[1], c[2], occupancy)
+            ):
+                if not self._store.try_acquire_node_lease(
+                    lease_id=job_id, node=state.name, mem_gb=mem, now=now,
+                    ttl_seconds=ttl, max_concurrent=state.node.max_concurrent,
+                    mem_budget_gb=state.node.mem_budget_gb,
+                ):
+                    rejections[state.name] = "no_slot"
+                    continue
 
-        return PlacementResult(
-            PLACED,
-            placement=Placement(
-                job_id=job_id, node=state.name, model=model, tier=tier,
-                provider=state.node.provider,
-                reserved_cost_usd=cost, reserved_mem_gb=mem,
-            ),
-            rejections=rejections,
-        )
+                # **비용 예약은 슬롯을 잡은 뒤에 한다.**
+                #
+                # 순서가 뒤집히면 슬롯 경합에서 진 배치가 예산만 먹고 사라진다.
+                if cost > 0:
+                    self._store.update_job(scope, job_id, cost_reserved_usd=cost)
+
+                return PlacementResult(
+                    PLACED,
+                    placement=Placement(
+                        job_id=job_id, node=state.name, model=model, tier=tier,
+                        provider=state.node.provider,
+                        reserved_cost_usd=cost, reserved_mem_gb=mem,
+                    ),
+                    rejections=rejections,
+                )
+
+            # 후보가 있었는데 전부 경합에 졌다 = 클러스터가 지금 가득 찼다.
+            return self._no_candidate_result(role, tiers, rejections)
 
     def release(self, placement: Placement) -> None:
         """슬롯과 메모리를 되돌린다. 잡이 어떻게 끝나든 반드시 불러야 한다.
 
         안 부르면 노드가 조용히 가득 찬 것처럼 보이고, 관리자는 부하가 없는데 큐가
-        쌓이는 것을 디버깅하게 된다.
+        쌓이는 것을 디버깅하게 된다. **다만 이제는 그것이 영구적이지 않다** — 리스에
+        만료가 있어서, 이 호출을 놓쳐도(워커가 죽어도) 역할 timeout 뒤에 풀린다.
+        만료는 안전망이지 대체가 아니다: 그 사이 노드는 실제로 비어 있는데 찬 것으로
+        보인다.
         """
-        with self._lock:
-            state = self._nodes.get(placement.node)
-            if state is None:
-                return
-            state.running = max(0, state.running - 1)
-            state.reserved_mem_gb = max(0.0, state.reserved_mem_gb - placement.reserved_mem_gb)
+        self._store.release_node_lease(placement.job_id)
+
+    def occupancy(self, now: float | None = None) -> Occupancy:
+        """지금의 점유 스냅샷. **읽을 때마다 DB 를 본다.**
+
+        캐시하지 않는 이유가 이 설계의 전부다 — 캐시하는 순간 그 캐시가 프로세스마다
+        하나씩 생기고, 그것이 고치려던 바로 그 결함이다.
+        """
+        return Occupancy(self._store.node_occupancy(self._now() if now is None else now))
 
     # -- 필터 -----------------------------------------------------------------
 
@@ -381,6 +428,7 @@ class Cluster:
         tenant_id: str,
         last_failed_node: str | None,
         allowed_boundaries: frozenset[str] = frozenset({INTERNAL, EXTERNAL}),
+        occupancy: Occupancy = Occupancy(),
     ) -> str | None:
         """노드가 이 잡을 받을 수 없는 이유. `None` 이면 후보다."""
         node = state.node
@@ -427,10 +475,10 @@ class Cluster:
 
         if state.provider.capabilities.uses_memory_budget:
             needed = self.model_size_gb(model)
-            if needed and needed > state.free_mem_gb:
+            if needed and needed > occupancy.free_mem_gb(state):
                 return "memory_budget"
 
-        if state.available_slots <= 0:
+        if occupancy.available_slots(state) <= 0:
             return "no_slot"
 
         if last_failed_node and state.name == last_failed_node:
@@ -441,13 +489,15 @@ class Cluster:
 
         return None
 
-    def _rank(self, tier_index: int, state: NodeState, model: str) -> tuple:
+    def _rank(
+        self, tier_index: int, state: NodeState, model: str, occupancy: Occupancy
+    ) -> tuple:
         """정렬 키. 앞에 오는 것이 우선이다.
 
         티어 → 모델 친화 → 최소 부하. **티어가 맨 앞인 것이 정책의 전부다.**
         """
         model_is_warm = 0 if state.loaded_model == model else 1
-        return (tier_index, model_is_warm, state.load_ratio, state.name)
+        return (tier_index, model_is_warm, occupancy.load_ratio(state), state.name)
 
     def _no_candidate_result(
         self, role: Role, tiers: Sequence[str], rejections: Mapping[str, str]
@@ -730,7 +780,12 @@ class Cluster:
         return result
 
     def snapshot(self) -> list[dict[str, Any]]:
-        """관제 UI 용 노드 그리드."""
+        """관제 UI 용 노드 그리드.
+
+        점유를 **한 번만** 읽어 모든 행에 쓴다. 행마다 읽으면 노드 수만큼 쿼리가 나고,
+        같은 화면 안에서 행끼리 시점이 어긋난다.
+        """
+        occupancy = self.occupancy()
         return [
             {
                 "node": s.name,
@@ -738,11 +793,11 @@ class Cluster:
                 "data_boundary": s.node.data_boundary,
                 "status": s.status,
                 "enabled": s.node.enabled,
-                "running": s.running,
+                "running": occupancy.running(s.name),
                 "max_concurrent": s.node.max_concurrent,
-                "load_ratio": round(s.load_ratio, 3),
+                "load_ratio": round(occupancy.load_ratio(s), 3),
                 "mem_budget_gb": s.node.mem_budget_gb,
-                "mem_reserved_gb": round(s.reserved_mem_gb, 2),
+                "mem_reserved_gb": round(occupancy.reserved_mem_gb(s.name), 2),
                 "models": sorted(s.models),
                 "loaded_model": s.loaded_model,
                 "metered": s.is_metered,

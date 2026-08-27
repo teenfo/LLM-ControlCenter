@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import platform
 import statistics
@@ -220,7 +221,38 @@ def measure_stages(parts, rounds: dict[int, int]) -> dict[str, Any]:
     # 도구라고 그 불변식에 구멍을 내면 그 구멍이 다음 사람의 선례가 된다.
     # 삽입 원가는 아래 종단 제출 수치 안에 들어 있다.
     out["db_poll"] = _measure(lambda: parts.store.job_status(scope, "none"), 2000)
+    out["place_release"] = _measure(_placement_probe(parts), 500)
     return out
+
+
+def _placement_probe(parts) -> Callable[[], Any]:
+    """배치 한 번(획득 + 해제)의 원가.
+
+    **재는 이유**: 점유 장부가 DB 로 가면서 배치마다 쓰기 트랜잭션이 하나 늘었고,
+    SQLite 는 라이터를 직렬화한다. 정합성을 얻는 대가가 얼마인지 모른 채 그 거래를
+    하면 안 된다 — 자릿수가 무너지면 설계를 되돌려야 한다.
+
+    비교 대상은 클러스터 상한이다. 노드 3대 × 슬롯 3개면 평균 지연 3.3초 기준
+    **2.7 job/초**가 상한이므로, 배치 원가가 그보다 서너 자릿수 싸면 병목이 아니다.
+    """
+    from .cluster import PLACED
+
+    counter = itertools.count()
+    role = next(
+        (r for r in parts.config.roles.values() if r.kind != "embed"),
+        next(iter(parts.config.roles.values())),
+    )
+
+    def once() -> None:
+        result = parts.cluster.place(
+            job_id=f"loadtest-place-{next(counter)}", tenant_id="load",
+            service_id="load-web", role=role,
+            placement_snapshot=role.placement, prompt="가" * 200,
+        )
+        if result.outcome == PLACED and result.placement is not None:
+            parts.cluster.release(result.placement)
+
+    return once
 
 
 async def measure_submit(parts, rounds: dict[int, int]) -> dict[str, Any]:

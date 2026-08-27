@@ -452,6 +452,25 @@ CREATE TABLE IF NOT EXISTS rate_counters (
     PRIMARY KEY (key, bucket)
 );
 CREATE INDEX IF NOT EXISTS idx_rate_bucket ON rate_counters(bucket);
+
+-- 노드 점유 장부. 슬롯 하나 = 행 하나다.
+--
+-- 레이트리밋 카운터와 **같은 이유로** 프로세스 메모리에 두지 않는다. 예약이 워커
+-- 메모리에 있으면 워커 N개는 장부 N개고, `max_concurrent=1` 노드에 N건이 동시에
+-- 올라간다. 한도가 조용히 곱해지는 것은 제품에서 버그다.
+--
+-- `expires_at` 이 이 설계의 핵심이다. 만료가 없으면 DB 장부는 인메모리 장부보다
+-- **나쁘다** — 인메모리 예약은 워커가 죽으면 같이 사라지지만, 행은 남아서 노드가
+-- 영원히 가득 찬 것처럼 보인다. 만료 시각은 역할의 `timeout` 에서 나온다: 요청
+-- 자신이 그 시각을 넘겨 살아 있을 수 없으므로 예약도 그 시각을 넘길 이유가 없다.
+CREATE TABLE IF NOT EXISTS node_leases (
+    id          TEXT PRIMARY KEY,
+    node        TEXT NOT NULL,
+    mem_gb      REAL NOT NULL DEFAULT 0,
+    acquired_at REAL NOT NULL,
+    expires_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_node_leases ON node_leases(node, expires_at);
 """
 
 #: ADD COLUMN 전용 마이그레이션. 추가·NULL 기본값만 허용하고 재작성·삭제는 금지한다.
@@ -963,6 +982,74 @@ class SqliteStore:
             f"SELECT COUNT(*) AS ahead FROM jobs WHERE {where}", params
         ).fetchone()
         return int(row["ahead"])
+
+    # -- 노드 점유 ------------------------------------------------------------
+    #
+    # **테넌트 스코프가 없는 것이 맞다.** 노드는 플랫폼 자원이고 그 용량은 테넌트를
+    # 가로질러 공유된다. `_scoped_where` 를 안 쓰는 소수의 경로 중 하나다.
+
+    def node_occupancy(self, now: float) -> dict[str, tuple[int, float]]:
+        """노드별 (점유 슬롯, 예약 메모리 GB). 만료된 리스는 세지 않는다.
+
+        후보를 거르고 순위를 매기는 데 쓰는 **스냅샷**이다. 이 값으로 확정하면 안
+        된다 — 읽고 나서 쓰기까지 사이에 다른 워커가 들어온다. 확정은
+        `try_acquire_node_lease()` 가 한 트랜잭션 안에서 다시 확인하며 한다.
+        """
+        rows = self._conn.execute(
+            "SELECT node, COUNT(*) AS n, COALESCE(SUM(mem_gb), 0) AS mem "
+            "FROM node_leases WHERE expires_at > ? GROUP BY node",
+            (now,),
+        ).fetchall()
+        return {row["node"]: (int(row["n"]), float(row["mem"])) for row in rows}
+
+    def try_acquire_node_lease(
+        self,
+        *,
+        lease_id: str,
+        node: str,
+        mem_gb: float,
+        now: float,
+        ttl_seconds: float,
+        max_concurrent: int,
+        mem_budget_gb: float | None,
+    ) -> bool:
+        """슬롯을 잡는다. **용량 재확인과 삽입이 한 트랜잭션 안이다.**
+
+        "먼저 세어 보고 자리가 있으면 넣는다" 를 애플리케이션에서 하면 다중 워커에서
+        반드시 진다 — 두 워커가 나란히 카운트를 통과하는 창이 실재한다. 그래서
+        재확인을 쓰기 트랜잭션 안으로 넣는다. SQLite 는 라이터를 직렬화하므로 그
+        안에서 본 카운트는 삽입 시점의 사실이다.
+
+        진 쪽은 `False` 를 받는다. 예외가 아니다 — 경합에서 지는 것은 정상 경로이고,
+        호출자는 그 노드를 후보에서 빼고 다음으로 간다.
+        """
+        with self._tx():
+            # 만료 수확을 여기서 한다. 별도 청소 루프에 맡기면 그 루프가 안 도는
+            # 구성(스케줄러 없이 API 워커만)에서 장부가 영원히 새 것처럼 안 보인다.
+            self._conn.execute("DELETE FROM node_leases WHERE expires_at <= ?", (now,))
+
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(mem_gb), 0) AS mem "
+                "FROM node_leases WHERE node = ?",
+                (node,),
+            ).fetchone()
+            if int(row["n"]) >= max_concurrent:
+                return False
+            if mem_budget_gb is not None and float(row["mem"]) + mem_gb > mem_budget_gb:
+                return False
+
+            self._conn.execute(
+                "INSERT OR REPLACE INTO node_leases"
+                "(id, node, mem_gb, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (lease_id, node, float(mem_gb), now, now + float(ttl_seconds)),
+            )
+        return True
+
+    def release_node_lease(self, lease_id: str) -> None:
+        """슬롯을 돌려준다. 없는 리스를 놓아도 조용히 넘어간다 — 만료가 먼저
+        수확했을 수 있고, 그것은 오류가 아니다."""
+        self._conn.execute("DELETE FROM node_leases WHERE id = ?", (lease_id,))
+        self._conn.commit()
 
     def job_by_idempotency_key(
         self, scope: TenantScope, service_id: str, key: str

@@ -244,20 +244,23 @@ def test_a_failed_transaction_leaves_nothing_behind(shared_db):
     assert found is None, "롤백됐어야 할 쓰기가 다른 프로세스에서 보인다"
 
 
-# ── 3. 알려진 한계 — 슬롯 장부는 프로세스 로컬이다 ──────────────────────────
+# ── 3. 슬롯 장부는 프로세스를 넘어 성립한다 ─────────────────────────────────
 
 
-def test_the_slot_ledger_does_not_cross_processes(shared_db):
-    """**부채 표의 그 항목을 실행 가능한 형태로 못박는다.**
+def test_the_slot_ledger_crosses_processes(shared_db):
+    """**`max_concurrent=1` 노드에 워커 N 개가 동시에 달려들어도 1건이다.**
 
-    `cluster.place()` 는 `threading.Lock` 아래서 확인-후-차감을 원자화하는데, 그
-    장부는 프로세스 메모리다. 비동기 경로는 스케줄러가 싱글턴이라 안전하지만
-    **동기 경로 두 곳**(`/v1/embed` · 가드 2단 분류)은 API 워커에서 `place()` 를
-    부르므로, 워커 N 개면 `max_concurrent=1` 노드에 N 건이 동시에 올라간다.
+    한동안 이 파일에는 정반대 단언이 있었다 — 예약이 워커 메모리에 있어서 N 건이
+    전부 올라가는 것을 "알려진 한계" 로 못박아 뒀다. `place()` 가 `threading.Lock`
+    아래서 확인-후-차감을 원자화하긴 했지만, 락은 프로세스를 넘지 못한다.
 
-    그래서 이 테스트는 "고쳐야 할 버그" 가 아니라 **문서가 주장하는 한계가 실제로
-    그러한지**를 잰다. 언젠가 예약을 DB 로 옮기면 여기가 실패하고, 그때 부채 표를
-    함께 고치라는 신호가 된다.
+    비동기 경로는 스케줄러가 싱글턴이라 원래 안전했다. 문제는 **동기 경로 두 곳**
+    (`/v1/embed` · 가드 2단 분류)이 API 워커에서 `place()` 를 부른다는 것이었고,
+    다중 워커가 지원 구성인 이상(architecture.md §11) 그 창은 실제로 열린다.
+    `max_concurrent=1` 로 잡아 둔 단일 GPU 노드에 N 건이 올라가면 OOM 이다.
+
+    유일성이 그랬듯 **용량도 DB 가 지킨다** — `node_leases` 에 행을 넣는 쓰기
+    트랜잭션 안에서 용량을 다시 확인하고, 진 쪽은 `False` 를 받아 다음 후보로 간다.
     """
     outcomes = run_workers(_place_worker, shared_db)
 
@@ -265,24 +268,64 @@ def test_the_slot_ledger_does_not_cross_processes(shared_db):
     assert not failures, f"워커가 오류를 냈다: {failures}"
 
     placed = [ok for _, ok in outcomes if ok]
-    assert len(placed) == WORKERS, (
-        "슬롯 예약이 프로세스를 넘어 성립한다 — 예약이 DB 로 옮겨졌다면 "
-        "architecture.md §11 과 README 부채 표를 함께 고쳐야 한다"
+    assert len(placed) == 1, (
+        f"슬롯 1개짜리 노드에 {len(placed)}건이 배치됐다 — 워커 {WORKERS}개가 "
+        "각자 자기 장부를 보고 있다"
     )
 
+    verify = SqliteStore(shared_db)
+    try:
+        rows = verify._conn.execute("SELECT COUNT(*) AS n FROM node_leases").fetchone()
+        assert rows["n"] == 1, "리스 행이 배치 건수와 안 맞는다"
+    finally:
+        verify.close()
 
-def test_the_debt_table_still_admits_the_process_local_ledger():
-    """위 테스트가 재는 사실이 **문서에도 적혀 있어야 한다.**
+
+def test_an_expired_lease_stops_holding_the_slot(shared_db):
+    """**만료가 없으면 DB 장부는 인메모리 장부보다 나쁘다.**
+
+    인메모리 예약은 워커가 죽으면 같이 사라진다. 행은 안 사라진다 — `release()` 를
+    못 부르고 죽은 워커의 예약이 남아 노드가 영원히 가득 찬 것처럼 보인다.
+    그래서 리스에 만료를 달았고, 이 테스트가 그 만료가 실제로 슬롯을 놓아주는지를
+    본다.
+    """
+    store = SqliteStore(shared_db)
+    try:
+        assert store.try_acquire_node_lease(
+            lease_id="죽은-워커", node="solo", mem_gb=0.0, now=1000.0,
+            ttl_seconds=60.0, max_concurrent=1, mem_budget_gb=None,
+        )
+        # 아직 살아 있다 — 두 번째는 못 들어간다.
+        assert not store.try_acquire_node_lease(
+            lease_id="다음", node="solo", mem_gb=0.0, now=1030.0,
+            ttl_seconds=60.0, max_concurrent=1, mem_budget_gb=None,
+        )
+        # 만료 뒤에는 들어간다.
+        assert store.try_acquire_node_lease(
+            lease_id="다음", node="solo", mem_gb=0.0, now=1100.0,
+            ttl_seconds=60.0, max_concurrent=1, mem_budget_gb=None,
+        )
+        assert store.node_occupancy(1100.0)["solo"] == (1, 0.0), (
+            "만료된 리스가 아직 세어지고 있다"
+        )
+    finally:
+        store.close()
+
+
+def test_the_debt_table_no_longer_claims_a_process_local_ledger():
+    """**코드가 고쳐졌으면 문서도 고쳐져야 한다.**
 
     코드의 한계와 문서의 한계가 갈리면 둘 중 하나는 거짓말이고, 설치처는 문서를
-    읽는다.
+    읽는다. 방향이 뒤집혔을 뿐 장치의 취지는 전과 같다.
     """
     from pathlib import Path
 
     readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
         encoding="utf-8"
     )
-    assert "프로세스 로컬" in readme, "슬롯 장부의 한계가 부채 표에서 사라졌다"
+    assert "슬롯 예약이 프로세스 로컬" not in readme, (
+        "슬롯 장부가 DB 로 갔는데 부채 표는 아직 프로세스 로컬이라고 말한다"
+    )
 
 
 # ── 4. 멱등성은 DB 가 지킨다 ────────────────────────────────────────────────
