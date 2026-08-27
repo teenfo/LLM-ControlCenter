@@ -25,9 +25,9 @@ import asyncio
 import contextlib
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from .cluster import FAIL, PLACED, WAIT, Cluster, Placement
+from .cluster import FAIL, WAIT, Cluster, Placement
 from .config import EXTERNAL, Config
 from .cost import CostAccountant
 from .models import ModelRegistrar

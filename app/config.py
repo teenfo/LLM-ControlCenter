@@ -253,6 +253,15 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def node_from_dict(name: str, raw: Mapping[str, Any]) -> Node:
+    """선언 하나를 `Node` 로. YAML 시드와 런타임 등록이 **같은 검증을 지난다.**
+
+    두 경로가 각자 검증하면 UI 로 등록한 노드만 통과하는 조합이 생기고, 그 조합이
+    하필 `data_boundary` 같은 안전 필드일 때 아무도 모르게 경계가 열린다.
+    """
+    return _node_from_dict(name, raw)
+
+
 def _node_from_dict(name: str, raw: Mapping[str, Any]) -> Node:
     boundary = raw.get("data_boundary", EXTERNAL)
     if boundary not in BOUNDARIES:

@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from .config import EXTERNAL, INTERNAL, Config, GuardRule, GuardSettings
+from .i18n import ApiError
 
 #: 등급 강도. 테넌트는 이 순서에서 **올릴 수만** 있다.
 ACTION_STRENGTH = {"off": 0, "audit": 1, "partial": 2, "full": 3, "block": 4}
@@ -200,6 +201,22 @@ class Guard:
             if rule.kind == "pattern" and rule.pattern
         }
 
+    def set_classifier(self, classifier: Classifier | None) -> None:
+        """2단 분류기를 나중에 꽂는다.
+
+        배선이 원형이기 때문이다 — 가드는 분류기가 필요하고, 분류기는 클러스터 배치가
+        필요하고, 파이프라인은 가드가 필요하다. 생성자에서 다 묶으려면 셋 중 하나를
+        반쯤 만든 채로 넘겨야 하고, 그러면 "가드가 분류기 없이 도는 조합" 이 조용히
+        정상 경로가 된다. **한 줄로 명시적으로 꽂는 쪽이 낫다.**
+        """
+        self._classifier = classifier
+
+    @property
+    def has_classifier(self) -> bool:
+        """2단이 살아 있는가. 관제 UI 가 이것을 표시해야 한다 —
+        분류기가 안 꽂힌 설치는 맥락 규칙을 만들어도 아무것도 판정하지 않는다."""
+        return self._classifier is not None
+
     # -- 규칙 해석 -------------------------------------------------------------
 
     def rules_for(
@@ -228,6 +245,45 @@ class Guard:
                 self._compiled[rule.id] = re.compile(rule.pattern)
 
         return tuple(merged.values())
+
+    def validate_rule(self, raw: Mapping[str, Any]) -> None:
+        """테넌트가 저장하려는 규칙이 말이 되는가.
+
+        저장 시점에 잡지 않으면 **다음 요청에서 정규식 컴파일 에러로 가드 전체가
+        멈춘다** — 필터가 죽으면 프롬프트가 검사 없이 나가거나 서비스가 통째로 선다.
+        어느 쪽이든 규칙 하나를 잘못 적은 대가로는 지나치다.
+        """
+        rule_id = str(raw.get("id") or "")
+        if not rule_id:
+            raise ApiError("missing_field", status=400, params={"field": "id"})
+
+        kind = str(raw.get("kind") or "pattern")
+        if kind not in ("pattern", "llm"):
+            raise ApiError("invalid_field", status=400, params={"field": "kind"})
+
+        action = raw.get("action")
+        grades = action.values() if isinstance(action, Mapping) else [action]
+        for grade in grades:
+            if grade not in ACTION_STRENGTH:
+                raise ApiError("invalid_field", status=400, params={"field": "action"})
+        if isinstance(action, Mapping) and set(action) - {INTERNAL, EXTERNAL}:
+            raise ApiError("invalid_field", status=400, params={"field": "action"})
+
+        checksum = raw.get("checksum")
+        if checksum and checksum not in CHECKSUMS:
+            raise ApiError("invalid_field", status=400, params={"field": "checksum"})
+
+        if kind == "pattern":
+            pattern = raw.get("pattern")
+            if not pattern:
+                raise ApiError("missing_field", status=400, params={"field": "pattern"})
+            try:
+                re.compile(pattern)
+            except re.error:
+                raise ApiError("invalid_field", status=400, params={"field": "pattern"})
+        elif not raw.get("description"):
+            # LLM 규칙은 설명이 곧 판정 기준이다. 비어 있으면 분류기가 물어볼 것이 없다.
+            raise ApiError("missing_field", status=400, params={"field": "description"})
 
     # -- 검사 -----------------------------------------------------------------
 

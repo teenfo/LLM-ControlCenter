@@ -24,8 +24,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .config import EXTERNAL, INTERNAL, Config, Node, Role
+from .config import EXTERNAL, INTERNAL, Config, ConfigError, Node, Role, node_from_dict
 from .cost import CostAccountant
+from .i18n import ApiError
 from .providers import Provider, build_provider
 from .store import SqliteStore, TenantScope
 
@@ -38,6 +39,15 @@ HEALTHY = "healthy"
 UNHEALTHY = "unhealthy"
 UNKNOWN = "unknown"
 DRAINING = "draining"
+
+#: 노드 등록 본문이 받는 필드. `name` 은 따로 뽑으므로 여기 없다.
+NODE_REGISTRATION_FIELDS = frozenset(
+    {
+        "provider", "base_url", "api_key_env", "auth_header_env", "data_boundary",
+        "mem_budget_gb", "max_concurrent", "tags", "models", "tenant_affinity",
+        "enabled", "metered_override",
+    }
+)
 
 
 @dataclass
@@ -416,6 +426,60 @@ class Cluster:
     async def probe_all(self) -> dict[str, bool]:
         return {name: await self.probe(name) for name in self._nodes}
 
+    # -- 등록 -----------------------------------------------------------------
+
+    async def register_node(
+        self, raw: Mapping[str, Any], *, actor: str = "", airgap: bool = False
+    ) -> tuple[NodeState, bool]:
+        """노드를 편입한다. **노드에는 아무것도 설치하지 않는다** — URL 만 받는다.
+
+        등록 즉시 프로브해서 도달성·모델 인벤토리를 수집하고, 실패해도 등록은 남긴다.
+        실패를 등록 실패로 처리하면 관리자가 오타와 "아직 안 켬" 을 구분할 수 없다.
+        **다만 그 사실을 반환값으로 즉시 알린다** — 설치 후에 조용히 안 붙는 것이
+        제품에서 가장 나쁜 경험이다.
+
+        반환의 두 번째 값이 프로브 도달 여부다. `status` 와 다른 값인 것이 중요하다 —
+        헬스는 플래핑 방지를 위해 연속 2회 성공을 요구하므로 방금 등록한 노드는 잘
+        붙었어도 `unknown` 이다. **"연결됐는가" 와 "안정적인가" 는 다른 질문이고,
+        등록 화면이 필요한 것은 앞쪽이다.**
+
+        자동 발견은 하지 않는다. 노드가 조용히 늘면 비용과 데이터 경계가 조용히 는다.
+        """
+        node = _node_from_registration(dict(raw))
+
+        if node.name in self._nodes:
+            raise ApiError("invalid_field", status=409, params={"field": "name"})
+
+        # 경계 밖 노드는 공개망을 지난다는 뜻이므로 TLS·인증을 필수로 강제한다.
+        if not node.is_internal and node.base_url:
+            if not node.base_url.lower().startswith("https://"):
+                raise ApiError("external_node_requires_auth", status=400)
+            if not (node.api_key_env or node.auth_header_env):
+                raise ApiError("external_node_requires_auth", status=400)
+
+        if airgap and not node.is_internal:
+            # 설정에 남아 있는데 조용히 실패하는 것이 최악이다. 등록에서 거절한다.
+            raise ApiError("airgap_cloud_disabled", status=400)
+
+        state = NodeState(node=node, provider=build_provider(node))
+        self._nodes[node.name] = state
+        self._store.audit(
+            actor or "platform_admin", "register_node", target=node.name,
+            detail={
+                "provider": node.provider,
+                "data_boundary": node.data_boundary,
+                "max_concurrent": node.max_concurrent,
+                "tenant_affinity": list(node.tenant_affinity),
+            },
+        )
+
+        try:
+            reachable = await self.probe(node.name)
+        except Exception as exc:  # 프로브 실패가 등록을 되돌리지는 않는다
+            self.record_failure(node.name, str(exc))
+            reachable = False
+        return state, reachable
+
     def drain(self, node: str, *, force: bool = False) -> None:
         """노드를 비활성화한다.
 
@@ -498,6 +562,31 @@ class Cluster:
             }
             for s in self._nodes.values()
         ]
+
+
+def _node_from_registration(raw: dict[str, Any]) -> Node:
+    """등록 본문을 `Node` 로. **YAML 시드와 같은 검증기를 지난다.**
+
+    `data_boundary` 를 안 적으면 `external` 이 된다(fail-safe) — 안 적은 노드를
+    내부로 간주하면 실수가 새는 쪽으로 향한다.
+    """
+    name = str(raw.pop("name", "") or "").strip()
+    if not name:
+        raise ApiError("missing_field", status=400, params={"field": "name"})
+    if not raw.get("provider"):
+        raise ApiError("missing_field", status=400, params={"field": "provider"})
+
+    # **모르는 키를 거절한다.** YAML 은 전진 호환을 위해 모르는 키를 흘려보내지만
+    # 등록 API 는 방금 사람이 친 값이다. `data_boundry` 오타를 조용히 무시하면
+    # external 기본값이 적용되고, 아무도 모르는 채 경계가 정해진다.
+    unknown = sorted(set(raw) - NODE_REGISTRATION_FIELDS)
+    if unknown:
+        raise ApiError("invalid_field", status=400, params={"field": ", ".join(unknown)})
+
+    try:
+        return node_from_dict(name, raw)
+    except ConfigError as exc:
+        raise ApiError("invalid_field", status=400, params={"field": str(exc)})
 
 
 def _dominant_reason(rejections: Mapping[str, str]) -> str:

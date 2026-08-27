@@ -56,7 +56,11 @@ class MockProvider:
         )
 
         # -- 연출 손잡이 (테스트·데모에서 직접 만진다) --
-        self.online = True
+        #
+        # `offline` 태그를 달면 죽은 채로 시작한다. 데모 시드가 "안 붙는 노드" 를
+        # 미리 심어 두고 등록 화면·노드 그리드가 그것을 어떻게 보여주는지 시연할 수
+        # 있어야 하기 때문이다 — 살아 있는 노드만 있는 데모는 관제를 못 보여준다.
+        self.online = "offline" not in tuple(getattr(node, "tags", ()) or ())
         self.fail_next = 0            # 다음 N회 호출을 실패시킨다
         self.fail_retryable = True
         self.installed: set[str] = set(self._models)

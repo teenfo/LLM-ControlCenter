@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 from .config import Config, GuardRule
 from .guard import ACTION_STRENGTH, Guard

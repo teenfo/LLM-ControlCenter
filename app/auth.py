@@ -280,6 +280,22 @@ class RateLimiter:
         for _, key, _ in checks:
             self._store.bump_rate_counter(key, bucket)
 
+    def check_named(self, key: str, limit: int, *, scope_label: str) -> None:
+        """이름 붙은 별도 한도. 상태 조회(폴링)처럼 제출과 다르게 재야 하는 경로용.
+
+        폴링을 제출과 같은 한도에 넣으면 둘 중 하나를 잘못 잡게 된다 — 제출 기준으로
+        맞추면 정상적인 대기 폴링이 429 를 맞고, 폴링 기준으로 맞추면 제출 한도가
+        무의미해진다. 그래서 넉넉한 별도 창을 준다.
+        """
+        bucket = int(self._now())
+        since = bucket - RATE_WINDOW_SECONDS + 1
+        if self._store.rate_count(key, since) >= limit:
+            raise ApiError(
+                "rate_limited", status=429, retryable=True,
+                params={"scope": scope_label, "limit": limit},
+            )
+        self._store.bump_rate_counter(key, bucket)
+
     def prune(self) -> int:
         """윈도를 벗어난 버킷을 정리한다. 스케줄러의 보존 루프가 주기적으로 부른다."""
         return self._store.prune_rate_counters(

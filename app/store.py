@@ -278,6 +278,37 @@ CREATE TABLE IF NOT EXISTS role_overrides (
     PRIMARY KEY (tenant_id, role)
 );
 
+-- 테넌트 관리자가 바꿀 수 있는 설정. 컬럼을 늘리는 대신 키·값으로 둔 이유는,
+-- 설정 항목이 늘 때마다 ADD COLUMN 마이그레이션을 찍는 것이 과하기 때문이다.
+-- **정책의 하한은 여기 없다** — 그건 플랫폼 소유라 YAML 에 있다.
+CREATE TABLE IF NOT EXISTS tenant_settings (
+    tenant_id  TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (tenant_id, key)
+);
+
+-- 테넌트가 추가·강화한 가드 규칙.
+--
+-- 베이스라인은 YAML(플랫폼 소유)이고 이 테이블은 그 위에 얹는 층이다. 완화 여부는
+-- 스토어가 아니라 `guard.rules_for()` 가 판정한다 — 두 곳에서 판정하면 언젠가 갈린다.
+CREATE TABLE IF NOT EXISTS tenant_guard_rules (
+    tenant_id   TEXT NOT NULL,
+    rule_id     TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'pattern',
+    action_json TEXT NOT NULL,
+    label       TEXT,
+    pattern     TEXT,
+    checksum    TEXT,
+    keep_tail   INTEGER NOT NULL DEFAULT 0,
+    description TEXT,
+    locale_pack TEXT NOT NULL DEFAULT 'common',
+    updated_by  TEXT,
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (tenant_id, rule_id)
+);
+
 CREATE TABLE IF NOT EXISTS admin_audit (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -823,6 +854,99 @@ class SqliteStore:
         ).fetchone()
         return float(row["total"])
 
+    #: 사용량을 묶을 수 있는 축. **화이트리스트인 이유는 SQL 주입 때문**이다 —
+    #: 그룹 컬럼은 파라미터로 못 넘기므로 문자열로 붙여야 하고, 그러면 검증이 유일한 방어다.
+    USAGE_AXES = ("service_id", "end_user_hash", "role", "model", "node", "provider")
+
+    def usage_summary(
+        self, scope: TenantScope, *, since: float, group_by: str = "service_id"
+    ) -> list[dict[str, Any]]:
+        """`서비스 × 엔드유저 × 역할 × 노드` 축의 집계."""
+        if group_by not in self.USAGE_AXES:
+            raise StoreError(f"알 수 없는 집계 축: {group_by}")
+
+        where, params = self._scoped_where(scope, "ts >= ?")
+        params.append(since)
+        rows = self._conn.execute(
+            f"SELECT {group_by} AS key, COUNT(*) AS calls, "
+            "SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, "
+            "SUM(cost_usd) AS cost_usd, AVG(duration_ms) AS avg_duration_ms, "
+            "SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok "
+            f"FROM usage WHERE {where} GROUP BY {group_by} ORDER BY calls DESC",
+            params,
+        )
+        return [
+            {
+                "key": row["key"],
+                "calls": row["calls"],
+                "input_tokens": row["input_tokens"] or 0,
+                "output_tokens": row["output_tokens"] or 0,
+                "cost_usd": round(row["cost_usd"] or 0.0, 6),
+                "avg_duration_ms": int(row["avg_duration_ms"] or 0),
+                "ok": row["ok"],
+                "success_rate": round((row["ok"] or 0) / row["calls"], 4) if row["calls"] else 0.0,
+            }
+            for row in rows
+        ]
+
+    def queued_wait_reasons(self) -> dict[str, int]:
+        """대기 사유별 잡 수. 관제 UI 의 1급 카드다.
+
+        "노드 정비로 대기 12건" 을 보여주지 못하면 관리자는 큐가 왜 안 줄어드는지
+        알 수 없고, 알 수 없으면 노드를 늘리는 잘못된 대응을 한다.
+        """
+        rows = self._conn.execute(
+            "SELECT COALESCE(wait_reason, 'none') AS reason, COUNT(*) AS n "
+            "FROM jobs WHERE status='queued' GROUP BY reason"
+        )
+        return {row["reason"]: row["n"] for row in rows}
+
+    def export_tenant(self, scope: TenantScope) -> dict[str, Any]:
+        """내보내기 — **마스킹본 기준.**
+
+        `prompt_cipher` · `prompt_nonce` 는 담지 않는다. 내보내기 파일이 원문을 나르면
+        보관 기간과 접근 감사가 그 파일 밖에서 모두 무력화된다.
+        """
+        where, params = self._scoped_where(scope)
+        jobs = [
+            {
+                k: row[k]
+                for k in row.keys()
+                if k not in ("prompt_cipher", "prompt_nonce")
+            }
+            for row in self._conn.execute(f"SELECT * FROM jobs WHERE {where}", params)
+        ]
+        where, params = self._scoped_where(scope)
+        usage = [dict(row) for row in self._conn.execute(f"SELECT * FROM usage WHERE {where}", params)]
+        where, params = self._scoped_where(scope)
+        events = [
+            dict(row)
+            for row in self._conn.execute(f"SELECT * FROM filter_events WHERE {where}", params)
+        ]
+        where, params = self._scoped_where(scope)
+        audit = [
+            dict(row)
+            for row in self._conn.execute(f"SELECT * FROM admin_audit WHERE {where}", params)
+        ]
+
+        tenant = self.get_tenant(scope.tenant_id)
+        return {
+            "tenant": {
+                "id": scope.tenant_id,
+                "name": tenant["name"] if tenant else None,
+                "locale": tenant["locale"] if tenant else None,
+            },
+            "exported_at": self._now(),
+            "services": [dict(row) for row in self.list_services(scope)],
+            "settings": self.tenant_settings(scope),
+            "guard_rules": self.list_tenant_guard_rules(scope),
+            "role_overrides": self.get_role_overrides(scope),
+            "jobs": jobs,
+            "usage": usage,
+            "filter_events": events,
+            "audit": audit,
+        }
+
     def record_filter_event(
         self,
         scope: TenantScope,
@@ -1035,6 +1159,102 @@ class SqliteStore:
         where, params = self._scoped_where(scope, "role = ?")
         params.append(role)
         cur = self._conn.execute(f"DELETE FROM role_overrides WHERE {where}", params)
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # -- 테넌트 설정 -----------------------------------------------------------
+
+    def set_tenant_setting(self, scope: TenantScope, key: str, value: Any) -> None:
+        self._scoped_where(scope)
+        self._conn.execute(
+            "INSERT INTO tenant_settings(tenant_id, key, value_json, updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(tenant_id, key) DO UPDATE SET "
+            "value_json=excluded.value_json, updated_at=excluded.updated_at",
+            (scope.tenant_id, key, _json(value), self._now()),
+        )
+        self._conn.commit()
+
+    def tenant_setting(self, scope: TenantScope, key: str, default: Any = None) -> Any:
+        where, params = self._scoped_where(scope, "key = ?")
+        params.append(key)
+        row = self._conn.execute(
+            f"SELECT value_json FROM tenant_settings WHERE {where}", params
+        ).fetchone()
+        return json.loads(row["value_json"]) if row else default
+
+    def tenant_settings(self, scope: TenantScope) -> dict[str, Any]:
+        where, params = self._scoped_where(scope)
+        return {
+            row["key"]: json.loads(row["value_json"])
+            for row in self._conn.execute(
+                f"SELECT key, value_json FROM tenant_settings WHERE {where}", params
+            )
+        }
+
+    def set_tenant_locale(self, scope: TenantScope, locale: str) -> None:
+        """테넌트 기본 로케일. 이 값이 가드 로케일 팩까지 정한다 — 단순 번역이 아니다."""
+        self._scoped_where(scope)
+        self._conn.execute(
+            "UPDATE tenants SET locale = ? WHERE id = ?", (locale, scope.tenant_id)
+        )
+        self._conn.commit()
+
+    # -- 테넌트 가드 규칙 ------------------------------------------------------
+
+    def set_tenant_guard_rule(
+        self, scope: TenantScope, rule: Mapping[str, Any], *, updated_by: str = ""
+    ) -> None:
+        """테넌트 규칙을 저장한다. **완화 여부는 여기서 판정하지 않는다.**
+
+        판정을 스토어와 가드 두 곳에 두면 언젠가 둘이 갈리고, 갈리는 순간 어느 쪽이
+        진짜 정책인지 아무도 모르게 된다. 스토어는 보관만 하고 `guard.rules_for()` 가
+        베이스라인과 병합하면서 강한 쪽을 채택한다.
+        """
+        self._scoped_where(scope)
+        self._conn.execute(
+            "INSERT INTO tenant_guard_rules(tenant_id, rule_id, kind, action_json, label, "
+            "pattern, checksum, keep_tail, description, locale_pack, updated_by, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tenant_id, rule_id) DO UPDATE SET "
+            "kind=excluded.kind, action_json=excluded.action_json, label=excluded.label, "
+            "pattern=excluded.pattern, checksum=excluded.checksum, keep_tail=excluded.keep_tail, "
+            "description=excluded.description, locale_pack=excluded.locale_pack, "
+            "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+            (
+                scope.tenant_id, str(rule["id"]), str(rule.get("kind", "pattern")),
+                _json(rule["action"]), rule.get("label"), rule.get("pattern"),
+                rule.get("checksum"), int(rule.get("keep_tail", 0)),
+                rule.get("description"), str(rule.get("locale_pack", "common")),
+                updated_by, self._now(),
+            ),
+        )
+        self._conn.commit()
+
+    def list_tenant_guard_rules(self, scope: TenantScope) -> list[dict[str, Any]]:
+        where, params = self._scoped_where(scope)
+        rows = self._conn.execute(
+            f"SELECT * FROM tenant_guard_rules WHERE {where} ORDER BY rule_id", params
+        )
+        return [
+            {
+                "id": row["rule_id"],
+                "kind": row["kind"],
+                "action": json.loads(row["action_json"]),
+                "label": row["label"] or "",
+                "pattern": row["pattern"],
+                "checksum": row["checksum"],
+                "keep_tail": row["keep_tail"],
+                "description": row["description"],
+                "locale_pack": row["locale_pack"],
+                "updated_by": row["updated_by"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def clear_tenant_guard_rule(self, scope: TenantScope, rule_id: str) -> bool:
+        where, params = self._scoped_where(scope, "rule_id = ?")
+        params.append(rule_id)
+        cur = self._conn.execute(f"DELETE FROM tenant_guard_rules WHERE {where}", params)
         self._conn.commit()
         return cur.rowcount > 0
 
@@ -1308,7 +1528,10 @@ class SqliteStore:
             raise ScopeViolation("테넌트 파기는 PlatformScope 를 요구한다")
 
         counts: dict[str, int] = {}
-        for table in ("jobs", "usage", "filter_events", "role_overrides", "tokens", "services"):
+        for table in (
+            "jobs", "usage", "filter_events", "role_overrides", "tenant_guard_rules",
+            "tenant_settings", "eval_fixtures", "tokens", "services",
+        ):
             counts[table] = self._conn.execute(
                 f"DELETE FROM {table} WHERE tenant_id = ?", (tenant_id,)
             ).rowcount

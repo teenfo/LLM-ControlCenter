@@ -8,7 +8,6 @@ from app.cluster import HEALTHY, Cluster
 from app.config import CatalogEntry, Config, GuardSettings, Lane, Node, Pricing, Role, Thresholds
 from app.i18n import ApiError
 from app.models import (
-    APPROVED,
     BLOCK_EMBEDDING_ROLE,
     BLOCK_INSTALLING,
     BLOCK_QUEUED_JOBS,
@@ -17,7 +16,6 @@ from app.models import (
     FAILED,
     PENDING,
     READY,
-    REJECTED,
     ModelRegistrar,
 )
 from app.store import SqliteStore, TenantScope

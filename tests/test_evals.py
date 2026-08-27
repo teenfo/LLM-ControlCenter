@@ -9,7 +9,6 @@ from app.evals import (
     BUNDLED_FIXTURES,
     KIND_CLASSIFIER,
     MIN_REVIEWS_FOR_PROMOTION,
-    MIN_SAMPLES_FOR_CERTIFICATION,
     Evaluator,
     RuleEval,
 )

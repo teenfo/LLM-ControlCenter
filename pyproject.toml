@@ -30,5 +30,8 @@ include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 설치 없이도 `pytest -q` 한 줄로 돌아야 한다 — 검증 절차에 PYTHONPATH 설정이
+# 끼면 설치처에서 그 한 줄이 먼저 실패한다.
+pythonpath = ["."]
 asyncio_mode = "auto"
 filterwarnings = ["error::DeprecationWarning"]
