@@ -50,9 +50,44 @@ ROOT = Path(__file__).resolve().parent.parent
     "Dockerfile", "compose.yml", "preflight.sh", "doctor.sh",
     "backup.sh", "restore.sh", "bundle.sh", "README.md",
     "clients/client.py", "clients/mock_server.py",
+    "tls/nginx.conf",
 ])
 def test_the_bundle_has_what_the_install_needs(name):
     assert (ROOT / name).is_file(), name
+
+
+def test_the_proxy_config_blocks_the_platform_surface():
+    """**topology §2 가 주장하는 통제가 실제로 파일에 있어야 한다.**
+
+    표가 프록시의 차단을 제품의 통제로 적으면서 그 설정을 번들에 안 담으면, 그것은
+    설치처 숙제인데 보증처럼 읽힌다 — 그러면 아무도 그 숙제를 안 한다.
+    """
+    conf = (ROOT / "tls" / "nginx.conf").read_text(encoding="utf-8")
+
+    block = re.search(
+        r"location\s+/v1/platform/\s*\{[^}]*\}", conf, re.S
+    )
+    assert block, "플랫폼 관리 면 차단 블록이 없다"
+    assert "404" in block.group(0), "차단이 404 가 아니다 — 403 은 존재를 알려 준다"
+
+    # `/v1/admin/*` 은 테넌트 관리자의 API 다. 막으면 테넌트가 자기 토큰도 못 만든다.
+    assert not re.search(r"location\s+/v1/admin/\s*\{[^}]*return\s+40", conf, re.S), \
+        "테넌트 관리 면을 막았다 — 원격 관제가 성립하지 않는다"
+
+
+def test_the_trust_boundary_table_and_the_proxy_agree():
+    """문서와 설정이 **같은 경로**를 말하는지 본다. 갈라지면 둘 중 하나가 거짓말이다."""
+    topology = (ROOT / "docs" / "topology.md").read_text(encoding="utf-8")
+    assert "/v1/platform/*" in topology, "신뢰 경계 표가 차단 대상을 안 적었다"
+    assert "tls/nginx.conf" in topology, "표가 근거 파일을 가리키지 않는다"
+    assert re.search(r"/v1/admin/\*`?\s*\**\s*은 차단 대상이 아니다", topology), \
+        "테넌트 관리 면을 막으면 안 된다는 사실이 표에서 사라졌다"
+
+
+def test_the_bundle_script_ships_the_proxy_config():
+    """에어갭 번들에 안 담기면 오프라인 설치처에는 그 파일이 없다."""
+    text = (ROOT / "bundle.sh").read_text(encoding="utf-8")
+    assert re.search(r"^for item in .*\btls\b", text, re.M), "bundle.sh 가 tls 를 안 담는다"
 
 
 @pytest.mark.parametrize("name", ["preflight.sh", "doctor.sh", "backup.sh", "restore.sh", "bundle.sh"])

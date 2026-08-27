@@ -39,7 +39,7 @@ else
 fi
 
 printf '  · 소스·설정·자산\n'
-for item in app config locales static clients pyproject.toml compose.yml Dockerfile \
+for item in app config locales static clients tls pyproject.toml compose.yml Dockerfile \
             preflight.sh doctor.sh backup.sh restore.sh README.md docs; do
   [ -e "$item" ] && cp -r "$item" "$STAGE/"
 done

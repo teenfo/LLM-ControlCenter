@@ -24,3 +24,8 @@ llm-controlcenter-airgap-*.tgz
 backups/
 data/
 keys/
+
+# TLS 인증서 — nginx.conf 는 번들의 일부라 커밋하지만 키·인증서는 아니다
+/tls/*.pem
+/tls/*.key
+/tls/*.crt

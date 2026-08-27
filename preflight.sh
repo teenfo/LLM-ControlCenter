@@ -120,6 +120,11 @@ printf '    · data_boundary: internal 노드는 **신뢰 네트워크(사설망
 printf '      Ollama 는 기본 무인증입니다. 공개망에 열지 마세요.\n'
 printf '    · data_boundary: external 노드는 TLS 와 인증이 **필수**입니다(등록 시 강제).\n'
 printf '    · 마스터 KEK 와 백업은 **서로 다른 곳**에 보관하세요.\n'
+# 프록시 없이 공개망에 붙으면 플랫폼 관리 면이 그대로 노출된다. 역할 검사는 여전히
+# 돌지만, 노출을 줄이는 것은 앱이 아니라 프록시의 몫이라 여기서 말해 주지 않으면
+# 설치처는 tls 프로파일이 선택 사항인 줄 안다.
+printf '    · 앱을 공개망에 직접 붙이지 마세요. tls 프로파일의 프록시가 플랫폼 관리 면\n'
+printf '      (/v1/platform/*) 을 404 로 막습니다:  docker compose --profile tls up -d\n'
 
 printf '\n'
 if [ "$problems" -gt 0 ]; then
