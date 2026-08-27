@@ -128,7 +128,7 @@ def place(cluster: Cluster, role_name: str, **kwargs):
     role = cluster._config.roles[role_name]
     defaults = dict(
         job_id="j1", tenant_id="acme", service_id="acme-web",
-        role=role, prompt_chars=400,
+        role=role, prompt="a" * 400,
     )
     defaults.update(kwargs)
     return cluster.place(**defaults)
@@ -428,7 +428,7 @@ def test_metered_node_reserves_upper_bound(cluster, store):
     for name in ("in-1", "in-2"):
         cluster.nodes[name].status = UNHEALTHY
 
-    result = place(cluster, "summarize", prompt_chars=3000)
+    result = place(cluster, "summarize", prompt="a" * 3000)
 
     assert result.placement.node == "out-1"
     assert result.placement.reserved_cost_usd > 0
@@ -439,7 +439,7 @@ def test_budget_exhaustion_demotes_to_the_free_path(cluster, store):
     """예산이 떨어지면 무료 경로로 자동 강등 — 이것이 의도한 동작이다."""
     store.record_usage(ACME, service_id="acme-web", role="summarize", cost_usd=100.0)
 
-    result = place(cluster, "summarize", tenant_budget=1.0, prompt_chars=3000)
+    result = place(cluster, "summarize", tenant_budget=1.0, prompt="a" * 3000)
 
     assert result.outcome == PLACED
     assert result.placement.tier == "internal", "예산 소진인데 과금 경로를 탔다"
@@ -450,7 +450,7 @@ def test_budget_exhaustion_blocks_when_no_free_tier(cluster, store):
     for name in ("in-1", "in-2"):
         cluster.nodes[name].status = UNHEALTHY
 
-    result = place(cluster, "summarize", tenant_budget=1.0, prompt_chars=3000)
+    result = place(cluster, "summarize", tenant_budget=1.0, prompt="a" * 3000)
 
     assert result.outcome == WAIT
     assert result.rejections["out-1"].startswith("budget_exceeded")
@@ -688,3 +688,146 @@ async def test_a_broken_node_row_does_not_stop_startup(tmp_path, clock):
         assert cluster.nodes, "시드 노드까지 사라졌다"
     finally:
         reopened.close()
+
+
+# ── 감사 H6 — 노드 한 대 구성에서 재시도가 불가능했다 ────────────────────────
+
+
+def _single_node_cluster(store, clock) -> Cluster:
+    """Starter 프로파일 — 내장 노드 한 대."""
+    config = build_config(
+        nodes={"only": Node(name="only", provider="mock", data_boundary="internal",
+                            max_concurrent=2, tags=("internal",), models=("m",))},
+        roles={"r": Role(name="r", model="m", placement=("internal",))},
+    )
+    c = Cluster(config, store, now=clock)
+    c.nodes["only"].status = HEALTHY
+    c.nodes["only"].models = frozenset({"m"})
+    return c
+
+
+def test_a_single_node_install_can_still_retry(store, clock):
+    """**배제는 선호이지 금지가 아니다.**
+
+    노드가 한 대뿐인 Starter 구성에서 직전 실패 노드를 영구 배제하면 그 잡은
+    다시는 못 돈다. 재시도가 재배치를 동반해야 한다는 것(B7)은 죽은 노드로 3회
+    재시도하고 끝나지 말라는 뜻이지, 노드를 영구히 금지하라는 뜻이 아니었다.
+    """
+    cluster = _single_node_cluster(store, clock)
+
+    result = cluster.place(
+        job_id="j", tenant_id="acme", service_id="acme-web",
+        role=cluster._config.roles["r"], last_failed_node="only",
+    )
+
+    assert result.outcome == PLACED, f"재시도가 영원히 막혔다: {result.reason}"
+    assert result.placement.node == "only"
+
+
+def test_crash_recovery_does_not_strand_a_single_node_install(store, clock):
+    """크래시 복구가 `last_failed_node` 를 심는다 — 재기동만 해도 잡이 멈췄다."""
+    cluster = _single_node_cluster(store, clock)
+    job_id = store.create_job(
+        ACME, service_id="acme-web", role="r", lane="interactive", kind="generate",
+        status="running", priority=0, prompt_masked="x",
+    )
+    store.update_job(ACME, job_id, node="only")
+    counts = store.recover_running_jobs(cluster.metered_nodes())
+    assert counts["requeued"] == 1
+
+    job = store.get_job(ACME, job_id)
+    assert job.status == "queued"
+    assert job.last_failed_node == "only", "전제가 틀렸다 — 복구가 노드를 안 심었다"
+
+    result = cluster.place(
+        job_id=job.id, tenant_id="acme", service_id="acme-web",
+        role=cluster._config.roles["r"], last_failed_node=job.last_failed_node,
+    )
+    assert result.outcome == PLACED, "재기동 뒤 잡이 영원히 대기한다"
+
+
+def test_another_node_still_wins_over_the_failed_one(cluster):
+    """되살리는 것은 **다른 후보가 없을 때뿐**이다. 우선순위는 그대로다."""
+    cluster.nodes["out-1"].status = UNHEALTHY
+
+    result = place(cluster, "classify", last_failed_node="in-1")
+
+    assert result.placement.node == "in-2", "다른 후보가 있는데 실패 노드를 골랐다"
+
+
+def test_a_genuinely_dead_node_is_still_refused(store, clock):
+    """정말 죽은 노드는 연속 실패 3회에 `unhealthy` 가 되어 걸린다.
+
+    그것이 사실이고 `last_failed_node` 는 힌트다. **힌트가 사실을 이기면 안 된다.**
+    """
+    cluster = _single_node_cluster(store, clock)
+    cluster.nodes["only"].status = UNHEALTHY
+
+    result = cluster.place(
+        job_id="j", tenant_id="acme", service_id="acme-web",
+        role=cluster._config.roles["r"], last_failed_node="only",
+    )
+
+    assert result.outcome != PLACED
+    assert result.rejections["only"] == "unhealthy"
+
+
+def test_the_revived_node_is_not_reported_as_rejected(store, clock):
+    """되살렸는데 탈락 사유로도 남으면 UI 가 "왜 안 도는지" 를 거짓으로 말한다."""
+    cluster = _single_node_cluster(store, clock)
+
+    result = cluster.place(
+        job_id="j", tenant_id="acme", service_id="acme-web",
+        role=cluster._config.roles["r"], last_failed_node="only",
+    )
+
+    assert "only" not in result.rejections
+
+
+# ── 감사 H8 — 입력 토큰이 비용 예약에서 통째로 빠졌다 ────────────────────────
+
+
+def test_the_input_prompt_is_part_of_the_reservation(cluster):
+    """스케줄러가 길이를 `0` 으로 넘겨서 큐를 지난 모든 잡의 입력이 빠졌다.
+
+    긴 프롬프트가 과금 노드로 나가도 예약은 출력 토큰만 잡았고, 예산 초과가
+    **정산 뒤에야** 드러났다 — 예약의 목적이 정확히 그것을 막는 것인데.
+    """
+    for name in ("in-1", "in-2"):
+        cluster.nodes[name].status = UNHEALTHY
+
+    short = place(cluster, "summarize", job_id="a", prompt="짧다")
+    cluster.release(short.placement)
+    long = place(cluster, "summarize", job_id="b", prompt="가" * 20_000)
+
+    assert long.placement.reserved_cost_usd > short.placement.reserved_cost_usd, \
+        "프롬프트 길이가 예약에 반영되지 않는다"
+
+
+def test_korean_is_not_counted_as_if_it_were_english(cluster):
+    """하나의 비율로 뭉뚱그리면 한국어 입력 토큰을 서너 배 과소 추정한다.
+
+    과소 추정한 "상한 예약" 은 상한이 아니다.
+    """
+    for name in ("in-1", "in-2"):
+        cluster.nodes[name].status = UNHEALTHY
+
+    english = place(cluster, "summarize", job_id="a", prompt="a" * 3000)
+    cluster.release(english.placement)
+    korean = place(cluster, "summarize", job_id="b", prompt="가" * 3000)
+
+    assert korean.placement.reserved_cost_usd > english.placement.reserved_cost_usd
+
+
+def test_the_estimator_errs_high_not_low():
+    """정확할 수 없으므로 **어느 쪽으로 틀릴지를 고른다.**
+
+    과소 추정은 예산을 넘긴 뒤에 드러나고, 과대 추정은 정산에서 풀린다.
+    """
+    from app.cost import estimate_input_tokens
+
+    # 한글 한 글자가 토큰 하나 아래로 계상되면 안 된다.
+    assert estimate_input_tokens("가" * 100) >= 100
+    assert estimate_input_tokens("") == 0
+    # 영어는 그보다 낮게 잡힌다 — 같은 길이라도 토큰이 적다.
+    assert estimate_input_tokens("a" * 100) < estimate_input_tokens("가" * 100)

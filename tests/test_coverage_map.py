@@ -172,7 +172,14 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
     19: (
         "노드 장애 재시도는 같은 노드를 후보에서 제외한다",
         ("test_retry_avoids_the_node_that_just_failed",
-         "test_retry_excludes_the_node_that_just_failed"),
+         "test_retry_excludes_the_node_that_just_failed",
+         "test_another_node_still_wins_over_the_failed_one",
+         # 배제는 **다른 후보가 있을 때만**이다. 노드 한 대짜리 구성에서
+         # 영구 배제는 곧 재시도 불능이었다(감사 H6).
+         "test_a_single_node_install_can_still_retry",
+         "test_crash_recovery_does_not_strand_a_single_node_install",
+         "test_a_genuinely_dead_node_is_still_refused",
+         "test_the_revived_node_is_not_reported_as_rejected"),
     ),
     20: (
         "예산 초과 동시 디스패치는 예약 단계에서 막힌다(완료 후가 아니라)",
@@ -181,6 +188,11 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
             "test_budget_exhaustion_blocks_when_no_free_tier",
             "test_budget_exhaustion_demotes_to_the_free_path",
             "test_release_reservation_without_settlement",
+            # 예약이 상한이려면 입력 토큰이 들어가야 한다. 스케줄러가 길이를
+            # `0` 으로 넘겨서 큐를 지난 모든 잡의 입력이 빠져 있었다(감사 H8).
+            "test_the_input_prompt_is_part_of_the_reservation",
+            "test_korean_is_not_counted_as_if_it_were_english",
+            "test_the_estimator_errs_high_not_low",
         ),
     ),
     21: (
@@ -396,6 +408,12 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
             "test_logs_drop_prompt_bodies_and_secrets",
             "test_redact_strips_prompts_and_secrets",
             "test_metrics_never_carry_prompts",
+            # **느린 채널은 예외를 내지 않고 그냥 붙잡고 있는다** — 예외만
+            # 삼켜서는 "파이프라인을 안 죽인다" 가 반쪽이다(감사 H10).
+            "test_a_slow_channel_does_not_stall_the_event_loop",
+            "test_a_slow_channel_does_not_stall_a_request",
+            "test_the_offloaded_send_still_swallows_failures",
+            "test_a_channel_is_assumed_to_block_unless_it_says_otherwise",
         ),
     ),
     45: (

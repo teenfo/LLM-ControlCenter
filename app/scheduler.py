@@ -50,6 +50,19 @@ class LaneStats:
     wait_reasons: dict[str, int] = field(default_factory=dict)
 
 
+def _longest_outbound(job: Any) -> str:
+    """이 잡이 노드로 보낼 수 있는 가장 긴 텍스트. 비용 예약의 입력 근거다.
+
+    경계마다 마스킹 결과가 다르고(외부용이 더 많이 가려진다) 배치 전에는 어느 쪽으로
+    갈지 모른다. **예약은 상한이므로 긴 쪽을 쓴다** — 남는 예약은 정산에서 풀린다.
+    """
+    internal = (job.prompt_masked or "") + (job.system_masked or "")
+    external = (job.prompt_external or job.prompt_masked or "") + (
+        job.system_external or job.system_masked or ""
+    )
+    return max(internal, external, key=len)
+
+
 class Scheduler:
     def __init__(
         self,
@@ -204,7 +217,13 @@ class Scheduler:
             service_id=job.service_id,
             role=role,
             placement_snapshot=job.placement,
-            prompt_chars=0,
+            # **실제로 나갈 텍스트를 넘긴다.** 여기가 `0` 이었고, 그래서 큐를 지난
+            # 모든 잡의 입력 토큰이 비용 예약에서 빠졌다 — 긴 프롬프트가 과금 노드로
+            # 나가도 예약은 출력 토큰만 잡았고, 예산 초과가 정산 뒤에야 드러났다.
+            #
+            # 어느 경계로 갈지는 아직 모르므로 **둘 중 긴 쪽**을 쓴다. 예약은 상한이라
+            # 넉넉한 쪽으로 틀리는 것이 맞고, 남는 예약은 정산에서 풀린다.
+            prompt=_longest_outbound(job),
             tenant_budget=tenant["budget_usd_per_month"] if tenant else None,
             service_budget=service["budget_usd_per_month"] if service else None,
             last_failed_node=job.last_failed_node,

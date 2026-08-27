@@ -40,6 +40,10 @@ UNHEALTHY = "unhealthy"
 UNKNOWN = "unknown"
 DRAINING = "draining"
 
+#: 직전 실패 노드 탈락 사유. **다른 후보가 없으면 되살린다** — 배제는 선호이지
+#: 금지가 아니다. 노드 한 대짜리 구성에서 금지는 곧 재시도 불능이다.
+LAST_FAILED = "last_failed_node"
+
 #: 노드 등록 본문이 받는 필드. `name` 은 따로 뽑으므로 여기 없다.
 NODE_REGISTRATION_FIELDS = frozenset(
     {
@@ -227,7 +231,7 @@ class Cluster:
         service_id: str,
         role: Role,
         placement_snapshot: Sequence[str] = (),
-        prompt_chars: int = 0,
+        prompt: str = "",
         tenant_budget: float | None = None,
         service_budget: float | None = None,
         last_failed_node: str | None = None,
@@ -251,6 +255,9 @@ class Cluster:
 
         with self._lock:
             candidates: list[tuple[int, NodeState, str, str, float, float]] = []
+            # 직전 실패 노드만 남았을 때 쓸 후보. **배제는 선호이지 금지가 아니다** —
+            # 아래 주석 참고.
+            fallback: list[tuple[int, NodeState, str, str, float, float]] = []
 
             for tier_index, tier in enumerate(tiers):
                 for state in self._nodes.values():
@@ -261,13 +268,13 @@ class Cluster:
                     verdict = self._reject_reason(
                         state, role, model, tenant_id, last_failed_node, boundaries
                     )
-                    if verdict:
+                    if verdict and verdict != LAST_FAILED:
                         rejections.setdefault(state.name, verdict)
                         continue
 
                     cost = self._accountant.estimate_upper_bound(
                         provider=state.node.provider, model=model,
-                        prompt_chars=prompt_chars, max_output_tokens=max_output_tokens,
+                        prompt=prompt, max_output_tokens=max_output_tokens,
                     )
                     affordable, tripped = self._accountant.can_afford(
                         scope, cost,
@@ -280,7 +287,25 @@ class Cluster:
                         continue
 
                     mem = self.model_size_gb(model) if state.provider.capabilities.uses_memory_budget else 0.0
-                    candidates.append((tier_index, state, model, tier, cost, mem))
+                    entry = (tier_index, state, model, tier, cost, mem)
+                    (fallback if verdict == LAST_FAILED else candidates).append(entry)
+
+            if not candidates and fallback:
+                # **다른 후보가 있을 때만 배제한다.**
+                #
+                # 재시도가 재배치를 동반해야 한다는 것(B7)은 죽은 노드로 3회 재시도하고
+                # 끝나지 말라는 뜻이지, 노드를 영구히 금지하라는 뜻이 아니었다.
+                # 노드가 한 대뿐인 Starter 구성에서는 배제가 곧 **재시도 불능**이고,
+                # 크래시 복구가 `last_failed_node` 를 심기 때문에 컨트롤 플레인 재기동만
+                # 해도 그 잡들이 통째로 멈춘다.
+                #
+                # 정말 죽은 노드는 연속 실패 3회에 `unhealthy` 가 되어 위에서 걸린다.
+                # 그것이 사실이고 `last_failed_node` 는 힌트다. 힌트가 사실을 이기면 안 된다.
+                # 재시도 백오프(2→4→8초)가 되돌아가는 간격을 이미 벌려 준다.
+                for name in tuple(rejections):
+                    if rejections[name] == LAST_FAILED:
+                        del rejections[name]
+                candidates = fallback
 
             if not candidates:
                 return self._no_candidate_result(role, tiers, rejections)
@@ -374,7 +399,9 @@ class Cluster:
 
         if last_failed_node and state.name == last_failed_node:
             # 재시도는 재배치를 동반한다 — 죽은 노드로 3회 재시도하고 끝나면 안 된다.
-            return "last_failed_node"
+            # **다만 이건 마지막 필터다.** 호출자가 다른 후보가 없을 때 되살릴 수
+            # 있도록 맨 뒤에 두고, 여기까지 온 노드는 그 외의 조건을 모두 통과했다.
+            return LAST_FAILED
 
         return None
 

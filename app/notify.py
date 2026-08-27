@@ -15,12 +15,18 @@ unknown → healthy 로 처음 전이하는 것처럼 보인다. 배포할 때�
 **③ 실패가 파이프라인을 죽이지 않는다.** 웹훅 URL 오타 하나로 추론이 멈추면
 알림이 장애의 원인이 된다. 예외를 삼키고 로그만 남긴다.
 
+**④ 이벤트 루프 위에서 네트워크를 만지지 않는다.** 웹훅은 최대 5초, SMTP 는 최대
+10초를 동기로 기다린다. 그 동안 **다른 모든 요청이 멈춘다** — 알림 채널 하나가
+느려지면 관제 센터 전체가 느려지고, ③이 막으려던 "알림이 장애의 원인이 되는" 일이
+예외가 아니라 지연으로 일어난다. 그래서 블로킹 채널은 스레드로 넘긴다.
+
 그리고 **비밀·프롬프트·응답 본문을 담지 않는다.** 알림 채널은 대개 사내 메신저이고,
 거기에 프롬프트가 흘러가면 가드의 모든 노력이 마지막 한 걸음에서 무의미해진다.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -28,6 +34,7 @@ import smtplib
 import ssl
 import threading
 import time
+from concurrent import futures
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -35,6 +42,33 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from .i18n import DEFAULT_LOCALE, Translator
 
 log = logging.getLogger("llmcc.notify")
+
+#: 블로킹 채널 발송용 스레드 풀. **알림은 저빈도**라 작게 잡고, 프로세스 전체가
+#: 하나를 나눠 쓴다 — 알림기마다 풀을 두면 테스트에서만 수십 개가 생긴다.
+#: 큐가 밀리면 발송이 늦어질 뿐 요청 경로는 그대로다(그게 넘긴 이유다).
+_POOL_WORKERS = 4
+_pool_lock = threading.Lock()
+_shared_pool: futures.ThreadPoolExecutor | None = None
+
+
+def _pool() -> futures.ThreadPoolExecutor:
+    global _shared_pool
+    with _pool_lock:
+        if _shared_pool is None:
+            _shared_pool = futures.ThreadPoolExecutor(
+                max_workers=_POOL_WORKERS, thread_name_prefix="llmcc-notify"
+            )
+        return _shared_pool
+
+
+def _loop_is_running() -> bool:
+    """이벤트 루프 위인가. 아니면(CLI·부트스트랩) 막을 루프가 없으니 그냥 보낸다."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
 
 ENV_WEBHOOK = "LCC_NOTIFY_WEBHOOK"
 ENV_SMTP_HOST = "LCC_SMTP_HOST"
@@ -96,6 +130,10 @@ def redact(detail: Mapping[str, Any]) -> dict[str, Any]:
 
 class Channel(Protocol):
     name: str
+    #: 이 채널의 `send` 가 네트워크·디스크를 만지는가. **기본은 그렇다고 본다** —
+    #: 모르는 채널을 인메모리로 가정하면 그 채널이 이벤트 루프를 세운다.
+    #: 아니라고 표기한 채널만 인라인으로 돈다(테스트·데모용 기록 채널).
+    blocking: bool
 
     def send(self, subject: str, body: str, detail: Mapping[str, Any]) -> None: ...
 
@@ -111,6 +149,7 @@ class WebhookChannel:
     url: str
     timeout: float = 5.0
     name: str = "webhook"
+    blocking: bool = True
 
     def send(self, subject: str, body: str, detail: Mapping[str, Any]) -> None:
         import httpx
@@ -130,6 +169,7 @@ class SmtpChannel:
     use_tls: bool = False
     timeout: float = 10.0
     name: str = "smtp"
+    blocking: bool = True
 
     def send(self, subject: str, body: str, detail: Mapping[str, Any]) -> None:
         if not self.recipients:
@@ -157,6 +197,9 @@ class RecordingChannel:
     sent: list[dict[str, Any]] = field(default_factory=list)
     fail: bool = False
     name: str = "recording"
+    #: 메모리에 담기만 한다 — 루프를 막지 않으므로 넘길 이유가 없고,
+    #: 넘기면 테스트가 발송을 기다려야 해서 경합이 생긴다.
+    blocking: bool = False
 
     def send(self, subject: str, body: str, detail: Mapping[str, Any]) -> None:
         if self.fail:
@@ -226,6 +269,9 @@ class Notifier:
         self._started_at = now()
         #: 진단·테스트용 이력. 채널이 없어도 무엇이 발생했는지는 남는다.
         self.history: list[dict[str, Any]] = []
+        #: 스레드로 넘긴 발송들. 붙잡아 두지 않으면 GC 가 가져갈 수 있고,
+        #: 종료 시 기다릴 방법도 없어진다.
+        self._inflight: set[Any] = set()
 
     @property
     def channel_names(self) -> tuple[str, ...]:
@@ -281,15 +327,61 @@ class Notifier:
         self.history.append({"ts": now, "event": event, "detail": clean, "body": body})
 
         for channel in self._channels:
+            self._deliver(channel, f"LLM ControlCenter · {event}", body, clean, event)
+        return True
+
+    def _deliver(
+        self,
+        channel: Channel,
+        subject: str,
+        body: str,
+        detail: Mapping[str, Any],
+        event: str,
+    ) -> None:
+        """한 채널로 보낸다. **이벤트 루프 위에서는 네트워크를 직접 만지지 않는다.**
+
+        웹훅 5초 · SMTP 10초가 전부 동기 호출이었다. 이 함수를 async 로 도는
+        스케줄러·헬스 루프·요청 핸들러가 부르므로, 채널 하나가 느려지면 그 동안
+        **관제 센터의 다른 모든 요청이 멈춘다.**
+
+        "알림 실패가 파이프라인을 죽이지 않는다" 는 예외만 삼켜서는 지켜지지 않는다 —
+        느린 채널은 예외를 내지 않고 그냥 붙잡고 있는다.
+        """
+
+        def run() -> None:
             try:
-                channel.send(f"LLM ControlCenter · {event}", body, clean)
+                channel.send(subject, body, detail)
             except Exception as exc:
                 # **알림 실패가 파이프라인을 죽이지 않는다.** 웹훅 URL 오타 하나로
                 # 추론이 멈추면 알림이 장애의 원인이 된다.
                 log.warning(
                     "알림 발송 실패 (채널=%s 이벤트=%s): %s", channel.name, event, exc
                 )
-        return True
+
+        if getattr(channel, "blocking", True) and _loop_is_running():
+            # **루프에 매이지 않는 스레드 풀을 쓴다.** `run_in_executor` 가 돌려주는
+            # asyncio future 는 만든 루프에서만 기다릴 수 있어서, 스케줄러 루프에서
+            # 넘긴 발송을 요청 핸들러가 기다리지 못한다(루프가 여럿인 배치가 실제로 있다).
+            future = _pool().submit(run)
+            # 결과를 기다리지 않는다. 다만 종료·테스트가 기다릴 수 있게 붙잡아 둔다.
+            self._inflight.add(future)
+            future.add_done_callback(self._inflight.discard)
+            return
+        run()
+
+    async def drain(self) -> None:
+        """진행 중인 발송이 끝나기를 기다린다. 종료와 테스트가 쓴다.
+
+        일상 경로는 이것을 부르지 않는다 — 기다리면 넘긴 의미가 없다.
+        """
+        while self._inflight:
+            pending = tuple(self._inflight)
+            await asyncio.to_thread(futures.wait, pending)
+
+    @property
+    def inflight(self) -> int:
+        """스레드로 넘어가 아직 안 끝난 발송 수. 진단용."""
+        return len(self._inflight)
 
     def _render(self, event: str, detail: Mapping[str, Any]) -> str:
         if self._translator is None:

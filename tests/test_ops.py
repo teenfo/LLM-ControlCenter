@@ -438,3 +438,92 @@ def test_test_notification_actually_reaches_the_channel(harness, client, acme):
         "/v1/platform/notifications", json={}, headers=auth(acme["platform_admin"])
     )
     assert any(s["detail"].get("node") == "(테스트)" for s in harness.channel.sent)
+
+
+# ── 감사 H10 — 알림이 이벤트 루프를 붙잡고 있었다 ────────────────────────────
+#
+# ③("실패가 파이프라인을 죽이지 않는다")은 예외만 삼켜서는 지켜지지 않는다.
+# **느린 채널은 예외를 내지 않고 그냥 붙잡고 있는다** — 웹훅 5초, SMTP 10초를
+# 동기로 기다리는 동안 관제 센터의 다른 모든 요청이 멈춘다.
+
+
+class SlowChannel:
+    """붙잡고 있는 채널. 죽은 채널이 아니라 **느린** 채널이다."""
+
+    name = "slow"
+    blocking = True
+
+    def __init__(self, seconds: float = 0.4) -> None:
+        self.seconds = seconds
+        self.sent = 0
+
+    def send(self, subject, body, detail):
+        import time as _time
+
+        _time.sleep(self.seconds)
+        self.sent += 1
+
+
+async def test_a_slow_channel_does_not_stall_the_event_loop():
+    """**같은 판정이 예외에는 걸리고 지연에는 안 걸리면 반쪽짜리다.**"""
+    import asyncio
+    import time as _time
+
+    slow = SlowChannel(0.4)
+    notifier = Notifier([slow], now=FakeClock(), min_interval_seconds=0.0)
+
+    started = _time.monotonic()
+    notifier.send("node_offline", node="n1")
+    # 루프가 살아 있으면 이 왕복이 즉시 끝난다. 막혀 있으면 채널을 기다린다.
+    await asyncio.sleep(0)
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 0.2, f"알림이 이벤트 루프를 {elapsed:.2f}초 붙잡았다"
+
+    await notifier.drain()
+    assert slow.sent == 1, "넘긴 뒤 실제로 보내지지 않았다"
+
+
+async def test_the_offloaded_send_still_swallows_failures():
+    """스레드로 넘겼다고 예외가 밖으로 새면 안 된다."""
+    channel = RecordingChannel(fail=True)
+    channel.blocking = True          # 네트워크 채널인 척한다
+    notifier = Notifier([channel], now=FakeClock(), min_interval_seconds=0.0)
+
+    assert notifier.send("node_offline", node="n1") is True
+    await notifier.drain()           # 예외가 여기로 나오면 실패다
+
+
+async def test_a_slow_channel_does_not_stall_a_request(harness, client, acme):
+    """실제 요청 경로에서도 같아야 한다 — 단위 테스트만으로는 배선을 못 본다."""
+    import time as _time
+
+    harness.notifier.add_channel(SlowChannel(0.4))
+
+    started = _time.monotonic()
+    response = client.post(
+        "/v1/platform/notifications", headers=auth(acme["platform_admin"])
+    )
+    elapsed = _time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 0.3, f"알림 테스트 요청이 {elapsed:.2f}초 걸렸다"
+    await harness.notifier.drain()
+
+
+def test_a_channel_is_assumed_to_block_unless_it_says_otherwise():
+    """**모르는 채널을 인메모리로 가정하면 그 채널이 루프를 세운다.**"""
+    class Bare:
+        name = "bare"
+
+        def send(self, subject, body, detail):
+            pass
+
+    from app.notify import SmtpChannel, WebhookChannel
+
+    assert WebhookChannel(url="http://x").blocking is True
+    assert SmtpChannel(host="x").blocking is True
+    # 표기가 없으면 블로킹으로 본다.
+    assert getattr(Bare(), "blocking", True) is True
+    # 인메모리 채널만 인라인으로 돈다 — 안 그러면 테스트가 발송을 기다려야 한다.
+    assert RecordingChannel().blocking is False

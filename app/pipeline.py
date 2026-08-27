@@ -595,7 +595,7 @@ class Pipeline:
             service_id=principal.service_id,
             role=role_config,
             placement_snapshot=role_config.placement,
-            prompt_chars=len(joined),
+            prompt=joined,
             tenant_budget=tenant["budget_usd_per_month"],
             service_budget=service["budget_usd_per_month"],
             allowed_boundaries=allowed,
@@ -697,7 +697,7 @@ class Pipeline:
                 service_id="_guard",
                 role=role,
                 placement_snapshot=role.placement,
-                prompt_chars=len(text),
+                prompt=text,
                 allowed_boundaries=(INTERNAL,),
             )
             if result.outcome != PLACED or result.placement is None:
