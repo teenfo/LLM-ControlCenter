@@ -181,6 +181,8 @@ function renderBanners(extra) {
   if (!s.guard_locale_pack) {
     warnings.push([t('ui.locale_pack_warning'), 'bad']);
   }
+  // 유예를 조용히 두면 그게 더 나쁘다 — 필터가 지키고 있다고 믿게 된다.
+  if (s.guard_grace_mode) warnings.push([t('ui.grace_mode'), 'bad']);
   for (const line of extra || []) warnings.push(line);
 
   for (const [text, cls] of warnings) {
@@ -527,6 +529,23 @@ async function renderBaseline() {
           [pack, tenants.join(', ')])),
       unused.length ? el('p', { class: 'muted', text: t('ui.locale_packs_off') + ': ' + unused.join(', ') }) : null,
     ], unused.length ? 'warn' : null),
+
+    card(t('ui.grace_mode'), [
+      el('div', { class: 'row' }, [
+        badge(data.grace_mode ? t('ui.grace_mode') : t('ui.none'),
+          data.grace_mode ? 'block' : 'healthy'),
+        data.grace_mode ? el('button', {
+          class: 'primary', text: t('ui.grace_mode_off'),
+          onclick: async () => {
+            try {
+              await api('/v1/platform/guard/grace-mode', { method: 'POST', body: { enabled: false } });
+              await loadSession();
+              refresh();
+            } catch (err) { showError(err); }
+          },
+        }) : null,
+      ]),
+    ], data.grace_mode ? 'bad' : null),
 
     card(t('ui.baseline'), table(
       [t('ui.rule'), '', t('ui.boundary_internal'), t('ui.boundary_external'), 'checksum', 'pack'],

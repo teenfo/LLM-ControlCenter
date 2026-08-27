@@ -153,5 +153,7 @@
   "ui.no_notify_channel": "No notification channel is configured.",
   "ui.test_notify": "Send test",
   "ui.diagnostics": "Diagnostic bundle",
-  "ui.download": "Download"
+  "ui.download": "Download",
+  "ui.grace_mode": "Guard grace mode — blocking rules are downgraded to audit and do not block.",
+  "ui.grace_mode_off": "End grace mode"
 }

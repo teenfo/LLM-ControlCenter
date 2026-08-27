@@ -153,5 +153,7 @@
   "ui.no_notify_channel": "알림 채널이 설정되지 않았습니다.",
   "ui.test_notify": "테스트 발송",
   "ui.diagnostics": "진단 번들",
-  "ui.download": "내려받기"
+  "ui.download": "내려받기",
+  "ui.grace_mode": "가드 유예 모드 — 차단 규칙이 audit 로 낮춰져 실제로 막지 않습니다.",
+  "ui.grace_mode_off": "유예 해제"
 }

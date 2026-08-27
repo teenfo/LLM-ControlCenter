@@ -126,6 +126,7 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "platform_catalog": ("번들 카탈로그 검색. 외부 레지스트리를 스크레이핑하지 않는다.", "platform_admin", False),
     "platform_overview": ("전역 관제 — 테넌트별 소비·노드 그리드·단일 호밍 경고.", "platform_admin", False),
     "platform_guard_baseline": ("베이스라인 가드 규칙과 로케일 팩 현황.", "platform_admin", False),
+    "platform_grace_mode": ("가드 유예 모드 해제·재설정. 끄는 것이 정상 상태다.", "platform_admin", False),
     "platform_evals": ("가드 회귀 평가 실행·이력.", "platform_admin", False),
     "platform_diagnostics": ("진단 번들 — 비밀은 마스킹, 프롬프트 본문은 미포함.", "platform_admin", False),
     "platform_notifications": ("알림 채널 현황과 테스트 발송.", "platform_admin", False),

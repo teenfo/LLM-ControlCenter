@@ -491,6 +491,20 @@ class Evaluator:
             )
         return report
 
+    def classifier_ready(self, role_name: str) -> tuple[bool, str]:
+        """2단 분류가 **실제로 판정할 수 있는가.** (가능한가, 사유).
+
+        배선만 되고 인증이 안 된 분류기는 안 붙은 것과 결과가 같다 — 매 요청이
+        실패로 떨어져 `on_classifier_error` 를 타고, 관리자는 필터가 도는 줄 안다.
+        그래서 "붙었는가" 가 아니라 "판정할 수 있는가" 를 묻는 함수를 따로 둔다.
+        """
+        role = self._config.roles.get(role_name)
+        if role is None:
+            return False, "no_role"
+        if not self.classifier_is_certified(role.model):
+            return False, "model_not_certified"
+        return True, "ok"
+
     def classifier_is_certified(self, model: str) -> bool:
         """이 모델을 2단 분류에 쓸 수 있는가. 인증 이력이 없으면 **거부**한다."""
         row = self._store.latest_eval_run(KIND_CLASSIFIER, model)

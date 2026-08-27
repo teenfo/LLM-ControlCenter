@@ -1302,6 +1302,20 @@ class SqliteStore:
             )
         }
 
+    #: 플랫폼 설정을 담는 예약 테넌트 id. **별도 테이블을 만들지 않는 이유**는
+    #: 스토어의 테넌트 초크포인트를 우회하는 경로를 새로 뚫지 않기 위해서다 —
+    #: 우회로가 생기면 언젠가 쓰인다.
+    PLATFORM_SETTINGS_TENANT = "_platform"
+
+    def set_platform_setting(self, key: str, value: Any) -> None:
+        """플랫폼 전역 설정. **테넌트가 만질 수 없다** — 스코프가 다르기 때문이다."""
+        self.set_tenant_setting(TenantScope(self.PLATFORM_SETTINGS_TENANT), key, value)
+
+    def platform_setting(self, key: str, default: Any = None) -> Any:
+        return self.tenant_setting(
+            TenantScope(self.PLATFORM_SETTINGS_TENANT), key, default
+        )
+
     def set_tenant_locale(self, scope: TenantScope, locale: str) -> None:
         """테넌트 기본 로케일. 이 값이 가드 로케일 팩까지 정한다 — 단순 번역이 아니다."""
         self._scoped_where(scope)

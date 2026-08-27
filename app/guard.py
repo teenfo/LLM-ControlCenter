@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from .config import EXTERNAL, INTERNAL, Config, GuardRule, GuardSettings
@@ -194,15 +194,28 @@ class Guard:
         *,
         classifier: Classifier | None = None,
         settings: GuardSettings | None = None,
+        grace_mode: bool = False,
     ) -> None:
         self._config = config
         self._settings = settings or config.guard_settings
         self._classifier = classifier
+        # 도입 첫날 유예. `block` 을 `audit` 로 낮춘다 — 처음부터 차단으로 켜면
+        # 도입 첫날 프로덕션이 서고, 그러면 설치처는 규칙을 통째로 꺼버린다.
+        # **켜져 있다는 사실을 화면과 API 가 계속 알려야 한다**(조용한 유예가 더 나쁘다).
+        self._grace_mode = grace_mode
         self._compiled: dict[str, re.Pattern[str]] = {
             rule.id: re.compile(rule.pattern)
             for rule in config.guard_rules
             if rule.kind == "pattern" and rule.pattern
         }
+
+    @property
+    def grace_mode(self) -> bool:
+        """유예 모드인가. 관제 UI 와 `/v1/session` 이 상시 표시해야 하는 값이다."""
+        return self._grace_mode
+
+    def set_grace_mode(self, enabled: bool) -> None:
+        self._grace_mode = bool(enabled)
 
     def set_classifier(self, classifier: Classifier | None) -> None:
         """2단 분류기를 나중에 꽂는다.
@@ -247,7 +260,8 @@ class Guard:
             if rule.kind == "pattern" and rule.id not in self._compiled and rule.pattern:
                 self._compiled[rule.id] = re.compile(rule.pattern)
 
-        return tuple(merged.values())
+        rules = tuple(merged.values())
+        return tuple(_downgraded(r) for r in rules) if self._grace_mode else rules
 
     def validate_rule(self, raw: Mapping[str, Any]) -> None:
         """테넌트가 저장하려는 규칙이 말이 되는가.
@@ -487,6 +501,40 @@ def _apply(
     for start, end, masked in sorted(replacements, key=lambda r: r[0], reverse=True):
         text = text[:start] + masked + text[end:]
     return text
+
+
+#: 유예 모드에서 `block` 이 내려앉는 등급. **`audit` 이 아니라 `full` 이다.**
+#:
+#: `audit` 로 내리면 도입 첫날 며칠 동안 주민번호가 **마스킹 없이** 노드로 나간다 —
+#: 개인정보를 거르려고 산 제품이 도입 첫 주에 정확히 그것을 안 하는 셈이다.
+#: `full` 은 요청을 세우지 않으므로 첫날 장애를 막는 목적은 그대로 달성하면서
+#: 개인정보는 계속 가린다.
+#:
+#: 대가: `audit` 였다면 "이 규칙이 오탐이었을 때 사용자 요청이 멀쩡했는가" 까지
+#: 볼 수 있었지만 `full` 에서는 오탐이 프롬프트를 훼손한다. 그래도 **탐지 기록은
+#: 동일하게 남으므로 오탐률 측정과 승격 게이트는 그대로 작동한다** — 잃는 것이
+#: 얻는 것보다 작다.
+GRACE_FALLBACK = "full"
+
+
+def _downgraded(rule: GuardRule) -> GuardRule:
+    """유예 모드에서 `block` 을 `full` 로 낮춘다.
+
+    **탐지는 그대로 한다** — 낮추는 것은 동작뿐이고, 그 기록이 곧 승격 게이트의
+    재료다. 마스킹 등급(`partial`·`full`)은 건드리지 않는다.
+    """
+    def soften(action: str) -> str:
+        return GRACE_FALLBACK if action == "block" else action
+
+    if isinstance(rule.action, str):
+        if rule.action != "block":
+            return rule
+        return replace(rule, action=GRACE_FALLBACK)
+
+    lowered = {b: soften(a) for b, a in rule.action.items()}
+    if lowered == dict(rule.action):
+        return rule
+    return replace(rule, action=lowered)
 
 
 def _stronger_of(baseline: GuardRule, candidate: GuardRule) -> GuardRule:

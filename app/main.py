@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from . import meta as meta_mod
+from .bootstrap import GRACE_KEY
 from .auth import (
     ROLE_PLATFORM_ADMIN,
     ROLE_SERVICE,
@@ -138,9 +140,12 @@ def build_app(
     )
     # 노드 헬스 전이가 알림기로 간다. 주입된 클러스터는 자기 알림기를 이미 갖고 있다.
     cluster = cluster or Cluster(
-        config, store, accountant=accountant, now=now, notifier=notifier
+        config, store, accountant=accountant, now=now, notifier=notifier, airgap=airgap
     )
     guard = guard or Guard(config)
+    # 저장된 유예 상태를 가드에 반영한다. 안 하면 재시작할 때마다 유예가 풀려
+    # 도입 둘째 날 아침에 프로덕션이 선다.
+    guard.set_grace_mode(bool(store.platform_setting(GRACE_KEY, False)))
     evaluator = evaluator or Evaluator(config, store, guard, now=now)
     registrar = registrar or ModelRegistrar(
         config, cluster, store, now=now, notify=notifier.as_callable()
@@ -164,9 +169,22 @@ def build_app(
         static_dir=static_dir or STATIC_DIR, client_dir=client_dir or CLIENT_DIR,
     )
 
+    # 스케줄러 수명주기. Starlette 이 `add_event_handler` 를 뺐으므로 lifespan 을 쓴다.
+    # **배경 루프가 안 뜨면 큐가 영원히 안 줄어든다** — 조용히 깨지는 종류의 실패다.
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        if start_scheduler and scheduler is not None:
+            await scheduler.start()
+        try:
+            yield
+        finally:
+            if start_scheduler and scheduler is not None:
+                await scheduler.stop()
+
     routes = _routes(ctx)
     app = Starlette(
         routes=routes,
+        lifespan=lifespan if start_scheduler and scheduler is not None else None,
         exception_handlers={
             ApiError: _api_error_handler,
             ScopeViolation: _scope_violation_handler,
@@ -178,11 +196,6 @@ def build_app(
         },
     )
     app.state.ctx = ctx
-
-    if start_scheduler and scheduler is not None:
-        app.add_event_handler("startup", scheduler.start)
-        app.add_event_handler("shutdown", scheduler.stop)
-
     return app
 
 
@@ -455,6 +468,15 @@ def _service_or_401(ctx: AppContext, principal: Principal) -> Any:
     return service
 
 
+def _classifier_ready(ctx: AppContext) -> tuple[bool, str]:
+    if not ctx.guard.has_classifier:
+        return False, "not_wired"
+    if not any(rule.is_llm for rule in ctx.config.guard_rules):
+        # 맥락 규칙이 없으면 분류를 안 부른다. 그건 미비가 아니라 구성이다.
+        return True, "no_context_rules"
+    return ctx.evaluator.classifier_ready(GUARD_ROLE)
+
+
 async def session(request: Request) -> Response:
     """이 토큰이 누구이고 UI 가 무엇을 그릴 수 있는가.
 
@@ -489,7 +511,13 @@ async def session(request: Request) -> Response:
         # 안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.
         "guard_locale_pack": guard_pack_for(tenant["locale"]) if tenant else None,
         "raw_prompt_storage": ctx.vault.enabled,
-        "guard_classifier_ready": ctx.guard.has_classifier,
+        # **배선만 되고 인증이 안 된 분류기는 안 붙은 것과 결과가 같다.**
+        # "붙었는가" 를 답하면 화면이 거짓말을 한다.
+        "guard_classifier_ready": _classifier_ready(ctx)[0],
+        "guard_classifier_reason": _classifier_ready(ctx)[1],
+        # **유예를 조용히 두면 그게 더 나쁘다.** 차단 규칙이 audit 로 낮춰진 채
+        # 도는 것을 모르면 관리자는 필터가 지키고 있다고 믿는다.
+        "guard_grace_mode": ctx.guard.grace_mode,
     })
 
 
@@ -1213,6 +1241,24 @@ async def platform_overview(request: Request) -> Response:
     })
 
 
+async def platform_grace_mode(request: Request) -> Response:
+    """가드 유예 모드 해제·재설정.
+
+    도입 첫날 프로덕션을 세우지 않으려고 켜 둔 것이므로, **끄는 것이 정상 상태다.**
+    끄는 순간부터 베이스라인의 `block` 이 실제로 차단한다.
+    """
+    ctx, principal = _platform_admin(request)
+    body = await _body(request)
+    enabled = bool(body.get("enabled", False))
+
+    ctx.guard.set_grace_mode(enabled)
+    ctx.store.set_platform_setting(GRACE_KEY, enabled)
+    ctx.store.audit(
+        principal.token_id, "set_guard_grace_mode", detail={"enabled": enabled}
+    )
+    return _ok(request, {"grace_mode": enabled})
+
+
 async def platform_guard_baseline(request: Request) -> Response:
     """베이스라인 규칙과 **켜진 로케일 팩**.
 
@@ -1240,6 +1286,7 @@ async def platform_guard_baseline(request: Request) -> Response:
         "packs_in_use": packs,
         "packs_unused": [p for p in all_packs if p != "common" and p not in packs],
         "settings": ctx.config.guard_settings.__dict__,
+        "grace_mode": ctx.guard.grace_mode,
     })
 
 
@@ -1381,6 +1428,8 @@ def _routes(ctx: AppContext) -> list[Any]:
         Route(f"{v}/platform/overview", platform_overview, name="platform_overview"),
         Route(f"{v}/platform/guard/baseline", platform_guard_baseline,
               name="platform_guard_baseline"),
+        Route(f"{v}/platform/guard/grace-mode", platform_grace_mode,
+              methods=["POST"], name="platform_grace_mode"),
         Route(f"{v}/platform/evals", platform_evals,
               methods=["GET", "POST"], name="platform_evals"),
         Route(f"{v}/platform/diagnostics", platform_diagnostics, name="platform_diagnostics"),

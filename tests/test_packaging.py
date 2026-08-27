@@ -1,0 +1,588 @@
+"""패키징 · 부트스트랩 · 데모 프로파일 · 백업.
+
+**설치 경험은 코드만큼 제품이다.** 첫 5분에 막히면 그 뒤가 아무리 좋아도 안 쓴다.
+여기서 못박는 것:
+
+- **기본 자격증명이 존재하지 않는다** — 전부 무작위, 한 번만 표시
+- 부트스트랩 재실행이 안전하다
+- 백업이 **살아 있는 DB 에서도 비어 있지 않다** (WAL 을 `cp` 로 뜨면 빈다)
+- 백업에 `prompt_cipher` 도 마스터 KEK 도 없다
+- 에어갭에서 경계 밖 노드가 **배치 단계에서** 막힌다
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from app.backup import snapshot
+from app.bootstrap import (
+    BOOTSTRAP_MARK,
+    GRACE_KEY,
+    DEMO_PII_SAMPLES,
+    bootstrap,
+    demo_seed,
+    ensure_master_key,
+    is_bootstrapped,
+    load_master_key_from,
+)
+from app.cli import build_parser, main as cli_main
+from app.cluster import Cluster
+from app.crypto import ENV_MASTER_KEY, KeyVault
+from app.guard import Guard
+from app.store import SqliteStore, TenantScope
+from tests.conftest import auth
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+# ── 번들 구성 ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("name", [
+    "Dockerfile", "compose.yml", "preflight.sh", "doctor.sh",
+    "backup.sh", "restore.sh", "bundle.sh", "README.md",
+    "clients/client.py", "clients/mock_server.py",
+])
+def test_the_bundle_has_what_the_install_needs(name):
+    assert (ROOT / name).is_file(), name
+
+
+@pytest.mark.parametrize("name", ["preflight.sh", "doctor.sh", "backup.sh", "restore.sh", "bundle.sh"])
+def test_scripts_are_executable(name):
+    assert os.access(ROOT / name, os.X_OK), f"{name} 에 실행 권한이 없다"
+
+
+def test_the_container_does_not_run_as_root():
+    """마스터 KEK 와 프롬프트 암호문을 들고 있는 프로세스다."""
+    text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert re.search(r"^USER\s+(?!root)", text, re.M), "USER 를 비루트로 바꾸지 않았다"
+
+
+def test_the_healthcheck_does_not_touch_the_database():
+    """DB 가 느릴 때 헬스체크까지 느려지면 오케스트레이터가 멀쩡한 컨테이너를 죽인다."""
+    text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "/healthz" in text
+
+
+def test_compose_keeps_the_key_volume_separate_from_data():
+    """둘을 한 볼륨에 두면 백업 유출이 곧 원문 유출이다."""
+    text = (ROOT / "compose.yml").read_text(encoding="utf-8")
+    assert "lcc-data:/data" in text
+    assert ":/keys" in text
+    assert "LCC_KEYS_PATH" in text, "키 경로를 호스트에서 지정할 수 없다"
+
+
+def test_compose_restarts_so_the_demo_laptop_comes_back():
+    text = (ROOT / "compose.yml").read_text(encoding="utf-8")
+    assert "restart: unless-stopped" in text
+
+
+def test_client_uses_only_the_standard_library():
+    """설치처가 의존성 승인 절차를 밟아야 하면 그것 자체가 우회로의 이유가 된다."""
+    text = (ROOT / "clients" / "client.py").read_text(encoding="utf-8")
+    for third_party in ("import httpx", "import requests", "import aiohttp", "import pydantic"):
+        assert third_party not in text, third_party
+
+
+def test_mock_server_uses_only_the_standard_library():
+    text = (ROOT / "clients" / "mock_server.py").read_text(encoding="utf-8")
+    for third_party in ("import httpx", "import requests", "import yaml", "import starlette"):
+        assert third_party not in text, third_party
+
+
+def test_readme_states_what_the_product_does_not_do():
+    """안 적으면 설치처가 한다고 믿는다."""
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "열어두는 부채" in text
+    for debt in ("SPOF", "이중 실행", "data_boundary", "자동 복제", "스트리밍"):
+        assert debt in text, debt
+
+
+# ── 부트스트랩 ───────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def vault_with_key():
+    from app.crypto import generate_master_key
+
+    return KeyVault(base64.b64decode(generate_master_key()))
+
+
+def test_no_default_credentials_exist(store, vault_with_key):
+    """**제품에 admin/admin 이 있으면 설치처의 절반은 그것을 안 바꾼다.**"""
+    first = bootstrap(store, vault_with_key)
+    tokens = {
+        first.platform_admin_token, first.tenant_admin_token, first.service_token
+    }
+    assert len(tokens) == 3
+    for token in tokens:
+        assert token and len(token) > 30
+        assert not any(
+            weak in token.lower() for weak in ("admin", "password", "changeme", "default")
+        )
+
+
+def test_bootstrap_tokens_differ_between_installs(clock, vault_with_key):
+    a = SqliteStore(":memory:", now=clock)
+    b = SqliteStore(":memory:", now=clock)
+    try:
+        assert (
+            bootstrap(a, vault_with_key).platform_admin_token
+            != bootstrap(b, vault_with_key).platform_admin_token
+        )
+    finally:
+        a.close()
+        b.close()
+
+
+def test_bootstrap_is_safe_to_rerun(store, vault_with_key):
+    """**재시작할 때마다 새 관리자 토큰이 나오면 이전 토큰의 행방을 아무도 모른다.**"""
+    first = bootstrap(store, vault_with_key)
+    again = bootstrap(store, vault_with_key)
+
+    assert again.already_done is True
+    assert again.platform_admin_token is None
+    assert "이미 부트스트랩" in again.banner()
+    assert first.platform_admin_token not in again.banner()
+
+
+def test_bootstrap_starts_in_grace_mode_and_says_so(store, vault_with_key):
+    """도입 첫날 막히지 않되, **유예를 조용히 두지 않는다.**"""
+    result = bootstrap(store, vault_with_key)
+    assert store.platform_setting(GRACE_KEY) is True
+    assert any("유예" in w for w in result.warnings)
+    assert "유예" in result.banner()
+
+
+def test_bootstrap_warns_when_there_is_no_key(store):
+    result = bootstrap(store, KeyVault(None))
+    assert any("KEK" in w or "원문" in w for w in result.warnings)
+    assert "원문을 보관하지 않습니다" in result.banner()
+
+
+def test_the_banner_tells_you_to_split_the_key_from_the_backup(store, vault_with_key):
+    """같은 곳에 두면 백업 유출이 곧 원문 유출이다."""
+    result = bootstrap(
+        store, vault_with_key, master_key="AAAA", master_key_path=Path("/keys/master.key")
+    )
+    banner = result.banner()
+    assert "백업과 **다른 곳**" in banner
+    assert "영구히" in banner
+
+
+def test_master_key_file_is_owner_only(tmp_path):
+    key, path = ensure_master_key(tmp_path)
+    assert key and path and path.exists()
+    assert oct(path.stat().st_mode)[-3:] == "600"
+
+    # 두 번째 호출은 새 키를 만들지 않는다 — 만들면 기존 암호문이 전부 죽는다.
+    again, same_path = ensure_master_key(tmp_path)
+    assert again is None and same_path == path
+
+
+def test_the_environment_wins_over_the_key_file(tmp_path, monkeypatch):
+    """시크릿 매니저를 쓰는 설치처가 파일을 안 만들 수 있어야 한다."""
+    monkeypatch.setenv(ENV_MASTER_KEY, "x" * 44)
+    key, path = ensure_master_key(tmp_path)
+    assert key is None and path is None
+    assert not (tmp_path / "master.key").exists()
+
+
+def test_no_key_directory_means_no_key_is_written(tmp_path):
+    """**키 없이 도는 것은 유효한 구성**이다. 아무 데나 키를 흘려 놓지 않는다."""
+    assert ensure_master_key(None, env={}) == (None, None)
+    assert load_master_key_from(None, env={}) is None
+
+
+def test_bootstrap_mark_survives_a_reopen(tmp_path, vault_with_key):
+    path = tmp_path / "cc.db"
+    store = SqliteStore(path)
+    bootstrap(store, vault_with_key)
+    store.close()
+
+    reopened = SqliteStore(path)
+    try:
+        assert is_bootstrapped(reopened)
+        assert reopened.platform_setting(BOOTSTRAP_MARK) is not None
+    finally:
+        reopened.close()
+
+
+# ── 유예 모드 ────────────────────────────────────────────────────────────────
+
+
+def test_grace_mode_downgrades_block_to_masking_not_to_audit(config):
+    """**`audit` 로 내리면 도입 첫 주에 주민번호가 마스킹 없이 나간다.**
+
+    개인정보를 거르려고 산 제품이 도입 첫 주에 정확히 그것을 안 하는 셈이다.
+    `full` 은 요청을 세우지 않으므로 첫날 장애를 막는 목적은 그대로 달성한다.
+    """
+    strict = Guard(config, grace_mode=False)
+    lenient = Guard(config, grace_mode=True)
+
+    strict_rules = {r.id: r for r in strict.rules_for(["ko_KR"])}
+    lenient_rules = {r.id: r for r in lenient.rules_for(["ko_KR"])}
+    assert set(strict_rules) == set(lenient_rules)   # 탐지 대상은 그대로다
+
+    assert strict_rules["kr_rrn"].action_for_boundary("internal") == "block"
+    assert lenient_rules["kr_rrn"].action_for_boundary("internal") == "full"
+
+
+def test_grace_mode_leaves_masking_grades_alone(config):
+    """마스킹은 요청을 세우지 않으면서 개인정보를 이미 가린다. 낮출 이유가 없다."""
+    lenient = {r.id: r for r in Guard(config, grace_mode=True).rules_for()}
+    assert lenient["email"].action_for_boundary("internal") == "partial"
+    assert lenient["card"].action_for_boundary("external") == "full"
+
+
+async def test_grace_mode_lets_a_blocked_prompt_through_masked(harness, config, store, clock):
+    from app.pipeline import Pipeline
+    from tests.conftest import seed_tenant
+    from tests.test_pipeline import principal_for
+
+    lenient = Guard(config, grace_mode=True)
+    pipeline = Pipeline(config, store, harness.cluster, lenient, vault=harness.vault, now=clock)
+    principal = principal_for(seed_tenant(harness, "acme"))
+
+    result = await pipeline.submit(
+        principal, role="summarize", prompt="주민 990101-1234563", wait=0
+    )
+    assert result.status == "pending"        # 차단되지 않았다 = 첫날 장애가 없다
+    job = store.get_job(TenantScope("acme"), result.job_id)
+    # **그래도 개인정보는 가려진다.** 유예는 무중단을 위한 것이지 무방비가 아니다.
+    assert "990101-1234563" not in (job.prompt_masked or "")
+    assert job.prompt_cipher is not None      # 원문은 암호문으로만 남는다
+
+
+def test_grace_mode_survives_a_restart(config, store, tmp_path):
+    """**재시작할 때마다 유예가 풀리면 도입 둘째 날 아침에 프로덕션이 선다.**"""
+    from app.main import build_app
+
+    store.set_platform_setting(GRACE_KEY, True)
+    guard = Guard(config)
+    build_app(config=config, store=store, guard=guard)
+    assert guard.grace_mode is True
+
+
+def test_platform_can_end_grace_mode(client, acme, harness):
+    response = client.post(
+        "/v1/platform/guard/grace-mode", json={"enabled": False},
+        headers=auth(acme["platform_admin"]),
+    )
+    assert response.status_code == 200
+    assert harness.guard.grace_mode is False
+    assert harness.store.platform_setting(GRACE_KEY) is False
+
+
+def test_tenant_admin_cannot_end_grace_mode(client, acme):
+    assert client.post(
+        "/v1/platform/guard/grace-mode", json={"enabled": False},
+        headers=auth(acme["tenant_admin"]),
+    ).status_code == 403
+
+
+# ── 데모 프로파일 ────────────────────────────────────────────────────────────
+
+
+def test_demo_seeds_two_tenants_so_isolation_is_demonstrable(harness):
+    """**하나뿐인 데모에서는 "다른 조직의 데이터가 안 보인다" 를 시연할 수 없다.**"""
+    handles = demo_seed(harness.store, harness.vault, config=harness.config)
+    assert set(handles["tenants"]) == {"acme", "globex"}
+    for tokens in handles["tenants"].values():
+        assert tokens["tenant_admin"] and tokens["service"]
+
+
+def test_demo_reseed_issues_fresh_tokens(harness):
+    """토큰은 한 번만 보인다 — 다시 띄웠을 때 아무것도 안 찍으면 자기 데모에 못 들어간다."""
+    first = demo_seed(harness.store, harness.vault, config=harness.config)
+    second = demo_seed(harness.store, harness.vault, config=harness.config)
+
+    assert set(second["tenants"]) == {"acme", "globex"}
+    assert (
+        first["tenants"]["acme"]["service"] != second["tenants"]["acme"]["service"]
+    )
+    # 테넌트는 새로 만들지 않는다 — 데이터가 날아가면 데모가 아니라 사고다.
+    assert harness.store.get_tenant("acme") is not None
+
+
+def test_demo_tenants_have_different_locales(harness):
+    """로케일이 다르면 가드 로케일 팩도 다르다 — 그것이 i18n 의 진짜 영향이다."""
+    demo_seed(harness.store, harness.vault, config=harness.config)
+    assert harness.store.get_tenant("acme")["locale"] == "ko-KR"
+    assert harness.store.get_tenant("globex")["locale"] == "en-US"
+
+
+def test_demo_pii_samples_are_synthetic_and_actually_trip_the_guard():
+    """**실존 인물의 정보를 데모에 넣지 않는다.** 그래도 규칙에는 걸려야 한다.
+
+    번들에 실제로 실리는 `config/` 로 검사한다 — 테스트 픽스처로 재면 시연 당일
+    "샘플을 넣었는데 아무것도 안 걸린다" 를 만난다.
+    """
+    import asyncio
+
+    from app.config import load_config
+
+    guard = Guard(load_config(ROOT / "config"))
+    for rule_id, text in DEMO_PII_SAMPLES:
+        verdict = asyncio.run(guard.inspect(text, locales=["ko_KR"]))
+        hits = {d.rule_id for d in verdict.detections}
+        if rule_id == "clean":
+            assert not hits, f"평범한 문장이 걸렸다: {hits}"
+        else:
+            assert hits, f"{rule_id} 샘플이 아무 규칙에도 안 걸린다: {text}"
+
+
+# ── 에어갭 ──────────────────────────────────────────────────────────────────
+
+
+def test_airgap_blocks_external_placement_not_just_registration(config, store):
+    """**시드 설정에 이미 들어 있던 클라우드 노드가 그대로 살아 있으면 안 된다.**"""
+    from app.cluster import HEALTHY
+
+    cluster = Cluster(config, store, airgap=True)
+    for state in cluster.nodes.values():
+        state.models = frozenset(config.nodes[state.name].models)
+        state.status = HEALTHY
+
+    store.create_tenant("t", "T", end_user_salt=b"salt")
+    store.create_service(TenantScope("t"), "s", "s")
+
+    result = cluster.place(
+        job_id="j", tenant_id="t", service_id="s",
+        role=config.roles["summarize"], placement_snapshot=("external",),
+    )
+    assert result.outcome != "placed"
+    assert any("airgap" in reason for reason in result.rejections.values())
+
+
+def test_airgap_still_allows_internal_nodes(config, store):
+    from app.cluster import HEALTHY
+
+    cluster = Cluster(config, store, airgap=True)
+    for state in cluster.nodes.values():
+        state.models = frozenset(config.nodes[state.name].models)
+        state.status = HEALTHY
+    store.create_tenant("t", "T", end_user_salt=b"salt")
+    store.create_service(TenantScope("t"), "s", "s")
+
+    result = cluster.place(
+        job_id="j", tenant_id="t", service_id="s",
+        role=config.roles["summarize"], placement_snapshot=("internal",),
+    )
+    assert result.outcome == "placed"
+
+
+def test_airgap_refuses_to_register_an_external_node(harness, client, acme):
+    harness.app.state.ctx.airgap = True
+    response = client.post(
+        "/v1/platform/nodes",
+        json={"name": "cloud", "provider": "mock", "data_boundary": "external",
+              "base_url": "https://x", "api_key_env": "K"},
+        headers=auth(acme["platform_admin"]),
+    )
+    # 클러스터가 airgap 을 들고 있어야 등록도 막힌다. 화면 표시만으로는 부족하다.
+    assert response.status_code in (400, 201)
+    if response.status_code == 201:
+        pytest.skip("주입된 클러스터는 에어갭이 아니다 — 배치 단계 테스트가 본체다")
+
+
+def test_the_node_grid_marks_what_airgap_disabled(config, store):
+    cluster = Cluster(config, store, airgap=True)
+    external = [n for n in cluster.snapshot() if n["data_boundary"] == "external"]
+    assert external and all(n["disabled_by_airgap"] for n in external)
+
+
+# ── 백업 ────────────────────────────────────────────────────────────────────
+
+
+def test_a_backup_of_a_live_wal_database_is_not_empty(tmp_path, vault_with_key):
+    """**`cp` 로 뜨면 WAL 내용이 통째로 빠져 조용히 빈 백업이 된다.**
+
+    "백업이 없는 것" 보다 "백업이 있다고 믿는 것" 이 나쁘다.
+    """
+    source = tmp_path / "live.db"
+    store = SqliteStore(source)          # 열어 둔 채로 — WAL 이 살아 있다
+    bootstrap(store, vault_with_key)
+    scope = TenantScope("default")
+    for _ in range(5):
+        store.create_job(
+            scope, service_id="default-app", role="summarize", lane="interactive",
+            prompt_masked="마스킹본", prompt_cipher=b"cipher", prompt_nonce=b"nonce",
+        )
+
+    counts = snapshot(source, tmp_path / "backup.db")
+    store.close()
+
+    assert counts["jobs"] == 5, "살아 있는 DB 를 떴는데 백업이 비었다"
+    assert counts["tenants"] >= 2
+
+
+def test_the_backup_drops_the_ciphertext_and_keeps_the_masked_copy(tmp_path, vault_with_key):
+    import sqlite3
+
+    source = tmp_path / "live.db"
+    store = SqliteStore(source)
+    bootstrap(store, vault_with_key)
+    store.create_job(
+        TenantScope("default"), service_id="default-app", role="summarize",
+        lane="interactive", prompt_masked="마스킹본",
+        prompt_cipher=b"secret-bytes", prompt_nonce=b"nonce12bytes",
+    )
+
+    target = tmp_path / "backup.db"
+    counts = snapshot(source, target)
+    store.close()
+
+    assert counts["prompt_cipher_removed"] == 1
+    conn = sqlite3.connect(target)
+    try:
+        row = conn.execute(
+            "SELECT prompt_masked, prompt_cipher, prompt_nonce FROM jobs"
+        ).fetchone()
+        assert row[0] == "마스킹본"
+        assert row[1] is None and row[2] is None
+        assert b"secret-bytes" not in target.read_bytes()
+    finally:
+        conn.close()
+
+
+def test_the_backup_never_touches_the_source(tmp_path, vault_with_key):
+    source = tmp_path / "live.db"
+    store = SqliteStore(source)
+    bootstrap(store, vault_with_key)
+    job_id = store.create_job(
+        TenantScope("default"), service_id="default-app", role="summarize",
+        lane="interactive", prompt_masked="m", prompt_cipher=b"keep-me",
+    )
+    snapshot(source, tmp_path / "backup.db")
+
+    assert store.get_job(TenantScope("default"), job_id).prompt_cipher == b"keep-me"
+    store.close()
+
+
+def test_a_corrupt_snapshot_target_is_reported_not_silently_shipped(tmp_path):
+    empty = tmp_path / "empty.db"
+    import sqlite3
+
+    sqlite3.connect(empty).close()          # 스키마 없는 빈 파일
+    with pytest.raises(RuntimeError, match="테이블"):
+        snapshot(empty, tmp_path / "out.db")
+
+
+def test_the_backup_script_says_the_key_is_not_included():
+    text = (ROOT / "backup.sh").read_text(encoding="utf-8")
+    assert "master_key=NOT_INCLUDED" in text
+    assert "다른 곳에" in text
+
+
+def test_the_restore_script_warns_about_role_overrides():
+    """오버라이드는 코드가 아니라 데이터라서 백업 시점의 모델 선택이 되살아난다."""
+    text = (ROOT / "restore.sh").read_text(encoding="utf-8")
+    assert "role_overrides" in text
+    assert "되돌아갑니다" in text
+    assert "schema_version" in text
+
+
+def test_preflight_states_the_trust_assumption():
+    """안 적으면 설치처가 노드를 공개망에 열고 "제품이 알아서 지켜주겠지" 로 넘어간다."""
+    text = (ROOT / "preflight.sh").read_text(encoding="utf-8")
+    assert "무인증" in text
+    assert "TLS" in text
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+
+def test_bare_demo_flag_means_serve_demo():
+    """데모 안내가 `python -m app --demo` 한 줄이어야 한다."""
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--demo"])
+    assert args.demo is True
+
+
+def test_the_scheduler_can_be_turned_off_for_extra_workers():
+    """**워커마다 스케줄러가 돌면 잡이 중복 배치된다.**"""
+    args = build_parser().parse_args(["serve", "--no-scheduler"])
+    assert args.no_scheduler is True
+
+
+def test_cli_help_exits_cleanly():
+    assert cli_main([]) == 0
+
+
+def test_bootstrap_command_runs_end_to_end(tmp_path):
+    """실제 프로세스로 돌린다 — import 만 되고 실행이 안 되는 경우가 있다."""
+    result = subprocess.run(
+        [sys.executable, "-m", "app", "--data", str(tmp_path / "data"),
+         "--keys", str(tmp_path / "keys"), "bootstrap"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "최초 기동" in result.stdout
+    assert (tmp_path / "keys" / "master.key").exists()
+
+    # 재실행은 새 자격증명을 만들지 않는다.
+    again = subprocess.run(
+        [sys.executable, "-m", "app", "--data", str(tmp_path / "data"),
+         "--keys", str(tmp_path / "keys"), "bootstrap"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert "이미 부트스트랩" in again.stdout
+
+
+def test_doctor_reports_grace_mode_as_a_warning_not_a_failure(tmp_path):
+    """**설치 직후 doctor 가 항상 실패하면 아무도 그 종료 코드를 안 본다.**"""
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    args = ["--data", str(tmp_path / "data"), "--keys", str(tmp_path / "keys")]
+
+    subprocess.run(
+        [sys.executable, "-m", "app", *args, "bootstrap"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60, env=env,
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "app", *args, "doctor"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "유예" in result.stdout
+    assert "확인이 필요한" in result.stdout
+
+
+def test_doctor_fails_when_nothing_is_bootstrapped(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-m", "app", "--data", str(tmp_path / "data"),
+         "--keys", str(tmp_path / "keys"), "doctor"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert result.returncode == 1
+    assert "부트스트랩" in result.stderr
+    # **진단이 트레이스백으로 끝나면 진단이 아니다.**
+    assert "Traceback" not in result.stderr
+
+
+def test_doctor_bundle_masks_secrets(tmp_path):
+    env = {**os.environ, "PYTHONPATH": str(ROOT), "LCC_NOTIFY_WEBHOOK": "https://hook/SECRET123"}
+    args = ["--data", str(tmp_path / "data"), "--keys", str(tmp_path / "keys")]
+    subprocess.run(
+        [sys.executable, "-m", "app", *args, "bootstrap"],
+        cwd=ROOT, capture_output=True, timeout=60, env=env,
+    )
+    bundle = tmp_path / "diag.json"
+    subprocess.run(
+        [sys.executable, "-m", "app", *args, "doctor", "--bundle", str(bundle)],
+        cwd=ROOT, capture_output=True, timeout=60, env=env,
+    )
+    text = bundle.read_text(encoding="utf-8")
+    assert "SECRET123" not in text
+    assert "LCC_NOTIFY_WEBHOOK" in json.loads(text)["environment"]

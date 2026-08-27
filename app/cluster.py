@@ -125,10 +125,16 @@ class Cluster:
         providers: Mapping[str, Provider] | None = None,
         now: Callable[[], float] = time.time,
         notifier: Any = None,
+        airgap: bool = False,
     ) -> None:
         self._config = config
         self._store = store
         self._now = now
+        # 에어갭이면 경계 밖 노드로 아예 배치하지 않는다. 등록만 막으면 시드 설정에
+        # 이미 들어 있던 클라우드 노드가 그대로 살아 있고, **설정에 남아 있는데
+        # 조용히 나가는 것**이 에어갭에서 가장 나쁜 실패다. 관리자가 드레이닝을
+        # 풀어도 되돌릴 수 없도록 배치 필터에 건다.
+        self._airgap = airgap
         # 알림기가 없어도 동작한다 — 관제는 알림 없이도 서고, 알림 배선이 없다고
         # 추론이 멈추면 안 된다. 있으면 헬스 전이를 그쪽에 알린다.
         self._notifier = notifier
@@ -146,6 +152,10 @@ class Cluster:
         self._model_sizes = {e.name: e.est_size_gb for e in config.catalog}
 
     # -- 조회 -----------------------------------------------------------------
+
+    @property
+    def airgap(self) -> bool:
+        return self._airgap
 
     @property
     def nodes(self) -> Mapping[str, NodeState]:
@@ -310,6 +320,9 @@ class Cluster:
         # 데이터 경계 — 두 겹이다.
         #   ① 역할의 internal_only: 어떤 상황에서도 경계 밖에 가지 않는다(설정으로 못 푼다).
         #   ② 가드가 좁힌 허용 경계: 차단 등급에 걸린 경계가 여기서 빠져 있다.
+        if self._airgap and not node.is_internal:
+            return "airgap_external_disabled"
+
         if role.internal_only and not node.is_internal:
             return "boundary_internal_only"
         if node.data_boundary not in allowed_boundaries:
@@ -580,6 +593,8 @@ class Cluster:
                 "metered": s.is_metered,
                 "tenant_affinity": list(s.node.tenant_affinity),
                 "last_error": s.last_error,
+                # 에어갭에서 꺼진 노드는 그 사실이 보여야 한다.
+                "disabled_by_airgap": self._airgap and not s.node.is_internal,
             }
             for s in self._nodes.values()
         ]
