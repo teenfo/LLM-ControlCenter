@@ -151,6 +151,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     prompt_cipher     BLOB,
     prompt_nonce      BLOB,
     system_masked     TEXT,
+    -- 경계 밖으로 나갈 때 쓰는 더 강하게 마스킹된 변형. NULL 이면 위와 같다.
+    -- 가드는 경계별로 다른 등급을 적용할 수 있는데(안에서는 보되 밖으로는 가리고),
+    -- 한 벌만 저장하면 그 구분이 디스패치 시점에 사라진다.
+    prompt_external   TEXT,
+    system_external   TEXT,
+    -- 가드가 좁힌 허용 경계. 배치 필터가 노드 경계와 교집합을 낸다.
+    allowed_boundaries_json TEXT NOT NULL DEFAULT '["internal","external"]',
     -- 해시: prompt_hash 는 마스킹 후 + 테넌트 솔트다.
     -- 원문 그대로 해싱하면 탐색 공간이 좁은 값(주민번호 등)을 전수조사로 복원할 수 있다.
     prompt_hash       TEXT,
@@ -350,6 +357,9 @@ class JobRow:
     end_user_hash: str | None = None
     priority: int = 0
     prompt_masked: str | None = None
+    prompt_external: str | None = None
+    system_external: str | None = None
+    allowed_boundaries: tuple[str, ...] = ("internal", "external")
     prompt_cipher: bytes | None = None
     prompt_nonce: bytes | None = None
     system_masked: str | None = None
@@ -614,6 +624,11 @@ class SqliteStore:
             "prompt_cipher": fields.pop("prompt_cipher", None),
             "prompt_nonce": fields.pop("prompt_nonce", None),
             "system_masked": fields.pop("system_masked", None),
+            "prompt_external": fields.pop("prompt_external", None),
+            "system_external": fields.pop("system_external", None),
+            "allowed_boundaries_json": _json(
+                list(fields.pop("allowed_boundaries", ("internal", "external")))
+            ),
             "prompt_hash": fields.pop("prompt_hash", None),
             "system_hash": fields.pop("system_hash", None),
             "placement_json": _json(list(fields.pop("placement", ()))),
@@ -697,8 +712,8 @@ class SqliteStore:
         rows = self._conn.execute(
             "SELECT id, tenant_id, service_id, end_user_hash, role, lane, kind, status, "
             "priority, placement_json, tier_models_json, options_json, timeout_s, "
-            "node, model, tier, last_failed_node, attempts, wait_reason, wait_since, "
-            "cost_reserved_usd, created_at "
+            "allowed_boundaries_json, node, model, tier, last_failed_node, attempts, "
+            "wait_reason, wait_since, cost_reserved_usd, created_at "
             "FROM jobs WHERE status = 'queued' AND lane = ? "
             "ORDER BY priority DESC, created_at ASC LIMIT ?",
             (lane, int(limit)),
@@ -1317,6 +1332,7 @@ class SqliteStore:
 # ── 행 ↔ 객체 ───────────────────────────────────────────────────────────────
 
 _JOB_FIELD_MAP = {
+    "allowed_boundaries": ("allowed_boundaries_json", lambda v: _json(list(v))),
     "placement": ("placement_json", lambda v: _json(list(v))),
     "tier_models": ("tier_models_json", lambda v: _json(dict(v))),
     "options": ("options_json", lambda v: _json(dict(v))),
@@ -1327,7 +1343,8 @@ _JOB_FIELD_MAP = {
 _JOB_DIRECT_FIELDS = frozenset(
     {
         "status", "priority", "prompt_masked", "prompt_cipher", "prompt_nonce",
-        "system_masked", "prompt_hash", "system_hash", "response", "error", "error_code",
+        "system_masked", "prompt_external", "system_external",
+        "prompt_hash", "system_hash", "response", "error", "error_code",
         "timeout_s", "max_prompt_chars", "node", "model", "tier", "last_failed_node",
         "attempts", "wait_reason", "wait_since", "cost_reserved_usd", "cost_usd",
         "input_tokens", "output_tokens", "started_at", "finished_at", "lane", "end_user_hash",
@@ -1369,6 +1386,11 @@ def _row_to_job(row: sqlite3.Row) -> JobRow:
         status=row["status"],
         priority=get("priority", 0) or 0,
         prompt_masked=get("prompt_masked"),
+        prompt_external=get("prompt_external"),
+        system_external=get("system_external"),
+        allowed_boundaries=tuple(
+            loads("allowed_boundaries_json", ["internal", "external"])
+        ),
         prompt_cipher=get("prompt_cipher"),
         prompt_nonce=get("prompt_nonce"),
         system_masked=get("system_masked"),

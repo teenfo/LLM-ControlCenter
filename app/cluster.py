@@ -178,6 +178,7 @@ class Cluster:
         service_budget: float | None = None,
         last_failed_node: str | None = None,
         max_output_tokens: int | None = None,
+        allowed_boundaries: Iterable[str] = (INTERNAL, EXTERNAL),
     ) -> PlacementResult:
         """(잡, 노드) 쌍을 고르고 슬롯·메모리·비용을 즉시 차감한다.
 
@@ -192,6 +193,7 @@ class Cluster:
 
         scope = TenantScope(tenant_id)
         rejections: dict[str, str] = {}
+        boundaries = frozenset(allowed_boundaries)
 
         with self._lock:
             candidates: list[tuple[int, NodeState, str, str, float, float]] = []
@@ -203,7 +205,7 @@ class Cluster:
 
                     model = role.model_for_tier(tier)
                     verdict = self._reject_reason(
-                        state, role, model, tenant_id, last_failed_node
+                        state, role, model, tenant_id, last_failed_node, boundaries
                     )
                     if verdict:
                         rejections.setdefault(state.name, verdict)
@@ -273,6 +275,7 @@ class Cluster:
         model: str,
         tenant_id: str,
         last_failed_node: str | None,
+        allowed_boundaries: frozenset[str] = frozenset({INTERNAL, EXTERNAL}),
     ) -> str | None:
         """노드가 이 잡을 받을 수 없는 이유. `None` 이면 후보다."""
         node = state.node
@@ -290,9 +293,13 @@ class Cluster:
         if not node.allows_tenant(tenant_id):
             return "tenant_affinity"
 
-        # 데이터 경계. internal_only 역할은 어떤 상황에서도 경계 밖에 가지 않는다.
+        # 데이터 경계 — 두 겹이다.
+        #   ① 역할의 internal_only: 어떤 상황에서도 경계 밖에 가지 않는다(설정으로 못 푼다).
+        #   ② 가드가 좁힌 허용 경계: 차단 등급에 걸린 경계가 여기서 빠져 있다.
         if role.internal_only and not node.is_internal:
             return "boundary_internal_only"
+        if node.data_boundary not in allowed_boundaries:
+            return "boundary_blocked_by_guard"
 
         if state.provider.capabilities.requires_model_install and model not in state.models:
             # 헬스 프로브 전에는 models 가 비어 있다. 그때는 막지 않는다 —
