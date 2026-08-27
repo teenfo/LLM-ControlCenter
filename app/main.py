@@ -258,6 +258,18 @@ async def _body(request: Request) -> dict[str, Any]:
     return parsed
 
 
+def _confirm(request: Request, body: Mapping[str, Any], expected: str) -> None:
+    """되돌릴 수 없는 작업의 확인값.
+
+    본문과 쿼리 **양쪽**에서 받는다. DELETE 에 본문을 싣는 것은 프록시·CLI·클라이언트
+    라이브러리가 제대로 지원하지 않는 경우가 많고, 파기 API 가 흔한 도구로 호출되지
+    않으면 설치처는 결국 DB 를 직접 지운다 — 그 순간 확인도 감사도 사라진다.
+    """
+    given = body.get("confirm") or request.query_params.get("confirm")
+    if given != expected:
+        raise ApiError("confirmation_required", status=400)
+
+
 def _need(body: Mapping[str, Any], field_name: str) -> Any:
     if field_name not in body or body[field_name] in (None, ""):
         raise ApiError("missing_field", status=400, params={"field": field_name})
@@ -758,9 +770,17 @@ async def tenant_settings(request: Request) -> Response:
             "status": tenant["status"],
             "budget_usd_per_month": tenant["budget_usd_per_month"],
             "rate_limit_per_min": tenant["rate_limit_per_min"],
-            "raw_prompt_retention_days": ctx.store.tenant_setting(
-                scope, "raw_prompt_retention_days",
-                ctx.config.guard_settings.raw_prompt_retention_days,
+            # 요청값과 실제 적용값을 함께 낸다. 테넌트는 **짧게만** 정할 수 있으므로
+            # 플랫폼 상한보다 긴 값은 잘린다 — 조용히 자르면 관리자는 30일로
+            # 설정했다고 믿는 채로 7일 뒤 원문이 사라지는 것을 보게 된다.
+            "raw_prompt_retention_days": ctx.store.effective_raw_retention_days(
+                scope.tenant_id, ctx.config.guard_settings.raw_prompt_retention_days
+            ),
+            "raw_prompt_retention_days_requested": ctx.store.tenant_setting(
+                scope, ctx.store.RAW_RETENTION_KEY
+            ),
+            "raw_prompt_retention_days_platform_max": (
+                ctx.config.guard_settings.raw_prompt_retention_days
             ),
             # 원문 보관은 키가 있을 때만 가능하다. **평문 폴백은 없다.**
             "raw_prompt_storage": ctx.vault.enabled,
@@ -777,7 +797,7 @@ async def tenant_settings(request: Request) -> Response:
         days = int(body["raw_prompt_retention_days"])
         if days < 0:
             raise ApiError("invalid_field", status=400, params={"field": "raw_prompt_retention_days"})
-        ctx.store.set_tenant_setting(scope, "raw_prompt_retention_days", days)
+        ctx.store.set_tenant_setting(scope, ctx.store.RAW_RETENTION_KEY, days)
     ctx.store.audit(
         principal.token_id, "update_tenant_settings", tenant_id=scope.tenant_id,
         detail={k: body[k] for k in ("locale", "raw_prompt_retention_days") if k in body},
@@ -933,15 +953,11 @@ async def tenant_purge_end_user(request: Request) -> Response:
     """
     ctx, principal, scope = _tenant_admin(request)
     end_user_hash = request.path_params["end_user_hash"]
-    body = await _body(request)
-    if body.get("confirm") != end_user_hash:
-        raise ApiError("confirmation_required", status=400)
+    _confirm(request, await _body(request), end_user_hash)
 
-    counts = ctx.store.purge_end_user(scope, end_user_hash)
-    ctx.store.audit(
-        principal.token_id, "purge_end_user", tenant_id=scope.tenant_id,
-        target=end_user_hash, detail=counts,
-    )
+    # 감사는 스토어가 남긴다 — 두 곳에서 남기면 같은 사건이 두 줄이 되고,
+    # 파기 건수를 세는 규정 대응에서 그 중복이 곧 오답이 된다.
+    counts = ctx.store.purge_end_user(scope, end_user_hash, actor=principal.token_id)
     return _ok(request, {"purged": counts})
 
 
@@ -1007,10 +1023,11 @@ async def platform_tenant_purge(request: Request) -> Response:
     ctx, principal = _platform_admin(request)
     tenant_id = request.path_params["tenant_id"]
     body = await _body(request)
-    if body.get("confirm") != tenant_id:
-        raise ApiError("confirmation_required", status=400)
+    _confirm(request, body, tenant_id)
 
-    reason = str(body.get("reason") or "tenant purge requested")
+    reason = str(
+        body.get("reason") or request.query_params.get("reason") or "tenant purge requested"
+    )
     scope = PlatformScope(principal.token_id, reason)
     counts = ctx.store.purge_tenant(scope, tenant_id)
     return _ok(request, {"purged": counts, "dek_destroyed": True})

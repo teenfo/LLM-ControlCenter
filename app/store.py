@@ -1469,6 +1469,27 @@ class SqliteStore:
 
     # -- 보존 정리 ------------------------------------------------------------
 
+    RAW_RETENTION_KEY = "raw_prompt_retention_days"
+
+    def effective_raw_retention_days(self, tenant_id: str, platform_max: int) -> int:
+        """이 테넌트에 실제로 적용되는 원문 보관 일수.
+
+        **테넌트는 짧게만 정할 수 있다.** 가드 규칙과 같은 방향이다 — 플랫폼이 정한
+        상한을 테넌트가 늘릴 수 있으면 플랫폼의 거버넌스 약속이 사라진다.
+        조용히 자르지 않도록 설정 API 가 두 숫자를 함께 보여준다.
+        """
+        row = self._conn.execute(
+            "SELECT value_json FROM tenant_settings WHERE tenant_id = ? AND key = ?",
+            (tenant_id, self.RAW_RETENTION_KEY),
+        ).fetchone()
+        if row is None:
+            return platform_max
+        try:
+            requested = int(json.loads(row["value_json"]))
+        except (TypeError, ValueError):
+            return platform_max
+        return max(0, min(requested, platform_max))
+
     def purge_expired(
         self, *, job_retention_days: int = 30, raw_prompt_retention_days: int = 7
     ) -> dict[str, int]:
@@ -1476,15 +1497,37 @@ class SqliteStore:
 
         원문 암호문과 잡 본체를 **다른 주기로** 지운다 — 마스킹본은 프롬프트 개선의
         재료라 오래 두되, 원문은 짧게 두는 것이 거버넌스의 요구다.
+
+        원문 주기는 **테넌트마다 다르다.** 설정 화면에 있는 값이 실제로 아무것도 안
+        하면 관리자는 설정했다고 믿는 채로 보관 기간을 어긴다 — 그 쪽이 설정이 아예
+        없는 것보다 나쁘다. `raw_prompt_retention_days` 는 그 상한이다.
         """
         now = self._now()
-        cipher_cutoff = now - raw_prompt_retention_days * 86400
         job_cutoff = now - job_retention_days * 86400
 
-        cipher = self._conn.execute(
+        # 테넌트별 주기를 하나로 묶어 한 번씩만 실행한다. 테넌트가 많아도 쿼리는
+        # 서로 다른 주기의 수만큼만 늘어난다.
+        by_days: dict[int, list[str]] = {}
+        for row in self._conn.execute("SELECT id FROM tenants"):
+            days = self.effective_raw_retention_days(row["id"], raw_prompt_retention_days)
+            by_days.setdefault(days, []).append(row["id"])
+
+        cipher = 0
+        for days, tenant_ids in by_days.items():
+            placeholders = ",".join("?" * len(tenant_ids))
+            cipher += self._conn.execute(
+                "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
+                f"WHERE prompt_cipher IS NOT NULL AND tenant_id IN ({placeholders}) "
+                "AND created_at < ?",
+                (*tenant_ids, now - days * 86400),
+            ).rowcount
+
+        # 테넌트 행이 이미 지워진 고아 암호문은 플랫폼 상한으로 정리한다.
+        cipher += self._conn.execute(
             "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
-            "WHERE prompt_cipher IS NOT NULL AND created_at < ?",
-            (cipher_cutoff,),
+            "WHERE prompt_cipher IS NOT NULL AND created_at < ? "
+            "AND tenant_id NOT IN (SELECT id FROM tenants)",
+            (now - raw_prompt_retention_days * 86400,),
         ).rowcount
         jobs = self._conn.execute(
             "DELETE FROM jobs WHERE status IN "
@@ -1501,21 +1544,46 @@ class SqliteStore:
 
     # -- 파기 (C6) ------------------------------------------------------------
 
-    def purge_end_user(self, scope: TenantScope, end_user_hash: str) -> dict[str, int]:
-        """엔드유저 파기. 그 사용자의 데이터만 지운다."""
+    def purge_end_user(
+        self, scope: TenantScope, end_user_hash: str, *, actor: str = "tenant_admin"
+    ) -> dict[str, int]:
+        """엔드유저 파기. **그 사용자의 데이터만 지운다.**
+
+        `filter_events` 는 남긴다. 값을 저장하지 않는 테이블이라 지워진 잡과의
+        연결이 끊긴 시점에 더는 그 사람의 데이터가 아니고, 지우면 가드 품질 통계가
+        파기 요청 한 건에 왜곡된다 — 오탐률이 규칙을 켜고 끄는 근거이므로
+        그 왜곡이 곧 필터 정책의 왜곡이 된다.
+        """
         where, params = self._scoped_where(scope, "end_user_hash = ?")
         params.append(end_user_hash)
 
+        # 지우기 **전에** 잡 id 를 모은다. 지운 뒤에는 어떤 이벤트가 이 사람 것이었는지
+        # 알 방법이 없다.
+        job_ids = [
+            row["id"] for row in self._conn.execute(f"SELECT id FROM jobs WHERE {where}", params)
+        ]
+
         jobs = self._conn.execute(f"DELETE FROM jobs WHERE {where}", params).rowcount
         usage = self._conn.execute(f"DELETE FROM usage WHERE {where}", params).rowcount
+
+        # 이벤트 자체는 남기되 job_id 는 끊는다. 지워진 잡을 가리키는 식별자가 남으면
+        # 그 사람의 요청 하나하나를 다시 묶어 셀 수 있고, 그건 파기가 아니다.
+        events = 0
+        if job_ids:
+            placeholders = ",".join("?" * len(job_ids))
+            events = self._conn.execute(
+                f"UPDATE filter_events SET job_id = NULL WHERE job_id IN ({placeholders})",
+                job_ids,
+            ).rowcount
         self._conn.commit()
 
-        # 무엇을 지웠는지가 아니라 언제·누가·얼마나 지웠는지만 남긴다.
+        # 무엇을 지웠는지가 아니라 **언제·누가·얼마나** 지웠는지만 남긴다.
+        # 감사가 새 유출 경로가 되면 나머지 노력이 무의미해진다.
         self.audit(
-            "tenant_admin", "purge_end_user", tenant_id=scope.tenant_id,
+            actor, "purge_end_user", tenant_id=scope.tenant_id,
             detail={"jobs": jobs, "usage": usage},
         )
-        return {"jobs": jobs, "usage": usage}
+        return {"jobs": jobs, "usage": usage, "filter_events_unlinked": events}
 
     def purge_tenant(self, scope: PlatformScope, tenant_id: str) -> dict[str, int]:
         """테넌트 파기.
