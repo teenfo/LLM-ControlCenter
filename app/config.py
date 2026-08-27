@@ -190,6 +190,11 @@ class Thresholds:
     health_probe_interval_seconds: int = 30
     max_retries: int = 3
     retry_backoff_seconds: tuple[int, ...] = (2, 4, 8)
+    #: 시간당 이 이상 차단되면 알린다. 규칙을 잘못 켰거나 소비자가 잘못 붙였다는 신호다.
+    guard_block_spike_per_hour: int = 50
+    #: 분류 실패율이 이 이상이면 알린다. **분류 실패는 판정이 아니다** —
+    #: on_classifier_error 정책을 타지만, 그 사건이 늘고 있다는 것은 사람이 알아야 한다.
+    classifier_failure_rate_warn: float = 0.10
 
 
 @dataclass(frozen=True)

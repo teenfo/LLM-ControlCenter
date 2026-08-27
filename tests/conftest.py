@@ -29,6 +29,7 @@ from app.guard import Guard
 from app.identity import new_salt
 from app.main import build_app
 from app.models import ModelRegistrar
+from app.notify import Notifier, RecordingChannel
 from app.pipeline import Pipeline
 from app.scheduler import Scheduler
 from app.store import SqliteStore, TenantScope
@@ -153,24 +154,33 @@ def store(clock):
 def harness(config, store, clock, vault):
     """앱 + 부품 묶음. 테스트가 내부 상태를 직접 만질 수 있게 함께 돌려준다."""
     accountant = CostAccountant(config.pricing, store, now=clock)
-    cluster = Cluster(config, store, accountant=accountant, now=clock)
+    channel = RecordingChannel()
+    notifier = Notifier([channel], now=clock, min_interval_seconds=0.0)
+    cluster = Cluster(
+        config, store, accountant=accountant, now=clock, notifier=notifier
+    )
     for name, state in cluster.nodes.items():
         state.models = frozenset(config.nodes[name].models)
         state.status = HEALTHY
 
     guard = Guard(config)
     evaluator = Evaluator(config, store, guard, now=clock)
-    registrar = ModelRegistrar(config, cluster, store, now=clock)
+    registrar = ModelRegistrar(
+        config, cluster, store, now=clock, notify=notifier.as_callable()
+    )
     pipeline = Pipeline(
         config, store, cluster, guard,
         vault=vault, accountant=accountant, evaluator=evaluator, now=clock,
     )
-    scheduler = Scheduler(config, store, cluster, now=clock)
+    scheduler = Scheduler(
+        config, store, cluster, accountant=accountant, registrar=registrar,
+        now=clock, notifier=notifier,
+    )
 
     app = build_app(
         config=config, store=store, cluster=cluster, guard=guard, scheduler=scheduler,
         pipeline=pipeline, vault=vault, evaluator=evaluator, registrar=registrar,
-        accountant=accountant, now=clock,
+        accountant=accountant, notifier=notifier, now=clock,
     )
 
     class Harness:
@@ -189,6 +199,8 @@ def harness(config, store, clock, vault):
     h.vault = vault
     h.clock = clock
     h.accountant = accountant
+    h.notifier = notifier
+    h.channel = channel
     return h
 
 

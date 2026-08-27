@@ -60,6 +60,7 @@ class Scheduler:
         registrar: ModelRegistrar | None = None,
         now: Callable[[], float] = time.time,
         notify: Callable[[str, dict[str, Any]], None] | None = None,
+        notifier: Any = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -67,7 +68,9 @@ class Scheduler:
         self._accountant = accountant or CostAccountant(config.pricing, store, now=now)
         self._registrar = registrar
         self._now = now
-        self._notify = notify or (lambda event, detail: None)
+        self._notify = notify or (notifier.as_callable() if notifier else (lambda e, d: None))
+        # 전이 판정이 필요한 알림(예산 경고 등)은 알림기가 직접 있어야 한다.
+        self._notifier = notifier
 
         self._thresholds = config.thresholds
         self._lane_running: dict[str, int] = {name: 0 for name in config.lanes}
@@ -93,6 +96,7 @@ class Scheduler:
         self._tasks.append(asyncio.create_task(self._health_loop(), name="health"))
         self._tasks.append(asyncio.create_task(self._models_loop(), name="models"))
         self._tasks.append(asyncio.create_task(self._retention_loop(), name="retention"))
+        self._tasks.append(asyncio.create_task(self._watch_loop(), name="watch"))
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -376,6 +380,64 @@ class Scheduler:
                     self._registrar.detect_missing()
                     await self._registrar.process_approved()
             await asyncio.sleep(self._thresholds.health_probe_interval_seconds)
+
+    async def _watch_loop(self) -> None:
+        """사람이 모르면 조용히 멈추는 지점을 주기적으로 본다."""
+        while not self._stopping.is_set():
+            await asyncio.sleep(self._thresholds.health_probe_interval_seconds * 2)
+            with contextlib.suppress(Exception):
+                self.run_watches()
+
+    def run_watches(self) -> dict[str, Any]:
+        """예산 소진 · 가드 차단 급증 · 분류 실패율.
+
+        전부 **전이에서만** 알린다. 예산이 90% 인 동안 매 주기 경고하면 이틀 뒤
+        아무도 그 채널을 안 본다 — 안 보는 알림은 없는 알림이다.
+
+        테스트가 직접 부를 수 있게 루프에서 분리했다.
+        """
+        if self._notifier is None:
+            return {}
+
+        findings: dict[str, Any] = {}
+        warn_at = self._thresholds.cost_budget_burn_warn
+        since = self._accountant.period_start()
+
+        for row in self._store.tenant_budget_status(since):
+            limit = row["budget_usd_per_month"]
+            if not limit:
+                continue
+            burn = row["spent"] / limit
+            # 세 구간 중 어디에 있는지를 상태로 본다. 값이 아니라 구간이 바뀔 때만 나간다.
+            band = "exhausted" if burn >= 1.0 else ("warn" if burn >= warn_at else "ok")
+            findings[row["tenant_id"]] = band
+            if band == "ok":
+                self._notifier.seed(f"budget:{row['tenant_id']}", band)
+                continue
+            self._notifier.observe(
+                f"budget:{row['tenant_id']}", band,
+                event="budget_exhausted" if band == "exhausted" else "budget_warn",
+                tenant=row["tenant_id"], percent=round(burn * 100, 1),
+            )
+
+        # 가드 차단 급증 — 규칙을 잘못 켰거나 소비자가 잘못 붙였다는 신호다.
+        blocks = self._store.recent_filter_event_count("block", since=self._now() - 3600)
+        spike = blocks >= self._thresholds.guard_block_spike_per_hour
+        findings["guard_blocks_last_hour"] = blocks
+        self._notifier.observe(
+            "guard:blocks", "spike" if spike else "normal",
+            event="guard_blocks_spike", count=blocks,
+        )
+
+        # 분류 실패는 판정이 아니다. 실패율이 오르면 관리자가 알아야 한다.
+        rate = self._store.classifier_failure_rate(since=self._now() - 3600)
+        findings["classifier_failure_rate"] = rate
+        bad = rate >= self._thresholds.classifier_failure_rate_warn
+        self._notifier.observe(
+            "guard:classifier", "degraded" if bad else "ok",
+            event="classifier_error_rate", percent=round(rate * 100, 1),
+        )
+        return findings
 
     async def _retention_loop(self) -> None:
         while not self._stopping.is_set():

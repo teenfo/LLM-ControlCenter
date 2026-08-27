@@ -889,6 +889,117 @@ class SqliteStore:
             for row in rows
         ]
 
+    # -- 관제 집계 (테넌트를 가로지르지만 **어느 테넌트인지는 안 나온다**) ------
+    #
+    # 메트릭은 설치처 전체가 보는 대시보드로 흘러간다. 테넌트별 숫자가 거기 뜨면
+    # 그것도 정보 유출이므로, 이 집계들은 합계만 돌려준다. 테넌트별 값은 인증이
+    # 걸린 관제 API 에만 있다.
+
+    def job_counts(self) -> dict[str, int]:
+        return {
+            row["status"]: row["n"]
+            for row in self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
+            )
+        }
+
+    def filter_event_counts(self) -> dict[tuple[str, str], int]:
+        return {
+            (row["action"], row["stage"]): row["n"]
+            for row in self._conn.execute(
+                "SELECT action, stage, COUNT(*) AS n FROM filter_events GROUP BY action, stage"
+            )
+        }
+
+    def unreviewed_filter_event_count(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM filter_events WHERE action='audit' AND reviewed=0"
+        ).fetchone()
+        return int(row["n"])
+
+    def total_spend_since(self, since: float) -> float:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM usage WHERE ts >= ?", (since,)
+        ).fetchone()
+        return float(row["total"])
+
+    def tenant_count(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM tenants WHERE purged_at IS NULL"
+        ).fetchone()
+        return int(row["n"])
+
+    def recent_job_errors(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """최근 실패. **프롬프트도 응답도 담지 않는다** — 코드와 사유뿐이다.
+
+        진단 번들에 들어가는 값이고, 그 번들은 설치처가 지원 채널로 그대로 보낸다.
+        """
+        rows = self._conn.execute(
+            "SELECT id, role, lane, node, model, error_code, error, attempts, finished_at "
+            "FROM jobs WHERE error_code IS NOT NULL ORDER BY finished_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        return [
+            {
+                "job_id": row["id"], "role": row["role"], "lane": row["lane"],
+                "node": row["node"], "model": row["model"],
+                "error_code": row["error_code"],
+                # 백엔드 오류 문자열에 응답 조각이 섞여 올 수 있어 길이를 자른다.
+                "error": (row["error"] or "")[:200],
+                "attempts": row["attempts"], "finished_at": row["finished_at"],
+            }
+            for row in rows
+        ]
+
+    def tenant_budget_status(self, since: float) -> list[dict[str, Any]]:
+        """테넌트별 한도와 소진액. 예산 알림의 재료다.
+
+        전 테넌트를 가로지르지만 `PlatformScope` 를 요구하지 않는다 — 이건 사람이
+        조회하는 경로가 아니라 **알림 루프가 쓰는 내부 집계**이고, 결과는 알림
+        본문(테넌트 id 와 퍼센트)으로만 나간다. 조회 감사를 매 주기 남기면
+        감사 로그가 알림 루프로 가득 찬다.
+        """
+        rows = self._conn.execute(
+            "SELECT t.id AS tenant_id, t.budget_usd_per_month, "
+            "COALESCE((SELECT SUM(cost_usd) FROM usage u "
+            "          WHERE u.tenant_id = t.id AND u.ts >= ?), 0.0) AS spent "
+            "FROM tenants t WHERE t.purged_at IS NULL",
+            (since,),
+        )
+        return [
+            {
+                "tenant_id": row["tenant_id"],
+                "budget_usd_per_month": row["budget_usd_per_month"],
+                "spent": float(row["spent"]),
+            }
+            for row in rows
+        ]
+
+    def recent_filter_event_count(self, action: str, *, since: float) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM filter_events WHERE action = ? AND ts >= ?",
+            (action, since),
+        ).fetchone()
+        return int(row["n"])
+
+    def classifier_failure_rate(self, *, since: float) -> float:
+        """최근 창에서 2단 분류가 실패한 비율.
+
+        분모는 **맥락 규칙이 걸린 요청** 이 아니라 그 창의 전체 잡이다. 분류를
+        시도하지 않은 잡까지 세면 실패율이 희석돼 경보가 안 울린다 — 그래서
+        `llm` 단계 이벤트가 하나라도 있는 잡만 분모에 넣는다.
+        """
+        row = self._conn.execute(
+            "SELECT "
+            " COUNT(DISTINCT CASE WHEN stage='llm' THEN job_id END) AS attempted, "
+            " COUNT(DISTINCT CASE WHEN stage='llm' AND rule_id='_classifier_failed' "
+            "        THEN job_id END) AS failed "
+            "FROM filter_events WHERE ts >= ?",
+            (since,),
+        ).fetchone()
+        attempted = int(row["attempted"] or 0)
+        return (int(row["failed"] or 0) / attempted) if attempted else 0.0
+
     def queued_wait_reasons(self) -> dict[str, int]:
         """대기 사유별 잡 수. 관제 UI 의 1급 카드다.
 

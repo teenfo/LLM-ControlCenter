@@ -124,10 +124,14 @@ class Cluster:
         accountant: CostAccountant | None = None,
         providers: Mapping[str, Provider] | None = None,
         now: Callable[[], float] = time.time,
+        notifier: Any = None,
     ) -> None:
         self._config = config
         self._store = store
         self._now = now
+        # 알림기가 없어도 동작한다 — 관제는 알림 없이도 서고, 알림 배선이 없다고
+        # 추론이 멈추면 안 된다. 있으면 헬스 전이를 그쪽에 알린다.
+        self._notifier = notifier
         self._accountant = accountant or CostAccountant(config.pricing, store, now=now)
 
         # 예약의 임계 구역을 지키는 락. 안에서 await 하지 않는다 —
@@ -392,6 +396,7 @@ class Cluster:
             state.status = HEALTHY
             state.last_error = None
         self._persist_health(state)
+        self._announce(state)
 
     def record_failure(self, node: str, error: str = "") -> None:
         """실패 1회. **1회로 죽이지 않는다** — 연속 3회여야 unhealthy 다."""
@@ -405,6 +410,7 @@ class Cluster:
             if state.status != DRAINING:
                 state.status = UNHEALTHY
         self._persist_health(state)
+        self._announce(state)
 
     async def probe(self, node: str) -> bool:
         """노드에 헬스 요청을 보내고 모델 인벤토리를 갱신한다."""
@@ -503,6 +509,21 @@ class Cluster:
         state.consecutive_failures = 0
         state.consecutive_successes = 0
         self._persist_health(state)
+
+    def _announce(self, state: NodeState) -> None:
+        """헬스 전이를 알림기에 넘긴다. **보낼지 말지는 알림기가 정한다.**
+
+        여기서 판정하면 성공·실패 두 경로가 각자 규칙을 갖게 되고, 언젠가 한쪽만
+        고쳐져서 "죽을 때는 알리는데 살아날 때는 안 알리는" 상태가 된다.
+        """
+        if self._notifier is None:
+            return
+        event = "node_recovered" if state.status == HEALTHY else "node_offline"
+        if state.status not in (HEALTHY, UNHEALTHY):
+            return   # unknown·draining 은 전이 알림 대상이 아니다
+        self._notifier.observe(
+            f"node:{state.name}", state.status, event=event, node=state.name
+        )
 
     def _persist_health(self, state: NodeState) -> None:
         self._store.upsert_node_health(

@@ -44,6 +44,11 @@ INTERNAL_ROLE_PREFIX = "_"
 
 _TERMINAL = frozenset({"ok", "failed", "blocked", "cancelled", "needs_review"})
 
+#: 2단 분류의 시도·실패를 세기 위한 예약 규칙 id. 실제 규칙이 아니라 계수기다.
+#: 밑줄로 시작하므로 테넌트가 같은 id 의 규칙을 만들어도 겹치지 않는다.
+CLASSIFIER_OK_RULE = "_classifier_ok"
+CLASSIFIER_FAILED_RULE = "_classifier_failed"
+
 
 def is_public_role(name: str) -> bool:
     return not name.startswith(INTERNAL_ROLE_PREFIX)
@@ -212,6 +217,21 @@ class Pipeline:
                     service_id=service_id,
                     boundary=boundary,
                 )
+
+        if result.classifier_attempted:
+            # **분류 실패는 판정이 아니다.** `on_classifier_error` 정책을 타되,
+            # 그 사건 자체를 별도로 집계한다 — 실패율이 오르면 사람이 알아야 하고,
+            # 시도 건수를 안 세면 실패율의 분모가 없다.
+            self._store.record_filter_event(
+                scope,
+                rule_id=CLASSIFIER_FAILED_RULE if result.classifier_failed else CLASSIFIER_OK_RULE,
+                stage="llm",
+                action=self._config.guard_settings.on_classifier_error
+                if result.classifier_failed
+                else "audit",
+                job_id=job_id,
+                service_id=service_id,
+            )
 
     @staticmethod
     def _guard_actions(result: GuardResult) -> dict[str, str]:

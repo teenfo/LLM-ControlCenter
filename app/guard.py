@@ -155,6 +155,9 @@ class GuardResult:
     systems: Mapping[str, str | None]
     detections: tuple[Detection, ...] = ()
     blocked_rules: tuple[str, ...] = ()
+    #: 2단 분류를 **시도했는가.** 실패율의 분모다 — 시도하지 않은 요청까지 세면
+    #: 실패율이 희석돼 경보가 안 울린다.
+    classifier_attempted: bool = False
     classifier_failed: bool = False
 
     @property
@@ -307,7 +310,8 @@ class Guard:
         classifier_failed = False
         llm_hits: set[str] = set()
 
-        if context_rules and allow_classifier:
+        classifier_attempted = bool(context_rules) and allow_classifier
+        if classifier_attempted:
             try:
                 if self._classifier is None:
                     raise RuntimeError("분류기가 없다")
@@ -356,6 +360,7 @@ class Guard:
             },
             detections=tuple(detections),
             blocked_rules=blocked_rules,
+            classifier_attempted=classifier_attempted,
             classifier_failed=classifier_failed,
         )
 

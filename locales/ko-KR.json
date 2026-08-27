@@ -50,6 +50,7 @@
   "notify.budget_exhausted": "'{tenant}' 테넌트의 예산이 모두 소진되었습니다.",
   "notify.guard_blocks_spike": "가드 차단이 급증했습니다 ({count}건/시간).",
   "notify.classifier_error_rate": "민감 정보 분류 실패율이 {percent}%로 상승했습니다.",
+  "notify.crash_recovery_needs_review": "크래시 복구: 검토가 필요한 작업 {needs_review}건이 있습니다.",
 
   "ui.dashboard": "관제",
   "ui.nodes": "노드",

@@ -126,7 +126,9 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "platform_overview": ("전역 관제 — 테넌트별 소비·노드 그리드·단일 호밍 경고.", "platform_admin", False),
     "platform_guard_baseline": ("베이스라인 가드 규칙과 로케일 팩 현황.", "platform_admin", False),
     "platform_evals": ("가드 회귀 평가 실행·이력.", "platform_admin", False),
-    "metrics": ("Prometheus/OpenMetrics 노출.", "platform_admin", False),
+    "platform_diagnostics": ("진단 번들 — 비밀은 마스킹, 프롬프트 본문은 미포함.", "platform_admin", False),
+    "platform_notifications": ("알림 채널 현황과 테스트 발송.", "platform_admin", False),
+    "metrics": ("Prometheus/OpenMetrics 노출. 테넌트 이름은 라벨에 없다.", "platform_admin", False),
     "ui": ("관제 UI 정적 자산.", "public", False),
 }
 

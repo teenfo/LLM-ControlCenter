@@ -46,6 +46,8 @@ from .guard import Guard
 from .i18n import ApiError, Translator, guard_pack_for, negotiate_locale
 from .identity import new_salt
 from .models import ModelRegistrar
+from .notify import Notifier, channels_from_env
+from .observability import collect, diagnostic_bundle, render_metrics
 from .pipeline import GUARD_ROLE, Pipeline, Submission, is_public_role
 from .scheduler import Scheduler
 from .store import PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
@@ -79,6 +81,7 @@ class AppContext:
     accountant: CostAccountant
     evaluator: Evaluator
     registrar: ModelRegistrar
+    notifier: Notifier
     scheduler: Scheduler | None = None
     version: str = VERSION
     #: 에어갭이면 클라우드 티어를 자동 비활성화하고 그 사실을 표시한다.
@@ -114,6 +117,7 @@ def build_app(
     evaluator: Evaluator | None = None,
     registrar: ModelRegistrar | None = None,
     accountant: CostAccountant | None = None,
+    notifier: Notifier | None = None,
     airgap: bool = False,
     version: str = VERSION,
     now: Callable[[], float] = time.time,
@@ -129,10 +133,18 @@ def build_app(
     translator = translator or Translator.from_dir(Path(__file__).resolve().parent.parent / "locales")
     vault = vault or KeyVault(None)
     accountant = accountant or CostAccountant(config.pricing, store, now=now)
-    cluster = cluster or Cluster(config, store, accountant=accountant, now=now)
+    notifier = notifier or Notifier(
+        channels_from_env(), translator=translator, now=now
+    )
+    # 노드 헬스 전이가 알림기로 간다. 주입된 클러스터는 자기 알림기를 이미 갖고 있다.
+    cluster = cluster or Cluster(
+        config, store, accountant=accountant, now=now, notifier=notifier
+    )
     guard = guard or Guard(config)
     evaluator = evaluator or Evaluator(config, store, guard, now=now)
-    registrar = registrar or ModelRegistrar(config, cluster, store, now=now)
+    registrar = registrar or ModelRegistrar(
+        config, cluster, store, now=now, notify=notifier.as_callable()
+    )
     pipeline = pipeline or Pipeline(
         config, store, cluster, guard,
         vault=vault, accountant=accountant, evaluator=evaluator, now=now,
@@ -148,7 +160,7 @@ def build_app(
         config=config, store=store, cluster=cluster, guard=guard, pipeline=pipeline,
         translator=translator, vault=vault, limiter=RateLimiter(store, now=now),
         accountant=accountant, evaluator=evaluator, registrar=registrar,
-        scheduler=scheduler, version=version, airgap=airgap, now=now,
+        notifier=notifier, scheduler=scheduler, version=version, airgap=airgap, now=now,
         static_dir=static_dir or STATIC_DIR, client_dir=client_dir or CLIENT_DIR,
     )
 
@@ -1204,14 +1216,58 @@ async def platform_evals(request: Request) -> Response:
 
 
 async def metrics(request: Request) -> Response:
-    """Prometheus/OpenMetrics. 13단계에서 채운다."""
+    """Prometheus/OpenMetrics.
+
+    설치처는 이미 자기 모니터링을 갖고 있다. 대시보드를 하나 더 주는 것보다
+    **그들이 쓰는 것에 물리는 쪽**이 낫다.
+
+    **테넌트 이름은 라벨에 없다.** 메트릭은 설치처 전체가 보는 대시보드로
+    흘러가고, 거기에 테넌트별 소비량이 뜨면 그것도 정보 유출이다.
+    """
+    ctx, _ = _platform_admin(request)
+    body = render_metrics(collect(
+        store=ctx.store, cluster=ctx.cluster, scheduler=ctx.scheduler,
+        registrar=ctx.registrar, notifier=ctx.notifier, vault=ctx.vault,
+        version=ctx.version, airgap=ctx.airgap, thresholds=ctx.config.thresholds,
+    ))
+    return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+async def platform_diagnostics(request: Request) -> Response:
+    """진단 번들.
+
+    **설치처가 이 파일을 그대로 지원 채널로 보낸다는 전제로 만든다.** 그래서
+    비밀은 길이만 남기고, 프롬프트·응답 본문과 테넌트 이름은 아예 담지 않는다.
+    """
+    import os
+
     ctx, principal = _platform_admin(request)
-    lines = [
-        "# HELP llmcc_up 컨트롤 플레인 생존",
-        "# TYPE llmcc_up gauge",
-        "llmcc_up 1",
-    ]
-    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+    bundle = diagnostic_bundle(
+        store=ctx.store, cluster=ctx.cluster, config=ctx.config,
+        scheduler=ctx.scheduler, registrar=ctx.registrar, notifier=ctx.notifier,
+        vault=ctx.vault, env=os.environ, version=ctx.version, airgap=ctx.airgap,
+        now=ctx.now,
+    )
+    ctx.store.audit(principal.token_id, "diagnostic_bundle")
+    return _ok(request, bundle)
+
+
+async def platform_notifications(request: Request) -> Response:
+    """알림 채널 현황과 최근 발송.
+
+    **채널이 하나도 없으면 그 사실이 보여야 한다** — 관제 센터가 알림 없이는
+    관제를 못 하는데, 안 붙은 것을 모르는 것이 가장 흔한 실패다.
+    """
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        snapshot = ctx.notifier.snapshot()
+        snapshot["configured"] = bool(snapshot["channels"])
+        return _ok(request, snapshot)
+
+    # 테스트 발송 — 채널이 실제로 닿는지는 보내 봐야 안다.
+    ctx.notifier.send("node_recovered", node="(테스트)")
+    ctx.store.audit(principal.token_id, "test_notification")
+    return _ok(request, {"sent": True, "channels": list(ctx.notifier.channel_names)})
 
 
 # ── 라우트 ──────────────────────────────────────────────────────────────────
@@ -1288,6 +1344,9 @@ def _routes(ctx: AppContext) -> list[Any]:
               name="platform_guard_baseline"),
         Route(f"{v}/platform/evals", platform_evals,
               methods=["GET", "POST"], name="platform_evals"),
+        Route(f"{v}/platform/diagnostics", platform_diagnostics, name="platform_diagnostics"),
+        Route(f"{v}/platform/notifications", platform_notifications,
+              methods=["GET", "POST"], name="platform_notifications"),
         Route("/metrics", metrics, name="metrics"),
     ]
     if ctx.static_dir.is_dir():

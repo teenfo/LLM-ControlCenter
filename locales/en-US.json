@@ -50,6 +50,7 @@
   "notify.budget_exhausted": "Tenant '{tenant}' has exhausted its budget.",
   "notify.guard_blocks_spike": "Guard blocks are spiking ({count}/hour).",
   "notify.classifier_error_rate": "Classifier failure rate rose to {percent}%.",
+  "notify.crash_recovery_needs_review": "Crash recovery: {needs_review} job(s) need review.",
 
   "ui.dashboard": "Control",
   "ui.nodes": "Nodes",
