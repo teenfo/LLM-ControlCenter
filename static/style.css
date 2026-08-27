@@ -1,0 +1,140 @@
+/* 관제 UI 스타일. 외부 폰트·CDN 없음 — 에어갭에서도 그대로 뜬다. */
+
+:root {
+  --bg: #0f1216;
+  --panel: #171b21;
+  --panel-2: #1e232b;
+  --line: #2a313b;
+  --text: #e6e9ee;
+  --muted: #97a1b0;
+  --accent: #5aa9e6;
+  --ok: #4ec9a0;
+  --warn: #e3b341;
+  --bad: #f07178;
+  --internal: #4ec9a0;
+  --external: #e3b341;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --line: #d9dee6;
+    --text: #1b1f26; --muted: #5c6675; --accent: #1c6fb0;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 system-ui, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif;
+}
+
+h1 { font-size: 1.35rem; margin: 0 0 1rem; }
+h2 { font-size: 1.05rem; margin: 0 0 .6rem; }
+h3 { font-size: .95rem; margin: 0 0 .4rem; }
+
+.muted { color: var(--muted); }
+.grow { flex: 1; }
+.error { color: var(--bad); margin: .75rem 1rem; }
+.hint { color: var(--muted); font-size: .85rem; margin: .35rem 0 .9rem; }
+
+/* -- 접속 -- */
+#login { display: grid; place-items: center; min-height: 100vh; padding: 1rem; }
+#login form {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 1.6rem; width: min(420px, 100%);
+}
+#login label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: .3rem; }
+
+input, select, textarea {
+  width: 100%; padding: .5rem .6rem; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; font: inherit;
+}
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+button {
+  padding: .45rem .8rem; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; font: inherit; cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #06121c; font-weight: 600; }
+button.danger { border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+/* -- 셸 -- */
+header {
+  display: flex; gap: .75rem; align-items: center;
+  padding: .6rem 1rem; background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5;
+}
+
+nav {
+  display: flex; gap: .25rem; flex-wrap: wrap;
+  padding: .5rem 1rem; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+nav button.active { background: var(--accent); border-color: var(--accent); color: #06121c; }
+
+main { padding: 1rem; display: grid; gap: 1rem; }
+
+/* -- 카드 -- */
+.card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: .9rem 1rem;
+}
+.card.warn { border-color: var(--warn); }
+.card.bad { border-color: var(--bad); }
+.grid { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+
+.stat { font-size: 1.6rem; font-weight: 600; }
+.stat.ok { color: var(--ok); }
+.stat.warn { color: var(--warn); }
+.stat.bad { color: var(--bad); }
+
+.row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+.row.end { justify-content: flex-end; }
+
+/* -- 표 -- */
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.scroll { overflow-x: auto; }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .85em; }
+
+/* -- 배지 -- */
+.badge {
+  display: inline-block; padding: .1rem .45rem; border-radius: 999px;
+  font-size: .75rem; border: 1px solid var(--line); white-space: nowrap;
+}
+.badge.internal { color: var(--internal); border-color: var(--internal); }
+.badge.external { color: var(--external); border-color: var(--external); }
+.badge.healthy { color: var(--ok); border-color: var(--ok); }
+.badge.unhealthy { color: var(--bad); border-color: var(--bad); }
+.badge.draining { color: var(--warn); border-color: var(--warn); }
+.badge.block { color: var(--bad); border-color: var(--bad); }
+.badge.audit { color: var(--muted); }
+.badge.full, .badge.partial { color: var(--warn); border-color: var(--warn); }
+
+/* -- 배너: 조용한 실패를 시끄럽게 만든다 -- */
+#banners { display: grid; gap: .4rem; padding: .5rem 1rem 0; }
+.banner {
+  padding: .5rem .75rem; border-radius: 8px; font-size: .88rem;
+  border: 1px solid var(--warn); color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.banner.bad { border-color: var(--bad); color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent); }
+
+/* -- 막대 -- */
+.bar { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--accent); }
+.bar > span.warn { background: var(--warn); }
+.bar > span.bad { background: var(--bad); }
+
+form.inline { display: grid; gap: .5rem; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); align-items: end; }
+form.inline label { font-size: .8rem; color: var(--muted); display: block; }
+
+pre.reveal {
+  background: var(--panel-2); border: 1px solid var(--accent); border-radius: 6px;
+  padding: .6rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+}

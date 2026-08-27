@@ -455,6 +455,44 @@ def _service_or_401(ctx: AppContext, principal: Principal) -> Any:
     return service
 
 
+async def session(request: Request) -> Response:
+    """이 토큰이 누구이고 UI 가 무엇을 그릴 수 있는가.
+
+    관제 UI 는 렌더 전에 **역할과 문자열 카탈로그**를 알아야 한다. 두 번에 나눠
+    받으면 첫 화면이 영어로 떴다가 한국어로 바뀌는 깜빡임이 생기고, 역할을 모른 채
+    그리면 권한 없는 메뉴를 띄웠다 지우게 된다.
+
+    문자열은 협상된 로케일 하나만 보낸다 — 전체 카탈로그를 보내면 쓰지도 않을
+    번역이 매 요청마다 따라다닌다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    tenant = request.state.tenant
+    locale = _locale(request, tenant["locale"] if tenant else None, ctx)
+
+    service = ctx.store.get_service(principal.scope(), principal.service_id)
+    return _ok(request, {
+        "tenant": {
+            "id": principal.tenant_id,
+            "name": tenant["name"] if tenant else principal.tenant_id,
+            "locale": tenant["locale"] if tenant else ctx.translator.default,
+        },
+        "service": {"id": principal.service_id, "name": service["name"] if service else ""},
+        "role": principal.role,
+        "is_tenant_admin": principal.is_tenant_admin,
+        "is_platform_admin": principal.is_platform_admin,
+        "locale": locale,
+        "available_locales": list(ctx.translator.available),
+        "strings": ctx.translator.catalog(locale),
+        "version": ctx.version,
+        "airgap": ctx.airgap,
+        # 안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.
+        "guard_locale_pack": guard_pack_for(tenant["locale"]) if tenant else None,
+        "raw_prompt_storage": ctx.vault.enabled,
+        "guard_classifier_ready": ctx.guard.has_classifier,
+    })
+
+
 async def meta_endpoint(request: Request) -> Response:
     ctx: AppContext = request.app.state.ctx
     principal = _principal(request)
@@ -1284,6 +1322,7 @@ def _routes(ctx: AppContext) -> list[Any]:
     routes: list[Any] = [
         Route("/healthz", healthz, name="healthz"),
         # 계약 자기 서빙
+        Route(f"{v}/session", session, name="session"),
         Route(f"{v}/meta", meta_endpoint, name="meta"),
         Route(f"{v}/integration", integration, name="integration"),
         Route(f"{v}/openapi.json", openapi_json, name="openapi_json"),

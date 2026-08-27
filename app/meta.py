@@ -84,6 +84,7 @@ class RouteInfo:
 ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     # name: (summary, audience, in_guide)
     "healthz": ("컨테이너·로드밸런서용 생존 확인. 인증이 필요 없다.", "public", True),
+    "session": ("이 토큰의 신원·권한·로케일 문자열. 관제 UI 가 렌더 전에 쓴다.", "consumer", False),
     "meta": ("기계가 읽는 계약 — 역할·한도·오류 코드·엔드포인트. 토큰마다 다르다.", "consumer", True),
     "integration": ("사람이 읽는 통합 가이드(마크다운).", "consumer", True),
     "openapi_json": ("OpenAPI 3.1 (JSON). 이 토큰이 쓸 수 있는 역할만 담는다.", "consumer", True),

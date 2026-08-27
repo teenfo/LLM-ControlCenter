@@ -75,6 +75,17 @@ class Translator:
     def available(self) -> tuple[str, ...]:
         return tuple(sorted(self._catalogs))
 
+    def catalog(self, locale: str | None = None) -> dict[str, str]:
+        """한 로케일의 문자열 전부. 관제 UI 가 렌더 전에 통째로 받아 간다.
+
+        기본 로케일을 아래에 깔고 요청 로케일을 덮는다 — 새 키가 한쪽에만 있어도
+        화면에 키 문자열이 그대로 뜨지 않는다.
+        """
+        chosen = locale if locale in self._catalogs else self._default
+        merged = dict(self._catalogs.get(self._default, {}))
+        merged.update(self._catalogs.get(chosen, {}))
+        return merged
+
     @property
     def default(self) -> str:
         return self._default
