@@ -196,17 +196,22 @@ class CostAccountant:
             input_tokens=input_tokens, output_tokens=output_tokens,
         )
 
-        self._store.update_job(
+        # **예약 해제와 지출 기록은 한 트랜잭션이다.** 따로 커밋하면 그 사이의
+        # 크래시가 예약은 풀고 지출은 잃어 예산이 영구히 과소 계상된다 — 그 오차는
+        # 아무 데도 안 남아서 누구도 발견하지 못한다.
+        self._store.settle_job(
             scope, job_id,
-            cost_usd=cost, cost_reserved_usd=0.0,
-            input_tokens=input_tokens, output_tokens=output_tokens,
-        )
-        self._store.record_usage(
-            scope,
-            service_id=service_id, end_user_hash=end_user_hash, job_id=job_id,
-            role=role, model=model, node=node, provider=provider,
-            input_tokens=input_tokens, output_tokens=output_tokens,
-            duration_ms=duration_ms, status=status, cost_usd=cost,
+            job_fields={
+                "cost_usd": cost, "cost_reserved_usd": 0.0,
+                "input_tokens": input_tokens, "output_tokens": output_tokens,
+            },
+            usage_fields={
+                "service_id": service_id, "end_user_hash": end_user_hash,
+                "job_id": job_id, "role": role, "model": model, "node": node,
+                "provider": provider, "input_tokens": input_tokens,
+                "output_tokens": output_tokens, "duration_ms": duration_ms,
+                "status": status, "cost_usd": cost,
+            },
         )
         return cost
 

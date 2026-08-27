@@ -947,6 +947,42 @@ async def tenant_jobs(request: Request) -> Response:
     ]})
 
 
+async def tenant_job_review(request: Request) -> Response:
+    """`needs_review` 잡을 사람이 종결시킨다.
+
+    크래시 복구는 과금 노드에서 돌던 잡을 자동 재큐하지 않고 `needs_review` 로
+    남긴다 — 이중 실행을 **막지는 못하고 드러내기만** 하기 때문이다(B7).
+    그런데 드러내 놓고 **치울 방법을 안 주면** 그 잡들은 영원히 쌓이고, 관제
+    화면의 그 숫자는 아무도 안 보는 숫자가 된다.
+
+    판정은 사람이 한다. 이중 청구가 실제로 났는지는 프로바이더 청구서를 봐야
+    알 수 있고, 그건 이 시스템이 모르는 정보다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    job_id = request.path_params["job_id"]
+    body = await _body(request)
+    verdict = str(body.get("verdict") or "").strip()
+    if verdict not in ("ok", "failed"):
+        raise ApiError("invalid_field", status=400, params={"field": "verdict"})
+
+    if not ctx.store.update_job(
+        scope, job_id, expect_status="needs_review",
+        status=verdict, error_code=None if verdict == "ok" else "double_execution_confirmed",
+        finished_at=ctx.now(),
+    ):
+        job = ctx.store.get_job(scope, job_id)
+        if job is None:
+            raise ApiError("job_not_found", status=404)
+        # 검토 대상이 아닌 잡을 종결시키려 한 것이다.
+        raise ApiError("invalid_field", status=409, params={"field": "status"})
+
+    ctx.store.audit(
+        principal.token_id, "resolve_needs_review", tenant_id=scope.tenant_id,
+        target=job_id, detail={"verdict": verdict},
+    )
+    return _ok(request, {"job_id": job_id, "status": verdict})
+
+
 async def tenant_job_raw(request: Request) -> Response:
     """원문 단건 복호화.
 
@@ -1404,6 +1440,8 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["GET", "PUT", "DELETE"], name="tenant_overrides"),
         Route(f"{v}/admin/jobs", tenant_jobs, name="tenant_jobs"),
         Route(f"{v}/admin/jobs/{{job_id}}/raw", tenant_job_raw, name="tenant_job_raw"),
+        Route(f"{v}/admin/jobs/{{job_id}}/review", tenant_job_review,
+              methods=["POST"], name="tenant_job_review"),
         Route(f"{v}/admin/usage", tenant_usage, name="tenant_usage"),
         Route(f"{v}/admin/audit", tenant_audit, name="tenant_audit"),
         Route(f"{v}/admin/export", tenant_export, name="tenant_export"),

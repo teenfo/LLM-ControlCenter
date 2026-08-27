@@ -30,7 +30,7 @@ from .guard import Guard, GuardResult
 from .i18n import ApiError, guard_pack_for
 from .identity import hash_end_user, hash_prompt, hash_system, looks_like_pii
 from .roles import RoleResolver, resolver_for
-from .store import SqliteStore, TenantScope
+from .store import TERMINAL_STATUSES, SqliteStore, TenantScope
 
 DEFAULT_WAIT_SECONDS = 30.0
 MAX_WAIT_SECONDS = 300.0
@@ -48,7 +48,9 @@ GUARD_ROLE = "_guard_classify"
 #: 쓰는 역할이며, 토큰의 `allow_roles` 에 `*` 가 있어도 노출되지 않는다.
 INTERNAL_ROLE_PREFIX = "_"
 
-_TERMINAL = frozenset({"ok", "failed", "blocked", "cancelled", "needs_review"})
+#: 종결 상태. **스토어와 같은 정의를 쓴다** — 두 벌로 두면 갈리고, 실제로
+#: 보존 정리 쪽 목록에서 `needs_review` 가 빠져 그 잡들이 영원히 쌓였다.
+_TERMINAL = TERMINAL_STATUSES
 
 #: 2단 분류의 시도·실패를 세기 위한 예약 규칙 id. 실제 규칙이 아니라 계수기다.
 #: 밑줄로 시작하므로 테넌트가 같은 id 의 규칙을 만들어도 겹치지 않는다.
@@ -481,10 +483,22 @@ class Pipeline:
         if job.status in _TERMINAL:
             return self._to_submission(scope, job)
 
-        self._store.update_job(
-            scope, job_id, status="cancelled", error_code="cancelled",
-            finished_at=self._now(),
-        )
+        # **검사와 갱신을 한 문장으로.** 위의 상태 확인과 이 UPDATE 사이에
+        # 스케줄러가 같은 잡을 디스패치할 수 있다 — 문서가 지원한다는 다중
+        # 프로세스 구성에서는 그 창이 실제로 열린다. 그러면 소비자는 "취소됨" 을
+        # 응답받고 그 잡은 실행되어 과금까지 간다.
+        if not self._store.update_job(
+            scope, job_id, expect_status=("queued", "pending"),
+            status="cancelled", error_code="cancelled", finished_at=self._now(),
+        ):
+            # 그 사이에 상태가 바뀌었다. 지금 상태를 그대로 돌려준다 —
+            # 취소했다고 답하는 것이 거짓말이 되는 경우다.
+            current = self._store.get_job(scope, job_id)
+            if current is None:
+                raise ApiError("job_not_found", status=404)
+            if current.status == "running":
+                raise ApiError("job_running", status=409)
+            return self._to_submission(scope, current)
         self._accountant.release_reservation(scope, job_id)
         self._store.audit(
             actor, "cancel_job", tenant_id=scope.tenant_id, target=job_id

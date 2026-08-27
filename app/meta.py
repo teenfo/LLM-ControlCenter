@@ -114,6 +114,11 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "tenant_overrides": ("역할 오버라이드 조회·설정·해제.", "tenant_admin", False),
     "tenant_jobs": ("자기 테넌트의 작업 목록. 마스킹본만 보인다.", "tenant_admin", False),
     "tenant_job_raw": ("원문 단건 복호화. **열람 자체가 감사에 남는다.**", "tenant_admin", False),
+    "tenant_job_review": (
+        "크래시 복구가 남긴 `needs_review` 잡을 사람이 종결시킨다. "
+        "드러내 놓고 치울 방법이 없으면 그 숫자는 아무도 안 보는 숫자가 된다.",
+        "tenant_admin", False,
+    ),
     "tenant_usage": ("사용량 집계 — 서비스·엔드유저·역할·노드 축.", "tenant_admin", False),
     "tenant_audit": ("자기 테넌트의 감사 로그.", "tenant_admin", False),
     "tenant_export": ("내보내기 — 작업·사용량·감사·설정(마스킹본 기준).", "tenant_admin", False),

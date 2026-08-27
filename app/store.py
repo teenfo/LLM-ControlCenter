@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
@@ -23,6 +24,16 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 SCHEMA_VERSION = 1
+
+#: 한 문장에 넣을 파라미터 상한. SQLite 의 실제 상한은 빌드에 따라 999~32766 인데,
+#: 넘으면 `too many SQL variables` 로 **문장 전체가** 실패한다. 보수적으로 잡는다 —
+#: 쪼개는 비용은 무시할 만하고, 넘쳐서 실패하는 쪽은 파기가 안 되는 사고다.
+SQL_VARIABLE_LIMIT = 500
+
+
+def _chunks(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 #: 잡 상태.
 #:   needs_review 는 크래시 복구 전용이다 — 과금 노드에서 돌던 잡을 자동 재큐하면
@@ -38,7 +49,20 @@ JOB_STATUSES = (
     "needs_review",   # 크래시 복구 — 이중 실행 가능성
 )
 
-TERMINAL_STATUSES = frozenset({"ok", "failed", "cancelled", "blocked"})
+TERMINAL_STATUSES = frozenset({"ok", "failed", "cancelled", "blocked", "needs_review"})
+
+#: 보존 정리가 지우는 상태. `TERMINAL_STATUSES` 에서 파생시켜 **목록을 두 벌 두지
+#: 않는다** — 하드코딩된 목록에 `needs_review` 가 빠져 그 잡들이 영원히 쌓이고 있었다.
+RETAINABLE_STATUSES = TERMINAL_STATUSES
+
+#: 같은 관리자의 같은 **읽기 전용** 조회를 이 안에서는 한 줄로 합친다.
+#: 관제 대시보드 폴링이 감사 테이블을 무한 증식시키던 것을 막는다.
+AUDIT_COALESCE_SECONDS = 300.0
+
+#: 감사 보존. 잡보다 길게 둔다(규제 대응) — 다만 상한은 있어야 한다.
+AUDIT_RETENTION_DAYS = 365
+#: 평가 이력 보존. 규칙 승격 판단의 근거이므로 잡보다 길다.
+EVAL_RUN_RETENTION_DAYS = 180
 
 
 def _json(obj: Any) -> str:
@@ -240,6 +264,12 @@ CREATE TABLE IF NOT EXISTS filter_events (
 );
 CREATE INDEX IF NOT EXISTS idx_filter_tenant_ts ON filter_events(tenant_id, ts);
 CREATE INDEX IF NOT EXISTS idx_filter_review ON filter_events(tenant_id, action, reviewed);
+-- 엔드유저 파기가 이 컬럼으로 UPDATE 한다. 없으면 풀스캔이고, 잡이 많은
+-- 엔드유저일수록 — 즉 파기가 가장 중요한 경우일수록 — 느려진다.
+CREATE INDEX IF NOT EXISTS idx_filter_job ON filter_events(job_id);
+-- `/metrics` 가 스크레이프마다 전역 집계를 한다. `idx_filter_review` 는 tenant_id
+-- 선두라 전역 집계에 못 쓰여 매번 풀스캔이었다.
+CREATE INDEX IF NOT EXISTS idx_filter_global ON filter_events(action, stage, reviewed);
 
 -- 노드는 공유 인프라라 테넌트 스코프가 아니다.
 CREATE TABLE IF NOT EXISTS node_health (
@@ -514,6 +544,26 @@ class SqliteStore:
 
     # -- 스코프 초크포인트 ----------------------------------------------------
 
+    @contextlib.contextmanager
+    def _tx(self):
+        """여러 문장을 한 트랜잭션으로 묶는다. **실패하면 되돌린다.**
+
+        이 저장소에는 `rollback` 이 한 곳도 없었다. 다중 문장 메서드가 중간에
+        실패하면 앞선 쓰기가 **열린 트랜잭션에 남았다가 다음 무관한 commit 에
+        섞여** 영속화된다 — 파기 요청이 절반만 처리되고 그 사실이 감사에도
+        안 남는다는 뜻이다.
+
+        `sqlite3` 의 컨텍스트 매니저를 쓰지 않는 이유: 그것은 커넥션 자체를
+        컨텍스트로 쓰기 때문에 중첩이 어렵고, 여기서는 명시적으로 커밋 지점을
+        드러내는 편이 읽기 쉽다.
+        """
+        try:
+            yield
+        except Exception:
+            self._conn.rollback()
+            raise
+        self._conn.commit()
+
     @staticmethod
     def _scoped_where(scope: TenantScope, extra: str = "") -> tuple[str, list[Any]]:
         """테넌트 조건을 붙이는 **유일한** 지점.
@@ -753,8 +803,22 @@ class SqliteStore:
         )
         return [_row_to_job(r) for r in rows]
 
-    def update_job(self, scope: TenantScope, job_id: str, **fields: Any) -> bool:
-        """잡을 갱신한다. `tenant_id` 는 절대 바꿀 수 없다 — 그것이 격리 그 자체다."""
+    def update_job(
+        self,
+        scope: TenantScope,
+        job_id: str,
+        *,
+        expect_status: str | Sequence[str] | None = None,
+        **fields: Any,
+    ) -> bool:
+        """잡을 갱신한다. `tenant_id` 는 절대 바꿀 수 없다 — 그것이 격리 그 자체다.
+
+        `expect_status` 를 주면 **그 상태일 때만** 갱신한다(compare-and-set).
+        문서가 지원한다는 다중 프로세스 구성(워커 N + 스케줄러 싱글턴)에서는
+        API 워커의 취소와 스케줄러의 디스패치가 같은 잡을 두고 경합한다. 검사와
+        갱신이 분리돼 있으면 **"취소됨" 을 응답받은 잡이 실행되고 과금까지 간다.**
+        조건을 UPDATE 문 안에 넣으면 그 창이 없어진다.
+        """
         if "tenant_id" in fields:
             raise ScopeViolation("잡의 tenant_id 는 변경할 수 없다")
 
@@ -762,14 +826,48 @@ class SqliteStore:
         if not mapped:
             return False
 
+        extra = "id = ?"
         assignments = ", ".join(f"{k} = ?" for k in mapped)
-        where, params = self._scoped_where(scope, "id = ?")
+        expected: list[Any] = []
+        if expect_status is not None:
+            expected = [expect_status] if isinstance(expect_status, str) else list(expect_status)
+            extra += f" AND status IN ({','.join('?' * len(expected))})"
+
+        where, params = self._scoped_where(scope, extra)
         params.append(job_id)
+        params.extend(expected)
         cur = self._conn.execute(
             f"UPDATE jobs SET {assignments} WHERE {where}", [*mapped.values(), *params]
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def settle_job(
+        self,
+        scope: TenantScope,
+        job_id: str,
+        *,
+        job_fields: Mapping[str, Any],
+        usage_fields: Mapping[str, Any],
+    ) -> None:
+        """정산을 **한 트랜잭션으로** 끝낸다.
+
+        예약 해제(`jobs`)와 지출 기록(`usage`)이 별도 커밋이면 그 사이의 크래시가
+        예약은 풀고 지출은 잃는다 — **예산이 영구히 과소 계상되고**, 그 오차는
+        아무 데도 안 남아서 누구도 발견하지 못한다. 예약을 둔 이유 자체가
+        "완료 후에야 드러나는 초과" 를 막는 것인데 여기서 되살아난다.
+        """
+        mapped = _map_job_fields(dict(job_fields))
+        with self._tx():
+            if mapped:
+                assignments = ", ".join(f"{k} = ?" for k in mapped)
+                where, params = self._scoped_where(scope, "id = ?")
+                params.append(job_id)
+                self._conn.execute(
+                    f"UPDATE jobs SET {assignments} WHERE {where}",
+                    [*mapped.values(), *params],
+                )
+            self._insert_usage(scope, dict(usage_fields))
 
     def claim_queued(
         self, lane: str, *, limit: int
@@ -812,28 +910,34 @@ class SqliteStore:
         metered = set(metered_nodes)
         requeued = reviewed = 0
 
-        for row in list(self._conn.execute("SELECT id, node FROM jobs WHERE status='running'")):
-            if row["node"] in metered:
-                self._conn.execute(
-                    "UPDATE jobs SET status='needs_review', error_code='possible_double_execution', "
-                    "wait_reason='crash_recovery_metered', finished_at=? WHERE id=?",
-                    (self._now(), row["id"]),
-                )
-                reviewed += 1
-            else:
-                self._conn.execute(
-                    "UPDATE jobs SET status='queued', attempts=attempts+1, "
-                    "last_failed_node=node, node=NULL, started_at=NULL WHERE id=?",
-                    (row["id"],),
-                )
-                requeued += 1
+        rows = list(self._conn.execute("SELECT id, node FROM jobs WHERE status='running'"))
 
-        self._conn.commit()
+        # **한 트랜잭션이다.** 절반만 복구된 상태로 기동하면 나머지는 `running` 인
+        # 채 남아 영원히 아무도 안 건드린다 — 크래시 복구가 그 자체로 사고가 된다.
+        with self._tx():
+            for row in rows:
+                if row["node"] in metered:
+                    self._conn.execute(
+                        "UPDATE jobs SET status='needs_review', "
+                        "error_code='possible_double_execution', "
+                        "wait_reason='crash_recovery_metered', finished_at=? WHERE id=?",
+                        (self._now(), row["id"]),
+                    )
+                    reviewed += 1
+                else:
+                    self._conn.execute(
+                        "UPDATE jobs SET status='queued', attempts=attempts+1, "
+                        "last_failed_node=node, node=NULL, started_at=NULL WHERE id=?",
+                        (row["id"],),
+                    )
+                    requeued += 1
+
         return {"requeued": requeued, "needs_review": reviewed}
 
     # -- 사용량·가드 이벤트 ---------------------------------------------------
 
-    def record_usage(self, scope: TenantScope, **fields: Any) -> None:
+    def _insert_usage(self, scope: TenantScope, fields: Mapping[str, Any]) -> None:
+        """커밋하지 않는다 — 호출자의 트랜잭션 안에서 쓰인다."""
         self._scoped_where(scope)
         self._conn.execute(
             "INSERT INTO usage(ts, tenant_id, service_id, end_user_hash, job_id, role, model, "
@@ -856,7 +960,10 @@ class SqliteStore:
                 float(fields.get("cost_usd", 0.0)),
             ),
         )
-        self._conn.commit()
+
+    def record_usage(self, scope: TenantScope, **fields: Any) -> None:
+        with self._tx():
+            self._insert_usage(scope, fields)
 
     def spend_since(self, scope: TenantScope, since: float, *, service_id: str | None = None) -> float:
         """기간 내 누적 비용. 예산 확인의 근거."""
@@ -1520,15 +1627,49 @@ class SqliteStore:
     def audit(
         self, actor: str, action: str, *, tenant_id: str | None = None,
         target: str | None = None, detail: Mapping[str, Any] | None = None,
-        outcome: str = "ok",
+        outcome: str = "ok", coalesce_seconds: float = 0.0,
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO admin_audit(ts, tenant_id, actor, action, target, detail_json, outcome) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (self._now(), tenant_id, actor, action, target,
-             _json(dict(detail or {})), outcome),
-        )
-        self._conn.commit()
+        """감사 한 줄.
+
+        `coalesce_seconds` 는 **읽기 전용 조회에만** 쓴다. 관제 대시보드가
+        폴링하면 같은 관리자의 같은 조회가 초 단위로 반복되는데, 그것을 한 줄씩
+        남기면 감사 테이블이 대시보드를 열어 둔 시간에 비례해 자란다 —
+        그리고 그 안에서 **진짜 봐야 할 한 줄을 찾을 수 없게 된다.**
+
+        경계를 넘은 사실 자체는 지운 적이 없다. 같은 사람이 같은 조회를 N 번 한
+        것을 한 줄 + 횟수로 적을 뿐이다. **변경은 절대 합치지 않는다** — 파기
+        두 번과 파기 한 번은 다른 사건이다.
+        """
+        now = self._now()
+        if coalesce_seconds > 0:
+            recent = self._conn.execute(
+                "SELECT id, detail_json FROM admin_audit "
+                "WHERE actor = ? AND action = ? AND ts >= ? "
+                "AND tenant_id IS ? AND target IS ? "
+                "ORDER BY ts DESC LIMIT 1",
+                (actor, action, now - coalesce_seconds, tenant_id, target),
+            ).fetchone()
+            if recent is not None:
+                merged = dict(detail or {})
+                try:
+                    previous = json.loads(recent["detail_json"] or "{}")
+                except ValueError:
+                    previous = {}
+                merged["repeats"] = int(previous.get("repeats", 1)) + 1
+                with self._tx():
+                    self._conn.execute(
+                        "UPDATE admin_audit SET ts = ?, detail_json = ? WHERE id = ?",
+                        (now, _json(merged), recent["id"]),
+                    )
+                return
+
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO admin_audit(ts, tenant_id, actor, action, target, "
+                "detail_json, outcome) VALUES(?,?,?,?,?,?,?)",
+                (now, tenant_id, actor, action, target,
+                 _json(dict(detail or {})), outcome),
+            )
 
     def list_audit(self, scope: TenantScope, *, limit: int = 100) -> list[sqlite3.Row]:
         where, params = self._scoped_where(scope)
@@ -1553,6 +1694,7 @@ class SqliteStore:
         self.audit(
             scope.actor, "usage_across_tenants",
             detail={"reason": scope.reason, "since": since},
+            coalesce_seconds=AUDIT_COALESCE_SECONDS,
         )
         return list(
             self._conn.execute(
@@ -1567,7 +1709,10 @@ class SqliteStore:
     def list_tenants(self, scope: PlatformScope) -> list[sqlite3.Row]:
         if not isinstance(scope, PlatformScope):
             raise ScopeViolation("테넌트 목록은 PlatformScope 를 요구한다")
-        self.audit(scope.actor, "list_tenants", detail={"reason": scope.reason})
+        self.audit(
+            scope.actor, "list_tenants", detail={"reason": scope.reason},
+            coalesce_seconds=AUDIT_COALESCE_SECONDS,
+        )
         return list(
             self._conn.execute(
                 # 호출부가 읽는 컬럼을 전부 담는다. 빠뜨리면 sqlite3.Row 키 오류로
@@ -1773,34 +1918,56 @@ class SqliteStore:
             by_days.setdefault(days, []).append(row["id"])
 
         cipher = 0
-        for days, tenant_ids in by_days.items():
-            placeholders = ",".join("?" * len(tenant_ids))
+        with self._tx():
+            for days, tenant_ids in by_days.items():
+                for chunk in _chunks(tenant_ids, SQL_VARIABLE_LIMIT):
+                    placeholders = ",".join("?" * len(chunk))
+                    cipher += self._conn.execute(
+                        "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
+                        f"WHERE prompt_cipher IS NOT NULL AND tenant_id IN ({placeholders}) "
+                        "AND created_at < ?",
+                        (*chunk, now - days * 86400),
+                    ).rowcount
+
+            # 테넌트 행이 이미 지워진 고아 암호문은 플랫폼 상한으로 정리한다.
             cipher += self._conn.execute(
                 "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
-                f"WHERE prompt_cipher IS NOT NULL AND tenant_id IN ({placeholders}) "
-                "AND created_at < ?",
-                (*tenant_ids, now - days * 86400),
+                "WHERE prompt_cipher IS NOT NULL AND created_at < ? "
+                "AND tenant_id NOT IN (SELECT id FROM tenants)",
+                (now - raw_prompt_retention_days * 86400,),
             ).rowcount
 
-        # 테넌트 행이 이미 지워진 고아 암호문은 플랫폼 상한으로 정리한다.
-        cipher += self._conn.execute(
-            "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
-            "WHERE prompt_cipher IS NOT NULL AND created_at < ? "
-            "AND tenant_id NOT IN (SELECT id FROM tenants)",
-            (now - raw_prompt_retention_days * 86400,),
-        ).rowcount
-        jobs = self._conn.execute(
-            "DELETE FROM jobs WHERE status IN "
-            "('ok','failed','cancelled','blocked') AND finished_at IS NOT NULL AND finished_at < ?",
-            (job_cutoff,),
-        ).rowcount
-        usage = self._conn.execute("DELETE FROM usage WHERE ts < ?", (job_cutoff,)).rowcount
-        events = self._conn.execute(
-            "DELETE FROM filter_events WHERE ts < ?", (job_cutoff,)
-        ).rowcount
+            # **상태 목록을 손으로 적지 않는다.** `needs_review` 가 이 목록에
+            # 없어서 그 잡들이 영원히 안 지워지고 있었다 — 새 종결 상태를
+            # 추가할 때마다 여기를 함께 고쳐야 한다는 것은 규율이고, 규율은 깨진다.
+            statuses = sorted(RETAINABLE_STATUSES)
+            placeholders = ",".join("?" * len(statuses))
+            jobs = self._conn.execute(
+                f"DELETE FROM jobs WHERE status IN ({placeholders}) "
+                "AND finished_at IS NOT NULL AND finished_at < ?",
+                (*statuses, job_cutoff),
+            ).rowcount
+            usage = self._conn.execute("DELETE FROM usage WHERE ts < ?", (job_cutoff,)).rowcount
+            events = self._conn.execute(
+                "DELETE FROM filter_events WHERE ts < ?", (job_cutoff,)
+            ).rowcount
 
-        self._conn.commit()
-        return {"prompt_cipher": cipher, "jobs": jobs, "usage": usage, "filter_events": events}
+            # **감사와 평가 이력도 자란다.** 플랫폼 개요 화면이 호출마다 감사를
+            # 남기므로 대시보드를 열어 두기만 해도 무한 증식한다. 감사는 잡보다
+            # 오래 보관하되(규제 대응) 상한은 있어야 한다.
+            audits = self._conn.execute(
+                "DELETE FROM admin_audit WHERE ts < ?",
+                (now - AUDIT_RETENTION_DAYS * 86400,),
+            ).rowcount
+            evals = self._conn.execute(
+                "DELETE FROM eval_runs WHERE ts < ?",
+                (now - EVAL_RUN_RETENTION_DAYS * 86400,),
+            ).rowcount
+
+        return {
+            "prompt_cipher": cipher, "jobs": jobs, "usage": usage,
+            "filter_events": events, "admin_audit": audits, "eval_runs": evals,
+        }
 
     # -- 파기 (C6) ------------------------------------------------------------
 
@@ -1823,19 +1990,25 @@ class SqliteStore:
             row["id"] for row in self._conn.execute(f"SELECT id FROM jobs WHERE {where}", params)
         ]
 
-        jobs = self._conn.execute(f"DELETE FROM jobs WHERE {where}", params).rowcount
-        usage = self._conn.execute(f"DELETE FROM usage WHERE {where}", params).rowcount
+        # **한 트랜잭션이다.** 중간에 실패해 절반만 지워지면 그것은 파기가 아니고,
+        # 요청자에게는 파기됐다고 답한 뒤다.
+        with self._tx():
+            jobs = self._conn.execute(f"DELETE FROM jobs WHERE {where}", params).rowcount
+            usage = self._conn.execute(f"DELETE FROM usage WHERE {where}", params).rowcount
 
-        # 이벤트 자체는 남기되 job_id 는 끊는다. 지워진 잡을 가리키는 식별자가 남으면
-        # 그 사람의 요청 하나하나를 다시 묶어 셀 수 있고, 그건 파기가 아니다.
-        events = 0
-        if job_ids:
-            placeholders = ",".join("?" * len(job_ids))
-            events = self._conn.execute(
-                f"UPDATE filter_events SET job_id = NULL WHERE job_id IN ({placeholders})",
-                job_ids,
-            ).rowcount
-        self._conn.commit()
+            # 이벤트 자체는 남기되 job_id 는 끊는다. 지워진 잡을 가리키는 식별자가 남으면
+            # 그 사람의 요청 하나하나를 다시 묶어 셀 수 있고, 그건 파기가 아니다.
+            #
+            # **IN 절을 쪼갠다.** SQLite 의 파라미터 상한(빌드에 따라 999~32766)을
+            # 넘으면 `too many SQL variables` 로 통째로 실패한다 — 잡이 많은
+            # 엔드유저일수록, 즉 파기가 가장 중요한 경우일수록 실패한다.
+            events = 0
+            for chunk in _chunks(job_ids, SQL_VARIABLE_LIMIT):
+                placeholders = ",".join("?" * len(chunk))
+                events += self._conn.execute(
+                    f"UPDATE filter_events SET job_id = NULL WHERE job_id IN ({placeholders})",
+                    chunk,
+                ).rowcount
 
         # 무엇을 지웠는지가 아니라 **언제·누가·얼마나** 지웠는지만 남긴다.
         # 감사가 새 유출 경로가 되면 나머지 노력이 무의미해진다.
@@ -1856,19 +2029,21 @@ class SqliteStore:
             raise ScopeViolation("테넌트 파기는 PlatformScope 를 요구한다")
 
         counts: dict[str, int] = {}
-        for table in (
-            "jobs", "usage", "filter_events", "role_overrides", "tenant_guard_rules",
-            "tenant_settings", "eval_fixtures", "tokens", "services",
-        ):
-            counts[table] = self._conn.execute(
-                f"DELETE FROM {table} WHERE tenant_id = ?", (tenant_id,)
-            ).rowcount
+        # **한 트랜잭션이다.** 테이블 아홉 개를 지우다 중간에 실패하면 절반만
+        # 파기된 테넌트가 남고, DEK 는 아직 살아 있어 crypto-shredding 도 안 된다.
+        with self._tx():
+            for table in (
+                "jobs", "usage", "filter_events", "role_overrides", "tenant_guard_rules",
+                "tenant_settings", "eval_fixtures", "tokens", "services",
+            ):
+                counts[table] = self._conn.execute(
+                    f"DELETE FROM {table} WHERE tenant_id = ?", (tenant_id,)
+                ).rowcount
 
-        self._conn.execute(
-            "UPDATE tenants SET status='purged', dek_wrapped=NULL, purged_at=? WHERE id=?",
-            (self._now(), tenant_id),
-        )
-        self._conn.commit()
+            self._conn.execute(
+                "UPDATE tenants SET status='purged', dek_wrapped=NULL, purged_at=? WHERE id=?",
+                (self._now(), tenant_id),
+            )
 
         self.audit(
             scope.actor, "purge_tenant", tenant_id=tenant_id,

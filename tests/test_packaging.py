@@ -962,3 +962,83 @@ def test_a_failed_bundle_copy_is_reported(tmp_path):
 
     assert proc.returncode != 0, "번들을 못 가져왔는데 0 으로 끝났다"
     assert "가져오지 못했습니다" in proc.stderr
+
+
+# ── 감사 M14 — 백업이 자기 계약을 안 지킨다 ─────────────────────────────────
+#
+# 모듈 독스트링이 "테이블이 있고 **행 수가 말이 되는지** 확인하고, 아니면 0 이 아닌
+# 코드로 끝낸다" 고 적어 놓고 테이블 존재만 봤다. 빈 스냅샷도 성공으로 나가면
+# `cp` 로 뜨던 시절과 같은 실패 — **백업이 있다고 믿는 것** — 이 그대로 돌아온다.
+
+
+class _EmptyingSource:
+    """스키마는 옮기고 행은 안 옮기는 원본. `cp` 로 뜬 빈 백업을 재현한다.
+
+    `sqlite3.Connection` 은 불변 타입이라 메서드를 갈아끼울 수 없어서 감싼다.
+    """
+
+    def __init__(self, conn, table: str = "tenants") -> None:
+        self._conn = conn
+        self._table = table
+
+    def backup(self, target, **kwargs):
+        self._conn.backup(target, **kwargs)
+        target.execute(f"DELETE FROM {self._table}")
+        target.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _snapshot_from_an_empty_backup(monkeypatch, source, target):
+    """원본 커넥션만 감싸서 `snapshot()` 을 그대로 돌린다."""
+    from app import backup as backup_module
+
+    real_connect = backup_module.sqlite3.connect
+
+    def connect(dsn, *args, **kwargs):
+        conn = real_connect(dsn, *args, **kwargs)
+        return _EmptyingSource(conn) if "mode=ro" in str(dsn) else conn
+
+    monkeypatch.setattr(backup_module.sqlite3, "connect", connect)
+    return backup_module.snapshot(source, target)
+
+
+def test_an_empty_snapshot_of_a_populated_database_is_refused(tmp_path, monkeypatch):
+    """행 수가 원본보다 적으면 그 백업은 쓸 수 없다."""
+    source = tmp_path / "src.db"
+    store = SqliteStore(source)
+    store.create_tenant("acme", "Acme", end_user_salt=b"s" * 16)
+    store.close()
+
+    with pytest.raises(RuntimeError, match="테넌트"):
+        _snapshot_from_an_empty_backup(monkeypatch, source, tmp_path / "out.db")
+
+
+def test_a_rejected_snapshot_is_not_left_on_disk(tmp_path, monkeypatch):
+    """남기면 누군가 그것으로 복원한다."""
+    source = tmp_path / "src.db"
+    store = SqliteStore(source)
+    store.create_tenant("acme", "Acme", end_user_salt=b"s" * 16)
+    store.close()
+
+    target = tmp_path / "out.db"
+    with pytest.raises(RuntimeError):
+        _snapshot_from_an_empty_backup(monkeypatch, source, target)
+
+    assert not target.exists(), "검증에 실패한 스냅샷이 디스크에 남았다"
+
+
+def test_the_ciphertext_is_gone_even_when_verification_fails(tmp_path, vault_with_key):
+    """검증 뒤에 지우면, 실패했을 때 원문 암호문이 든 파일이 그대로 남는다.
+
+    백업에서 빼기로 한 바로 그것이 **실패 경로에서만** 디스크에 남는 셈이다.
+    """
+    import inspect
+
+    from app import backup as backup_module
+
+    body = inspect.getsource(backup_module.snapshot)
+    strip = body.index("prompt_cipher = NULL")
+    verify = body.index("백업의 테넌트가 원본보다")
+    assert strip < verify, "암호문 제거가 검증보다 뒤에 있다"

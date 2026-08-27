@@ -956,3 +956,121 @@ def test_a_backfill_is_audited(harness, client, acme):
         for row in harness.store.list_audit(TenantScope("acme"), limit=50)
     ]
     assert "adopt_tenant_dek" in actions
+
+
+# ── 감사 M11·M13 — 경합과 해소 경로 ─────────────────────────────────────────
+
+
+def test_a_cancelled_job_is_never_dispatched(harness, client, acme):
+    """**"취소됨" 을 응답받은 잡이 실행되고 과금까지 가면 안 된다.**
+
+    문서가 지원한다는 다중 프로세스 구성에서는 API 워커의 취소와 스케줄러의
+    디스패치가 같은 잡을 두고 경합한다.
+    """
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="queued")
+
+    client.delete(f"/v1/jobs/{job_id}", headers=auth(acme["service"]))
+    assert harness.store.get_job(scope, job_id).status == "cancelled"
+
+    # 스케줄러가 뒤늦게 이 잡을 디스패치하려 한다.
+    assert harness.store.update_job(
+        scope, job_id, expect_status="queued", status="running"
+    ) is False
+    assert harness.store.get_job(scope, job_id).status == "cancelled"
+
+
+def test_cancelling_a_running_job_is_refused_not_lied_about(harness, client, acme):
+    """노드에도 클라우드에도 취소 의미론이 없다 — "취소했다" 는 거짓말이 된다."""
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="running")
+
+    response = client.delete(f"/v1/jobs/{job_id}", headers=auth(acme["service"]))
+    assert response.status_code == 409
+
+
+def test_a_needs_review_job_can_be_resolved(harness, client, acme):
+    """**드러내 놓고 치울 방법을 안 주면 그 숫자는 아무도 안 보는 숫자가 된다.**"""
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="needs_review")
+
+    response = client.post(
+        f"/v1/admin/jobs/{job_id}/review", json={"verdict": "ok"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 200
+    assert harness.store.get_job(scope, job_id).status == "ok"
+
+
+def test_resolving_a_job_that_is_not_under_review_is_refused(harness, client, acme):
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="queued")
+
+    response = client.post(
+        f"/v1/admin/jobs/{job_id}/review", json={"verdict": "ok"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 409
+
+
+def test_resolving_needs_a_verdict(harness, client, acme):
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="needs_review")
+
+    response = client.post(
+        f"/v1/admin/jobs/{job_id}/review", json={"verdict": "아무거나"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 400
+
+
+def test_a_service_token_cannot_resolve_a_review(harness, client, acme):
+    """판정은 테넌트 관리자의 몫이다 — 소비자가 자기 잡을 종결시키면 안 된다."""
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="needs_review")
+
+    response = client.post(
+        f"/v1/admin/jobs/{job_id}/review", json={"verdict": "ok"},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code == 403
+
+
+def test_one_tenant_cannot_resolve_anothers_review(harness, client, acme, globex):
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="needs_review")
+
+    response = client.post(
+        f"/v1/admin/jobs/{job_id}/review", json={"verdict": "ok"},
+        headers=auth(globex["tenant_admin"]),
+    )
+    assert response.status_code == 404
+    assert harness.store.get_job(scope, job_id).status == "needs_review"

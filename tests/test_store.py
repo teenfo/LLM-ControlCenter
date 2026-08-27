@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import inspect
+import sqlite3
 
 import pytest
 
@@ -477,3 +478,255 @@ def test_unknown_config_keys_are_a_warning_not_a_rejection(tmp_path):
     config = load_config(target)          # 모르는 키로 기동이 멈추지 않는다
     validate_cross_references(config)
     assert "future-node" in config.nodes
+
+
+class _FailingOn:
+    """특정 SQL 에서만 터지는 커넥션 프록시.
+
+    `sqlite3.Connection.execute` 는 인스턴스에 덮어쓸 수 없어서 감싼다.
+    """
+
+    def __init__(self, conn, prefix: str) -> None:
+        self._conn = conn
+        self._prefix = prefix
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.startswith(self._prefix):
+            raise sqlite3.OperationalError("디스크 오류")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+# ── 감사 M9 — 스토어에 rollback 이 한 곳도 없었다 ────────────────────────────
+#
+# 다중 문장 메서드가 중간에 실패하면 앞선 쓰기가 **열린 트랜잭션에 남았다가 다음
+# 무관한 commit 에 섞여** 영속화된다. 파기 요청이 절반만 처리되고 그 사실이 감사에도
+# 안 남는다는 뜻이다.
+
+
+def test_a_failed_purge_leaves_nothing_behind(store, clock):
+    """**절반만 지워진 파기는 파기가 아니다** — 요청자에게는 파기됐다고 답한 뒤다."""
+    scope = TenantScope("acme")
+    for _ in range(3):
+        store.create_job(
+            scope, service_id="acme-web", role="r", lane="interactive",
+            prompt_masked="x", end_user_hash="u1",
+        )
+    store.record_usage(scope, service_id="acme-web", role="r", end_user_hash="u1")
+
+    # usage 삭제에서 터뜨린다 — jobs 는 이미 지워진 뒤다.
+    real = store._conn
+    store._conn = _FailingOn(real, "DELETE FROM usage")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store.purge_end_user(scope, "u1")
+    finally:
+        store._conn = real
+
+    # 되돌아갔어야 한다. 안 되돌리면 다음 commit 이 이 삭제를 영속화한다.
+    assert len(store.list_jobs(scope)) == 3, "실패한 파기가 잡을 지운 채로 남겼다"
+
+
+def test_an_unrelated_commit_does_not_persist_a_failed_write(store):
+    """rollback 이 없으면 **다음 무관한 commit 에 섞여** 조용히 영속화된다."""
+    scope = TenantScope("acme")
+    job_id = store.create_job(
+        scope, service_id="acme-web", role="r", lane="interactive",
+        prompt_masked="x", end_user_hash="u1",
+    )
+
+    real = store._conn
+    store._conn = _FailingOn(real, "DELETE FROM usage")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store.purge_end_user(scope, "u1")
+    finally:
+        store._conn = real
+
+    store.audit("someone", "완전히_무관한_동작")     # 이것이 commit 을 부른다
+    assert store.get_job(scope, job_id) is not None
+
+
+# ── 감사 M10 — IN 절이 SQLite 파라미터 상한을 넘는다 ────────────────────────
+
+
+def test_purging_an_end_user_with_many_jobs_does_not_blow_the_variable_limit(store):
+    """`too many SQL variables` 는 **잡이 많은 엔드유저일수록** 터진다.
+
+    즉 파기가 가장 중요한 경우에 실패한다.
+    """
+    from app.store import SQL_VARIABLE_LIMIT
+
+    scope = TenantScope("acme")
+    count = SQL_VARIABLE_LIMIT * 2 + 7
+    for _ in range(count):
+        job_id = store.create_job(
+            scope, service_id="acme-web", role="r", lane="interactive",
+            prompt_masked="x", end_user_hash="u1",
+        )
+        store.record_filter_event(
+            scope, rule_id="card", stage="pattern", action="audit",
+            match_count=1, offsets=(), job_id=job_id, service_id="acme-web",
+        )
+
+    result = store.purge_end_user(scope, "u1")
+
+    assert result["jobs"] == count
+    assert result["filter_events_unlinked"] == count
+
+
+def test_filter_events_have_an_index_on_job_id():
+    """없으면 파기가 풀스캔이다 — 잡이 많을수록 느려진다."""
+    from app.store import _SCHEMA
+
+    assert "idx_filter_job" in _SCHEMA
+
+
+# ── 감사 M11 — 검사와 갱신 사이에 창이 있다 ─────────────────────────────────
+
+
+def test_update_job_can_require_a_current_status(store):
+    """**"취소됨" 을 응답받은 잡이 실행되고 과금까지 가면 안 된다.**"""
+    scope = TenantScope("acme")
+    job_id = store.create_job(
+        scope, service_id="acme-web", role="r", lane="interactive", prompt_masked="x",
+    )
+    store.update_job(scope, job_id, status="running")
+
+    assert store.update_job(scope, job_id, expect_status="queued", status="cancelled") is False
+    assert store.get_job(scope, job_id).status == "running"
+
+    assert store.update_job(scope, job_id, expect_status="running", status="ok") is True
+    assert store.get_job(scope, job_id).status == "ok"
+
+
+def test_the_expected_status_accepts_a_set(store):
+    scope = TenantScope("acme")
+    job_id = store.create_job(
+        scope, service_id="acme-web", role="r", lane="interactive", prompt_masked="x",
+    )
+    assert store.update_job(
+        scope, job_id, expect_status=("queued", "pending"), status="cancelled"
+    ) is True
+
+
+# ── 감사 M12 — 정산이 두 개의 독립 커밋이었다 ───────────────────────────────
+
+
+def test_settling_writes_the_job_and_the_usage_together(store):
+    """그 사이의 크래시가 **예약은 풀고 지출은 잃어** 예산이 영구히 과소 계상된다.
+
+    그 오차는 아무 데도 안 남아서 누구도 발견하지 못한다.
+    """
+    scope = TenantScope("acme")
+    job_id = store.create_job(
+        scope, service_id="acme-web", role="r", lane="interactive", prompt_masked="x",
+    )
+    store.update_job(scope, job_id, cost_reserved_usd=5.0)
+
+    real = store._conn
+    store._conn = _FailingOn(real, "INSERT INTO usage")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store.settle_job(
+                scope, job_id,
+                job_fields={"cost_usd": 3.0, "cost_reserved_usd": 0.0},
+                usage_fields={"service_id": "acme-web", "role": "r", "cost_usd": 3.0},
+            )
+    finally:
+        store._conn = real
+
+    # 지출을 못 남겼으면 예약도 풀리면 안 된다.
+    assert store.get_job(scope, job_id).cost_reserved_usd == 5.0
+
+
+# ── 감사 M13·M15 — 영원히 안 지워지는 것들 ──────────────────────────────────
+
+
+def test_needs_review_jobs_are_eventually_cleaned_up(store, clock):
+    """보존 정리의 상태 목록에 `needs_review` 가 없어 영원히 쌓이고 있었다."""
+    scope = TenantScope("acme")
+    job_id = store.create_job(
+        scope, service_id="acme-web", role="r", lane="interactive", prompt_masked="x",
+    )
+    store.update_job(scope, job_id, status="needs_review", finished_at=clock())
+
+    clock.advance(31 * 86400)
+    store.purge_expired(job_retention_days=30)
+
+    assert store.get_job(scope, job_id) is None
+
+
+def test_the_retention_list_is_derived_not_hand_written():
+    """**손으로 적은 목록은 어긋난다** — 실제로 어긋나서 이 결함이 났다."""
+    from app.store import RETAINABLE_STATUSES, TERMINAL_STATUSES
+
+    assert RETAINABLE_STATUSES is TERMINAL_STATUSES
+
+
+def test_the_pipeline_and_the_store_agree_on_terminal():
+    """두 벌로 두면 갈린다."""
+    from app.pipeline import _TERMINAL
+    from app.store import TERMINAL_STATUSES
+
+    assert _TERMINAL is TERMINAL_STATUSES
+
+
+def test_audit_and_eval_runs_are_cleaned_up_too(store, clock):
+    """감사와 평가 이력은 어떤 보존 정리에도 없었다."""
+    from app.store import AUDIT_RETENTION_DAYS, EVAL_RUN_RETENTION_DAYS
+
+    store.audit("someone", "오래된_동작")
+    store.record_eval_run("rule", "card", passed=1, total=1)
+
+    clock.advance((max(AUDIT_RETENTION_DAYS, EVAL_RUN_RETENTION_DAYS) + 1) * 86400)
+    result = store.purge_expired()
+
+    assert result["admin_audit"] >= 1
+    assert result["eval_runs"] >= 1
+
+
+def test_a_polling_dashboard_does_not_grow_the_audit_table(store, clock):
+    """**대시보드를 열어 둔 시간에 비례해 감사가 자라면 진짜 한 줄을 못 찾는다.**"""
+    from app.store import PlatformScope
+
+    scope = PlatformScope(actor="platform_admin", reason="관제")
+    for _ in range(50):
+        store.list_tenants(scope)
+        clock.advance(5)
+
+    rows = [r for r in store._conn.execute(
+        "SELECT detail_json FROM admin_audit WHERE action='list_tenants'"
+    )]
+    assert len(rows) < 5, f"폴링 50회가 감사 {len(rows)}줄을 남겼다"
+
+
+def test_coalescing_keeps_the_count_not_just_the_last_one(store, clock):
+    """경계를 넘은 사실을 지우는 것이 아니다 — 횟수로 적을 뿐이다."""
+    import json as _json
+
+    from app.store import PlatformScope
+
+    scope = PlatformScope(actor="platform_admin", reason="관제")
+    for _ in range(4):
+        store.list_tenants(scope)
+        clock.advance(1)
+
+    row = store._conn.execute(
+        "SELECT detail_json FROM admin_audit WHERE action='list_tenants' ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    assert _json.loads(row["detail_json"])["repeats"] == 4
+
+
+def test_mutations_are_never_coalesced(store, clock):
+    """**파기 두 번과 파기 한 번은 다른 사건이다.**"""
+    for _ in range(3):
+        store.audit("admin", "purge_end_user", tenant_id="acme")
+        clock.advance(1)
+
+    rows = list(store._conn.execute(
+        "SELECT id FROM admin_audit WHERE action='purge_end_user'"
+    ))
+    assert len(rows) == 3

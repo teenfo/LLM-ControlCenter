@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 #: 이 테이블들이 비어 있으면 스냅샷이 잘못됐다고 본다. 정상 설치라면 최소한
@@ -30,13 +31,10 @@ def snapshot(source: str | Path, target: str | Path) -> dict[str, int]:
     target_path = Path(target)
     target_path.unlink(missing_ok=True)
     target_conn = sqlite3.connect(target_path)
-    try:
-        source_conn.backup(target_conn)   # WAL 을 포함한 일관된 스냅샷
-    finally:
-        source_conn.close()
-
     counts: dict[str, int] = {}
     try:
+        source_conn.backup(target_conn)   # WAL 을 포함한 일관된 스냅샷
+
         names = {
             row[0]
             for row in target_conn.execute(
@@ -47,12 +45,15 @@ def snapshot(source: str | Path, target: str | Path) -> dict[str, int]:
         if missing:
             raise RuntimeError(f"백업에 테이블이 없습니다: {missing}")
 
-        for table in ("tenants", "services", "jobs", "usage", "filter_events"):
-            counts[table] = target_conn.execute(
-                f"SELECT COUNT(*) FROM {table}"
-            ).fetchone()[0]
+        # 검증의 기준은 **원본**이다. 절대값을 못박으면 갓 설치한 시스템이 항상 실패한다.
+        source_counts = {
+            table: source_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tenants", "jobs")
+        }
 
-        # 암호문 제거 — 보관 기간이 백업 앞에서 무의미해지지 않게.
+        # **암호문을 검증보다 먼저 지운다.** 검증 뒤에 지우면, 검증에 실패했을 때
+        # 원문 암호문이 든 파일이 디스크에 남는다 — 백업에서 빼기로 한 바로 그것이
+        # 실패 경로에서만 남는 셈이다.
         counts["prompt_cipher_removed"] = target_conn.execute(
             "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
             "WHERE prompt_cipher IS NOT NULL"
@@ -60,8 +61,41 @@ def snapshot(source: str | Path, target: str | Path) -> dict[str, int]:
         target_conn.commit()
         target_conn.execute("VACUUM")
         target_conn.commit()
+
+        for table in ("tenants", "services", "jobs", "usage", "filter_events"):
+            counts[table] = target_conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+
+        # **행 수가 말이 되는지 실제로 본다.**
+        #
+        # 테이블이 있는지만 보는 것은 이 모듈이 스스로 적은 계약("행 수가 말이
+        # 되는지 확인하고, 아니면 0 이 아닌 코드로 끝낸다")의 절반이다. 빈
+        # 스냅샷도 성공으로 나가면 `cp` 로 뜨던 시절과 같은 실패가 —
+        # **백업이 있다고 믿는 것** — 그대로 돌아온다.
+        #
+        # 기준은 원본이다. 절대값을 못박으면 갓 설치한 시스템이 항상 실패한다.
+        expected = source_counts["tenants"]
+        if expected and counts["tenants"] < expected:
+            raise RuntimeError(
+                f"백업의 테넌트가 원본보다 적습니다 (원본 {expected} → 백업 {counts['tenants']})"
+            )
+        if source_counts["jobs"] and counts["jobs"] < source_counts["jobs"]:
+            raise RuntimeError(
+                f"백업의 작업이 원본보다 적습니다 "
+                f"(원본 {source_counts['jobs']} → 백업 {counts['jobs']})"
+            )
+    except Exception:
+        with suppress(Exception):
+            target_conn.close()
+        # 검증에 실패한 스냅샷은 남기지 않는다. 남기면 누군가 그것으로 복원한다.
+        target_path.unlink(missing_ok=True)
+        raise
     finally:
-        target_conn.close()
+        with suppress(Exception):
+            source_conn.close()
+        with suppress(Exception):
+            target_conn.close()
     return counts
 
 

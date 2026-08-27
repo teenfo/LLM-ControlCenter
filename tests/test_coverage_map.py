@@ -167,6 +167,12 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
             "test_crash_recovery_does_not_requeue_metered_jobs",
             "test_crash_recovery_requeues_free_node_jobs",
             "test_start_recovers_running_jobs",
+            # 드러내 놓고 **치울 방법이 없으면** 그 숫자는 아무도 안 보는 숫자가
+            # 되고, 그 잡들은 보존 정리에도 없어 영원히 쌓인다(감사 M13).
+            "test_a_needs_review_job_can_be_resolved",
+            "test_resolving_a_job_that_is_not_under_review_is_refused",
+            "test_needs_review_jobs_are_eventually_cleaned_up",
+            "test_the_retention_list_is_derived_not_hand_written",
         ),
     ),
     19: (
@@ -373,6 +379,11 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
             "test_a_backup_of_a_live_wal_database_is_not_empty",
             "test_the_backup_script_says_the_key_is_not_included",
             "test_export_carries_the_masked_copy_never_the_ciphertext",
+            # 마스킹돼 있어도 **행 수가 말이 되는지** 안 보면 빈 백업이
+            # 성공으로 나간다 — 백업이 있다고 믿는 것이 가장 나쁘다(감사 M14).
+            "test_an_empty_snapshot_of_a_populated_database_is_refused",
+            "test_a_rejected_snapshot_is_not_left_on_disk",
+            "test_the_ciphertext_is_gone_even_when_verification_fails",
         ),
     ),
     42: (

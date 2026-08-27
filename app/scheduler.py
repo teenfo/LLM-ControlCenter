@@ -271,14 +271,21 @@ class Scheduler:
         placement = result.placement
         assert placement is not None
 
-        self._lane_running[lane] += 1
-        self._stats[lane].running = self._lane_running[lane]
-        self._store.update_job(
-            scope, job.id,
+        # **`queued` 일 때만 running 으로 넘긴다.** 배치를 결정하는 동안 API 워커가
+        # 그 잡을 취소했을 수 있다 — 그때 그대로 실행하면 소비자는 "취소됨" 을
+        # 응답받은 잡의 과금 청구서를 받는다.
+        if not self._store.update_job(
+            scope, job.id, expect_status="queued",
             status="running", node=placement.node, model=placement.model,
             tier=placement.tier, started_at=self._now(),
             wait_reason=None, wait_since=None,
-        )
+        ):
+            self._cluster.release(placement)
+            self._accountant.release_reservation(scope, job.id)
+            return False
+
+        self._lane_running[lane] += 1
+        self._stats[lane].running = self._lane_running[lane]
         # **참조를 붙잡는다.** `create_task` 의 반환을 버리면 이벤트 루프는 태스크를
         # 약한 참조로만 들고 있어서, GC 가 실행 도중에 가져갈 수 있다. 그러면 잡은
         # `running` 인 채 남고 `_execute` 의 `finally` 가 안 돌아 슬롯·메모리·비용
