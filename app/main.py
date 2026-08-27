@@ -91,6 +91,13 @@ VERSION = "0.1.0"
 #: 닿지 않고, 메모리를 노린 본문은 파싱 전에 걸린다.
 MAX_BODY_BYTES = 2 * 1024 * 1024
 
+#: 멱등성 키 헤더와 그 상한.
+#:
+#: 길이를 재는 이유: 키는 유니크 인덱스에 들어가고 잡 행에 붙어 산다. 소비자가
+#: 프롬프트 전체를 키로 넣으면 그 인덱스가 통째로 커진다.
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+MAX_IDEMPOTENCY_KEY_CHARS = 200
+
 #: 상태 조회는 제출과 다른 한도로 잰다. 대기 중인 소비자가 정상적으로 폴링하는 것을
 #: 제출 한도로 막으면 안 되고, 그렇다고 무제한이면 큐가 길어질 때 컨트롤 플레인이
 #: **클러스터 포화의 증상으로** 죽는다.
@@ -492,6 +499,24 @@ async def healthz(request: Request) -> Response:
     return JSONResponse({"ok": True, "version": ctx.version, "api": meta_mod.API_VERSION})
 
 
+def _idempotency_key(request: Request) -> str | None:
+    """`Idempotency-Key` 헤더. 없으면 `None`.
+
+    **모양만 본다.** 값의 의미는 소비자가 정하고, 서버는 (테넌트, 서비스) 안에서
+    같은 값이면 같은 작업으로 본다. 빈 문자열은 헤더를 안 보낸 것과 같게 다룬다 —
+    그렇게 안 하면 빈 키를 보낸 소비자 전원이 같은 잡 하나를 공유한다.
+    """
+    raw = (request.headers.get(IDEMPOTENCY_HEADER) or "").strip()
+    if not raw:
+        return None
+    if len(raw) > MAX_IDEMPOTENCY_KEY_CHARS:
+        raise ApiError(
+            "invalid_field", status=400,
+            params={"field": "Idempotency-Key", "limit": str(MAX_IDEMPOTENCY_KEY_CHARS)},
+        )
+    return raw
+
+
 async def generate(request: Request) -> Response:
     ctx: AppContext = request.app.state.ctx
     principal = _principal(request)
@@ -511,6 +536,7 @@ async def generate(request: Request) -> Response:
             None if body.get("wait") is None
             else _float(body.get("wait"), "wait", minimum=0.0, maximum=MAX_WAIT_SECONDS)
         ),
+        idempotency_key=_idempotency_key(request),
     )
     return _submission_response(request, submission)
 
@@ -1260,6 +1286,10 @@ async def tenant_usage(request: Request) -> Response:
         "by": axis,
         "rows": ctx.store.usage_summary(scope, since=since, group_by=axis),
         "spend_usd": ctx.store.spend_since(scope, since),
+        # **토큰 처리율은 계기지 한도가 아니다.** 무료 경로는 달러가 0 이라
+        # 200KB 프롬프트 1건과 1KB 1건이 같은 1건이고, 그 차이가 예산에도
+        # 레이트리밋에도 안 잡힌다. 상한을 걸기 전에 분포부터 본다.
+        "token_rate": ctx.store.token_rate(scope),
         "budget": {
             "limit": budget.limit, "spent": budget.spent, "reserved": budget.reserved,
             "committed": budget.committed,

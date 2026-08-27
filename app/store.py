@@ -34,6 +34,13 @@ SCHEMA_VERSION = 1
 #: 어느 앱 모듈도 임포트하지 않는 바닥 레이어이기 때문이다.
 BUDGET_WINDOW_DAYS = 30
 
+#: 멱등성 키가 사는 시간(시). 업계 관행(24시간)을 따른다.
+#:
+#: **잡 보존(30일)과 같이 두면 안 된다.** 소비자가 한 달 뒤 같은 키를 다시 쓰면
+#: 그때는 새 작업을 원하는 것이지 옛 응답을 원하는 것이 아니고, 그 사이에 프롬프트도
+#: 모델도 바뀌었을 수 있다. 창을 넘긴 키는 지워서 다음 요청이 새 잡을 만들게 한다.
+IDEMPOTENCY_TTL_HOURS = 24
+
 #: 한 문장에 넣을 파라미터 상한. SQLite 의 실제 상한은 빌드에 따라 999~32766 인데,
 #: 넘으면 `too many SQL variables` 로 **문장 전체가** 실패한다. 보수적으로 잡는다 —
 #: 쪼개는 비용은 무시할 만하고, 넘쳐서 실패하는 쪽은 파기가 안 되는 사고다.
@@ -230,6 +237,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     attempts          INTEGER NOT NULL DEFAULT 0,
     wait_reason       TEXT,
     wait_since        REAL,
+
+    -- 멱등성 키. 소비자가 준 값이며 **(테넌트, 서비스) 안에서만 유일하다.**
+    -- 네트워크 단절 뒤 재시도하는 소비자가 같은 작업을 두 번 만들지 않게 한다 —
+    -- metered 경로면 그 중복이 곧 이중 과금이다.
+    idempotency_key   TEXT,
 
     cost_reserved_usd REAL NOT NULL DEFAULT 0.0,
     cost_usd          REAL NOT NULL DEFAULT 0.0,
@@ -452,6 +464,18 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 없다. 새 응답부터 적용되고 옛 응답은 잡 보존 기간이 지나면 사라진다.
     ("jobs", "response_cipher", "BLOB"),
     ("jobs", "response_nonce", "BLOB"),
+    ("jobs", "idempotency_key", "TEXT"),
+)
+
+#: 컬럼이 생긴 **뒤에** 만들어야 하는 인덱스. `_SCHEMA` 에 두면 옛 DB 에서
+#: 컬럼보다 먼저 실행돼 죽는다 — 스키마는 마이그레이션보다 앞서 돌기 때문이다.
+_POST_MIGRATION_INDEXES: tuple[str, ...] = (
+    # **멱등성의 강제 지점.** 애플리케이션에서 "먼저 조회하고 없으면 삽입" 하면
+    # 두 워커가 동시에 조회를 통과한다 — 다중 워커가 지원 구성이므로 그 창은
+    # 실제로 열린다. 유일성은 DB 가 지켜야 프로세스를 넘는다.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency "
+    "ON jobs(tenant_id, service_id, idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL",
 )
 
 #: 원문을 담은 컬럼. **내보내기와 백업에서 함께 빠진다.**
@@ -493,6 +517,7 @@ class JobRow:
     system_masked: str | None = None
     prompt_hash: str | None = None
     system_hash: str | None = None
+    idempotency_key: str | None = None
     response: str | None = None
     response_cipher: bytes | None = None
     response_nonce: bytes | None = None
@@ -586,6 +611,8 @@ class SqliteStore:
             }
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        for statement in _POST_MIGRATION_INDEXES:
+            self._conn.execute(statement)
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -799,6 +826,7 @@ class SqliteStore:
             ),
             "prompt_hash": fields.pop("prompt_hash", None),
             "system_hash": fields.pop("system_hash", None),
+            "idempotency_key": fields.pop("idempotency_key", None),
             "placement_json": _json(list(fields.pop("placement", ()))),
             "tier_models_json": _json(dict(fields.pop("tier_models", {}))),
             "options_json": _json(dict(fields.pop("options", {}))),
@@ -903,6 +931,22 @@ class SqliteStore:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def job_by_idempotency_key(
+        self, scope: TenantScope, service_id: str, key: str
+    ) -> JobRow | None:
+        """이 키로 이미 만든 잡. **서비스까지 스코프에 넣는다.**
+
+        키는 소비자가 정한 값이라 테넌트만으로 가르면 한 테넌트의 두 서비스가
+        `retry-1` 같은 흔한 값에서 부딪힌다 — 그러면 A 서비스가 B 서비스의 응답을
+        받는다. 유일성 인덱스도 같은 세 칸으로 걸려 있다.
+        """
+        where, params = self._scoped_where(scope, "service_id = ? AND idempotency_key = ?")
+        params.extend([service_id, key])
+        row = self._conn.execute(
+            f"SELECT * FROM jobs WHERE {where}", params
+        ).fetchone()
+        return _row_to_job(row) if row else None
 
     def settle_job(
         self,
@@ -1120,6 +1164,50 @@ class SqliteStore:
             }
             for row in rows
         ]
+
+    def token_rate(
+        self, scope: TenantScope | None = None, *, window_seconds: float = 300.0
+    ) -> dict[str, float]:
+        """최근 창의 **분당 토큰 처리율**(TPM). `scope` 가 없으면 전 테넌트 합계.
+
+        ### 이것은 한도가 아니다
+
+        레이트리밋은 건/분이고 예산은 달러다. 무료(internal) 경로는 달러가 0 이라
+        **200KB 프롬프트 1건과 1KB 1건이 같은 1건**이고, 대형 프롬프트를 던지는
+        테넌트가 건수 한도를 지키면서 클러스터를 잠식할 수 있다.
+
+        그렇다고 지금 토큰 상한을 걸 근거는 없다 — 설치처의 분포를 모른다.
+        **값을 모르는 채 건 한도는 오탐 규칙과 같은 운명을 맞는다**(관리자가
+        꺼버린다). 그래서 먼저 재서 보여주고, 실측 분포를 본 뒤에 상한을 건다.
+
+        창을 두는 이유: 순간값은 튀고 전체 평균은 어제 일을 오늘로 끌고 온다.
+        """
+        clause = "ts >= ?"
+        since = self._now() - window_seconds
+        if scope is None:
+            where, params = clause, [since]
+        else:
+            where, params = self._scoped_where(scope, clause)
+            params.append(since)
+
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+            "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+            "COUNT(*) AS calls "
+            f"FROM usage WHERE {where}",
+            params,
+        ).fetchone()
+
+        minutes = max(window_seconds / 60.0, 1e-9)
+        inbound = float(row["input_tokens"])
+        outbound = float(row["output_tokens"])
+        return {
+            "window_seconds": window_seconds,
+            "input_tokens_per_minute": round(inbound / minutes, 2),
+            "output_tokens_per_minute": round(outbound / minutes, 2),
+            "tokens_per_minute": round((inbound + outbound) / minutes, 2),
+            "calls_per_minute": round(row["calls"] / minutes, 2),
+        }
 
     # -- 관제 집계 (테넌트를 가로지르지만 **어느 테넌트인지는 안 나온다**) ------
     #
@@ -2112,6 +2200,15 @@ class SqliteStore:
                 "DELETE FROM usage WHERE ts < ?", (usage_cutoff,)
             ).rowcount
 
+            # **창을 넘긴 멱등성 키를 놓아준다.** 잡 행은 보존 기간까지 남지만
+            # 키는 24시간짜리다 — 안 놓아주면 유일성 인덱스가 한 달 전 키를 붙들고
+            # 있어서, 같은 키를 다시 쓴 소비자가 한 달 전 응답을 받는다.
+            self._conn.execute(
+                "UPDATE jobs SET idempotency_key = NULL "
+                "WHERE idempotency_key IS NOT NULL AND created_at < ?",
+                (now - IDEMPOTENCY_TTL_HOURS * 3600,),
+            )
+
             # **검토를 마친 가드 이벤트는 오래 둔다.** 그것이 승격 게이트의
             # 표본이다 — 잡과 같은 주기로 지우면 승격 가능하던 규칙이 표본 부족으로
             # 되돌아가고, 관리자는 어제 되던 것이 왜 안 되는지 알 수 없다.
@@ -2246,6 +2343,7 @@ _JOB_DIRECT_FIELDS = frozenset(
         "response", "response_cipher", "response_nonce", "error", "error_code",
         "timeout_s", "max_prompt_chars", "node", "model", "tier", "last_failed_node",
         "attempts", "wait_reason", "wait_since", "cost_reserved_usd", "cost_usd",
+        "idempotency_key",
         "input_tokens", "output_tokens", "started_at", "finished_at", "lane", "end_user_hash",
     }
 )
@@ -2295,6 +2393,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRow:
         system_masked=get("system_masked"),
         prompt_hash=get("prompt_hash"),
         system_hash=get("system_hash"),
+        idempotency_key=get("idempotency_key"),
         response=get("response"),
         response_cipher=get("response_cipher"),
         response_nonce=get("response_nonce"),

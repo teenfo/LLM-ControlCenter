@@ -230,6 +230,23 @@ def collect(
         [({}, float(store.total_spend_since(time.time() - 30 * 86400)))],
     )
 
+    # -- 토큰 처리율 --
+    #
+    # **한도가 아니라 계기다.** 레이트리밋은 건/분이고 예산은 달러인데, 무료 경로는
+    # 달러가 0 이라 200KB 프롬프트 1건과 1KB 1건이 같은 1건이다. 상한을 걸기 전에
+    # 설치처의 분포부터 봐야 하고, 그 분포를 볼 자리가 여기다.
+    #
+    # 테넌트 라벨은 여기에도 없다 — 전 테넌트 합계뿐이다.
+    rate = store.token_rate()
+    gauge(
+        "tokens_per_minute",
+        "최근 창의 분당 토큰 처리율(전 테넌트 합계). **한도가 아니라 계기다**",
+        [
+            ({"direction": "input"}, rate["input_tokens_per_minute"]),
+            ({"direction": "output"}, rate["output_tokens_per_minute"]),
+        ],
+    )
+
     # -- 알림 --
     if notifier is not None:
         # **"발송" 과 "발생" 은 다르다.**

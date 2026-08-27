@@ -117,6 +117,27 @@ def _place_worker(db_path: str, barrier, results) -> None:
         store.close()
 
 
+def _idempotency_worker(db_path: str, key: str, barrier, results) -> None:
+    """같은 멱등성 키로 잡을 만들려고 다툰다. **하나만 살아야 한다.**"""
+    store = SqliteStore(db_path)
+    try:
+        barrier.wait()
+        try:
+            job_id = store.create_job(
+                ACME, service_id="acme-web", role="r", lane="interactive",
+                kind="generate", status="queued", priority=0, prompt_masked="x",
+                idempotency_key=key,
+            )
+            results.put(("created", job_id))
+        except sqlite3.IntegrityError:
+            # **정상 경로다.** 조회를 나란히 통과한 뒤 삽입에서 갈린다.
+            results.put(("rejected", None))
+    except Exception as exc:                       # pragma: no cover - 진단용
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        store.close()
+
+
 def run_workers(target, db_path, *extra, count: int = WORKERS) -> list:
     """`spawn` 으로 워커를 띄우고 결과를 모은다.
 
@@ -262,3 +283,31 @@ def test_the_debt_table_still_admits_the_process_local_ledger():
         encoding="utf-8"
     )
     assert "프로세스 로컬" in readme, "슬롯 장부의 한계가 부채 표에서 사라졌다"
+
+
+# ── 4. 멱등성은 DB 가 지킨다 ────────────────────────────────────────────────
+
+
+def test_only_one_process_creates_the_job_for_a_key(shared_db):
+    """**"먼저 조회하고 없으면 삽입" 은 다중 워커에서 반드시 진다.**
+
+    두 워커가 조회를 나란히 통과하는 창이 실재하고, 애플리케이션 락으로 막으려 해도
+    락이 프로세스를 넘지 못한다. 유일성은 DB 가 지켜야 하고, 진 쪽은 삽입 실패를
+    **정상 경로로** 다뤄 이긴 쪽의 잡을 찾아간다.
+    """
+    outcomes = run_workers(_idempotency_worker, shared_db, "retry-1")
+
+    errors = [o for kind, o in outcomes if kind == "error"]
+    assert not errors, f"워커가 오류를 냈다: {errors}"
+
+    created = [job for kind, job in outcomes if kind == "created"]
+    assert len(created) == 1, f"{WORKERS}개 프로세스 중 {len(created)}개가 잡을 만들었다"
+
+    verify = SqliteStore(shared_db)
+    count = verify.get_job(ACME, created[0])
+    rows = verify._conn.execute(
+        "SELECT COUNT(*) AS n FROM jobs WHERE idempotency_key = ?", ("retry-1",)
+    ).fetchone()["n"]
+    verify.close()
+    assert count is not None
+    assert rows == 1, f"같은 키의 잡이 {rows}건 남았다"

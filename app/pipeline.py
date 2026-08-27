@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import re
 import secrets
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -297,7 +298,8 @@ class Pipeline:
         priority: int,
         metadata: Mapping[str, Any] | None,
         status: str = "queued",
-    ) -> str:
+        idempotency_key: str | None = None,
+    ) -> str | None:
         # **잡 id 를 먼저 만든다.** 봉인이 그 id 를 태그에 묶어야 하므로 저장
         # 시점에 받아서는 늦다.
         job_id = uuid.uuid4().hex[:16]
@@ -307,40 +309,53 @@ class Pipeline:
         system_internal = verdict.system_for(INTERNAL)
         system_external = verdict.system_for(EXTERNAL)
 
-        return self._store.create_job(
-            scope,
-            id=job_id,
-            service_id=principal.service_id,
-            end_user_hash=end_user_hash,
-            role=role_config.name,
-            lane=role_config.lane,
-            kind=role_config.kind,
-            status=status,
-            priority=priority,
-            prompt_masked=masked,
-            # 외부용 변형은 **다를 때만** 저장한다. 같은 값을 두 벌 두면 저장이 두 배가
-            # 되고, 다를 때 저장하지 않으면 실행 시점에 구분이 사라진다.
-            prompt_external=external if external != masked else None,
-            system_masked=system_internal,
-            system_external=(
-                system_external if system_external != system_internal else None
-            ),
-            prompt_cipher=sealed.ciphertext if sealed else None,
-            prompt_nonce=sealed.nonce if sealed else None,
-            # 해시는 **마스킹 후 + 테넌트 솔트**다. 원문을 그대로 해싱하면 주민번호처럼
-            # 탐색 공간이 좁은 값은 전수조사로 복원되고, 해시가 새 유출 경로가 된다.
-            prompt_hash=hash_prompt(masked, tenant["end_user_salt"]),
-            # `system_hash` 는 솔트가 없다 — 테넌트를 가로질러 "같은 프롬프트 전략을
-            # 쓰는가" 를 비교해야 하고, system 프롬프트는 저엔트로피가 아니다.
-            system_hash=hash_system(system),
-            allowed_boundaries=sorted(verdict.allowed_boundaries),
-            placement=role_config.placement,
-            tier_models=role_config.tier_models,
-            options=role_config.options,
-            timeout_s=role_config.timeout,
-            max_prompt_chars=role_config.max_prompt_chars,
-            metadata=dict(metadata or {}),
-        )
+        try:
+            return self._store.create_job(
+                scope,
+                id=job_id,
+                service_id=principal.service_id,
+                end_user_hash=end_user_hash,
+                role=role_config.name,
+                lane=role_config.lane,
+                kind=role_config.kind,
+                status=status,
+                priority=priority,
+                prompt_masked=masked,
+                # 외부용 변형은 **다를 때만** 저장한다. 같은 값을 두 벌 두면 저장이 두 배가
+                # 되고, 다를 때 저장하지 않으면 실행 시점에 구분이 사라진다.
+                prompt_external=external if external != masked else None,
+                system_masked=system_internal,
+                system_external=(
+                    system_external if system_external != system_internal else None
+                ),
+                prompt_cipher=sealed.ciphertext if sealed else None,
+                prompt_nonce=sealed.nonce if sealed else None,
+                # 해시는 **마스킹 후 + 테넌트 솔트**다. 원문을 그대로 해싱하면 주민번호처럼
+                # 탐색 공간이 좁은 값은 전수조사로 복원되고, 해시가 새 유출 경로가 된다.
+                prompt_hash=hash_prompt(masked, tenant["end_user_salt"]),
+                # `system_hash` 는 솔트가 없다 — 테넌트를 가로질러 "같은 프롬프트 전략을
+                # 쓰는가" 를 비교해야 하고, system 프롬프트는 저엔트로피가 아니다.
+                system_hash=hash_system(system),
+                allowed_boundaries=sorted(verdict.allowed_boundaries),
+                placement=role_config.placement,
+                tier_models=role_config.tier_models,
+                options=role_config.options,
+                timeout_s=role_config.timeout,
+                max_prompt_chars=role_config.max_prompt_chars,
+                metadata=dict(metadata or {}),
+                idempotency_key=idempotency_key,
+            )
+        except sqlite3.IntegrityError:
+            # **유일성 인덱스가 잡았다.** 같은 키로 두 요청이 나란히 들어오면 조회는
+            # 둘 다 통과하고 삽입에서 하나만 산다 — 그 판정을 애플리케이션이 하려
+            # 들면 다중 워커에서 반드시 진다. 진 쪽은 `None` 을 받아 이긴 쪽의 잡을
+            # 찾아간다.
+            #
+            # 여기까지 온 무결성 오류는 멱등성 키 말고는 원인이 없다. 다른 원인이면
+            # 그것을 삼키는 것이 더 나쁘므로 키가 없을 때는 다시 던진다.
+            if not idempotency_key:
+                raise
+            return None
 
     # -- 제출 -----------------------------------------------------------------
 
@@ -355,6 +370,7 @@ class Pipeline:
         priority: int = 0,
         metadata: Mapping[str, Any] | None = None,
         wait: float | None = None,
+        idempotency_key: str | None = None,
     ) -> Submission:
         """생성 요청. **이 함수의 본문 순서가 곧 계약이다.**"""
         scope = principal.scope()
@@ -363,6 +379,20 @@ class Pipeline:
         role_config, tenant, service, end_user_hash = self._authorize(
             principal, role, end_user
         )
+
+        # ①.5 멱등성 — **인증 다음, 가드 앞.**
+        #
+        # 인증 앞에 두면 남의 키를 조회해 잡 존재 여부를 알아낼 수 있다. 가드 뒤로
+        # 밀면 재시도마다 2단 분류(추론 한 번)를 다시 도는데, 재시도는 정확히
+        # "이미 한 일을 또 하지 않으려고" 있는 장치라 앞뒤가 맞지 않는다.
+        if idempotency_key:
+            existing = self._store.job_by_idempotency_key(
+                scope, principal.service_id, idempotency_key
+            )
+            if existing is not None:
+                # **같은 키면 같은 잡이다.** 끝났으면 그 결과를, 아직이면 기다린다 —
+                # 재시도한 소비자가 원본과 같은 모양을 받아야 분기가 필요 없다.
+                return await self.wait_for(scope, existing.id, seconds=wait)
         if role_config.is_embed:
             # 임베딩은 동기 경로다. 큐에 넣으면 소비자가 영원히 폴링한다.
             raise ApiError("wrong_kind", status=400, params={"role": role, "kind": "embed"})
@@ -397,7 +427,19 @@ class Pipeline:
             principal=principal, role_config=role_config, tenant=tenant,
             end_user_hash=end_user_hash, verdict=verdict, raw_prompt=prompt,
             system=effective_system, priority=priority, metadata=metadata,
+            idempotency_key=idempotency_key,
         )
+        if job_id is None:
+            # **유일성 인덱스가 동시 삽입을 막았다.** 두 워커가 위의 조회를 나란히
+            # 통과할 수 있고 — 다중 워커가 지원 구성이므로 그 창은 실제로 열린다 —
+            # 그때 유일성을 지키는 것은 애플리케이션이 아니라 DB 다. 진 쪽은 이긴
+            # 쪽의 잡을 그대로 돌려준다.
+            winner = self._store.job_by_idempotency_key(
+                scope, principal.service_id, idempotency_key or ""
+            )
+            if winner is None:
+                raise ApiError("internal", status=500)
+            return await self.wait_for(scope, winner.id, seconds=wait)
         self._record_guard_events(
             scope, verdict, job_id=job_id, service_id=principal.service_id
         )
