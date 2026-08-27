@@ -262,13 +262,36 @@ rented-gpu:
 ## 9. 계층
 
 ```
-HTTP (Starlette)
-  └ 인증        토큰 → 테넌트·서비스 · 3단 레이트리밋        auth.py
-     └ 가드      1단 패턴 → 2단 내부 노드 분류               guard.py
-        └ 저장   마스킹본 평문 + 원문 AES-GCM                store.py · crypto.py
-           └ 배치  (잡, 노드) 쌍 선택 + 원자적 예약           cluster.py · cost.py
-              └ 실행  프로바이더                              providers/
+HTTP (Starlette)                                              main.py · meta.py
+  └ 파이프라인  ① 인증 → ② 가드 → ③ 저장 → ④ 배치 → ⑤ 실행    pipeline.py
+     ├ 인증      토큰 → 테넌트·서비스 · 3단 레이트리밋         auth.py · identity.py
+     ├ 가드      1단 패턴 → 2단 내부 노드 분류                 guard.py · evals.py
+     ├ 저장      마스킹본 평문 + 원문 AES-GCM                  store.py · crypto.py
+     ├ 배치      (잡, 노드) 쌍 선택 + 원자적 예약              cluster.py · cost.py
+     └ 실행      프로바이더                                    providers/
+
+배경        레인 루프 · 헬스 · 모델 설치 · 보존 · 감시         scheduler.py · models.py
+운영        알림 · 메트릭 · 구조화 로그 · 진단 번들            notify.py · observability.py
+설치        부트스트랩 · CLI · 백업 스냅샷                     bootstrap.py · cli.py · backup.py
+설정                                                          config.py · i18n.py
 ```
+
+### `pipeline.py` 가 잡을 만드는 유일한 경로다
+
+라우터가 `store.create_job()` 을 직접 부를 수 있으면 언젠가 누군가 가드를 건너뛴 경로를
+만든다. 스토어의 테넌트 초크포인트와 같은 이유로, **순서를 규율이 아니라 구조로 만든다.**
+동기 임베딩도 같은 관문을 지난다 — 큐만 우회하고 가드·배치·경계·비용은 우회하지 않는다.
+
+이 불변식은 주석이 아니라 테스트가 지킨다(`tests/test_architecture.py`):
+스토어 커넥션 단일 접근 · 잡 생성 단일 경로 · 경계는 노드 속성 · `force` 없음 ·
+필터 이벤트에 값 인자 없음.
+
+### `meta.py` 는 계약을 손으로 적지 않는다
+
+엔드포인트 목록을 문서에 적어 두면 라우트를 추가할 때 문서 고치는 것을 잊는다.
+재고는 앱의 라우트 테이블을 **순회해서** 만들고, 요약이 빠진 라우트가 있으면
+테스트가 실패한다. 계약은 **토큰마다 생성된다** — 다른 테넌트의 역할 이름이
+OpenAPI 에 새면 그것도 정보 유출이다.
 
 `build_app(...)` 이 전부 주입식인 이유는 §3 과 같다: **실제 노드도 클라우드 키도 없이
 테스트가 돈다.** 목 프로바이더가 그대로 Demo 프로파일이 된다.

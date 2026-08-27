@@ -148,3 +148,36 @@ def test_schema_migrations_are_add_only():
         assert "NOT NULL" not in upper or "DEFAULT" in upper, (
             f"{table}.{column}: 기본값 없는 NOT NULL 은 기존 행을 깨뜨린다"
         )
+
+
+# ── 문서 드리프트 ────────────────────────────────────────────────────────────
+
+
+def test_the_architecture_doc_names_every_module():
+    """**문서의 모듈 표도 손으로 관리하는 표다** — 반드시 어긋난다.
+
+    실제로 어긋났다: 10~15단계에서 만든 모듈 7개가 1단계에 쓴 문서에 없었다.
+    설계 문서가 코드의 절반만 설명하면 그 문서를 읽고 붙은 사람이 나머지 절반을
+    모른 채 고치게 된다.
+    """
+    doc = (APP.parent / "docs" / "architecture.md").read_text(encoding="utf-8")
+    modules = {
+        path.stem for path in APP.glob("*.py")
+        if path.stem not in ("__init__", "__main__")
+    }
+    missing = sorted(name for name in modules if f"{name}.py" not in doc)
+    assert not missing, f"docs/architecture.md 에 없는 모듈: {missing}"
+
+
+def test_the_doc_does_not_name_modules_that_no_longer_exist():
+    """반대 방향도 본다 — 지운 모듈이 문서에 남으면 없는 코드를 찾게 된다."""
+    import re
+
+    doc = (APP.parent / "docs" / "architecture.md").read_text(encoding="utf-8")
+    named = set(re.findall(r"\b([a-z_]+)\.py\b", doc))
+    # providers/ 하위 모듈과 테스트 파일은 이 검사 대상이 아니다.
+    named -= {p.stem for p in (APP / "providers").glob("*.py")}
+    named = {n for n in named if not n.startswith("test_")}
+
+    ghosts = sorted(n for n in named if not (APP / f"{n}.py").exists())
+    assert not ghosts, f"문서에만 있고 코드에 없는 모듈: {ghosts}"
