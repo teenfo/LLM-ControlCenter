@@ -950,6 +950,102 @@ class SqliteStore:
     def all_node_health(self) -> list[sqlite3.Row]:
         return list(self._conn.execute("SELECT * FROM node_health ORDER BY node"))
 
+    # -- 모델 설치 요청 (공유 인프라 — 테넌트 스코프 아님) ------------------------
+
+    def create_model_request(
+        self, node: str, model: str, *, requested_by: str = "",
+        roles: Sequence[str] = (), est_size_gb: float = 0.0,
+        status: str = "pending",
+    ) -> str:
+        """(모델, 노드) 쌍당 요청 하나. 같은 모델을 3대에 얹으려면 요청 3건이다."""
+        request_id = uuid.uuid4().hex[:16]
+        self._conn.execute(
+            "INSERT INTO model_requests(id, node, model, status, requested_by, roles_json, "
+            "est_size_gb, created_at) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(node, model) DO NOTHING",
+            (request_id, node, model, status, requested_by, _json(list(roles)),
+             est_size_gb, self._now()),
+        )
+        self._conn.commit()
+        row = self.get_model_request(node, model)
+        return row["id"] if row else request_id
+
+    def get_model_request(self, node: str, model: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM model_requests WHERE node = ? AND model = ?", (node, model)
+        ).fetchone()
+
+    def get_model_request_by_id(self, request_id: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM model_requests WHERE id = ?", (request_id,)
+        ).fetchone()
+
+    def list_model_requests(self, *, status: str | None = None) -> list[sqlite3.Row]:
+        if status:
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM model_requests WHERE status = ? ORDER BY created_at",
+                    (status,),
+                )
+            )
+        return list(self._conn.execute("SELECT * FROM model_requests ORDER BY created_at"))
+
+    def update_model_request(self, request_id: str, **fields: Any) -> bool:
+        allowed = {"status", "progress", "error", "decided_at", "est_size_gb"}
+        payload = {k: v for k, v in fields.items() if k in allowed}
+        if not payload:
+            return False
+        assignments = ", ".join(f"{k} = ?" for k in payload)
+        cur = self._conn.execute(
+            f"UPDATE model_requests SET {assignments} WHERE id = ?",
+            [*payload.values(), request_id],
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_model_request(self, node: str, model: str) -> bool:
+        """삭제 시 요청 행 자체를 지운다.
+
+        `ready` 로 두면 다음 탐지에서 되살아나고, `rejected` 로 두면 이후 잡이
+        "설치가 거부됨" 이라는 **거짓 사유**로 하드 실패한다.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM model_requests WHERE node = ? AND model = ?", (node, model)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def infra_job_counts(self, *, node: str | None = None, model: str | None = None) -> dict[str, int]:
+        """상태별 잡 수. **집계만 돌려주므로 테넌트 내용을 노출하지 않는다.**
+
+        모델 삭제 차단 판정처럼 인프라 결정에 쓰인다. 개수는 테넌트 데이터가 아니므로
+        스코프를 요구하지 않되, 프롬프트나 응답은 절대 여기로 나가지 않는다.
+        """
+        conditions, params = [], []
+        if node:
+            conditions.append("node = ?")
+            params.append(node)
+        if model:
+            conditions.append("model = ?")
+            params.append(model)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        return {
+            row["status"]: row["n"]
+            for row in self._conn.execute(
+                f"SELECT status, COUNT(*) AS n FROM jobs {where} GROUP BY status", params
+            )
+        }
+
+    def queued_roles(self) -> dict[str, int]:
+        """대기 중인 잡의 역할별 개수. 삭제 차단이 "이 역할의 대기 잡" 을 세는 데 쓴다."""
+        return {
+            row["role"]: row["n"]
+            for row in self._conn.execute(
+                "SELECT role, COUNT(*) AS n FROM jobs WHERE status='queued' GROUP BY role"
+            )
+        }
+
     # -- 레이트리밋 카운터 -----------------------------------------------------
 
     def bump_rate_counter(self, key: str, bucket: int) -> None:
