@@ -932,6 +932,38 @@ class SqliteStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def queue_position(
+        self, scope: TenantScope, *, lane: str, priority: int,
+        created_at: float, job_id: str,
+    ) -> int:
+        """이 잡 앞에 몇 건이 있는가. **행을 끌어오지 않고 센다.**
+
+        예전에는 대기 잡을 최대 500건 `SELECT *` 로 가져와 파이썬에서 셌다. 그
+        쿼리는 마스킹본·암호문·응답까지 끌어오는데 폴링이 보는 것은 개수 하나뿐이고,
+        그래서 **폴 한 번의 원가가 큐 깊이에 비례했다** — 실측으로 깊이 0 에서
+        0.72ms, 1000 에서 28ms 였다.
+
+        하필 그것이 이 시스템의 유일한 파국 경로를 **증폭한다**: 클러스터가 포화되면
+        큐가 늘고, 큐가 늘면 대기 잡이 늘고, 대기 잡이 늘면 폴링이 느는데, 그 폴링이
+        큐 깊이에 비례해 비싸진다. 적응형 `retry_after` 가 damp 하려던 바로 그
+        되먹임에 gain 을 얹고 있었던 셈이다.
+
+        정렬 기준은 `priority DESC, created_at ASC` — 스케줄러가 꺼내는 순서와 같다.
+        `idx_jobs_queue` 가 그 순서 그대로라 이 COUNT 는 인덱스만 훑는다.
+
+        상한도 사라졌다. 500건에서 자르면 그 너머는 전부 "500번째" 로 보였다.
+        """
+        where, params = self._scoped_where(
+            scope,
+            "status = 'queued' AND lane = ? AND id != ? "
+            "AND (priority > ? OR (priority = ? AND created_at < ?))",
+        )
+        params.extend([lane, job_id, priority, priority, created_at])
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS ahead FROM jobs WHERE {where}", params
+        ).fetchone()
+        return int(row["ahead"])
+
     def job_by_idempotency_key(
         self, scope: TenantScope, service_id: str, key: str
     ) -> JobRow | None:

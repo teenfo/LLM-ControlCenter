@@ -587,14 +587,14 @@ class Pipeline:
 
         전역 깊이를 돌려주면 **다른 테넌트가 얼마나 밀어 넣었는지가 새어 나간다.**
         약한 정보지만 다중 테넌트 제품에서 굳이 열어 줄 이유가 없다.
+
+        세는 것은 스토어가 한다 — 여기서 행을 끌어와 파이썬으로 세면 폴 한 번의
+        원가가 큐 깊이에 비례하고, 그것이 이 시스템의 유일한 파국 경로를 증폭한다.
         """
-        ahead = 0
-        for other in self._store.list_jobs(scope, status="queued", limit=500):
-            if other.lane != job.lane or other.id == job.id:
-                continue
-            if (other.priority, -other.created_at) > (job.priority, -job.created_at):
-                ahead += 1
-        return ahead
+        return self._store.queue_position(
+            scope, lane=job.lane, priority=job.priority,
+            created_at=job.created_at, job_id=job.id,
+        )
 
     def _retry_after(self, job: Any) -> float:
         """큐 위치 기반 적응형 백오프.

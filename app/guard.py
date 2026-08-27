@@ -49,7 +49,11 @@ UNVERIFIED_SUFFIX = ":unverified"
 INVISIBLE_CHARS = frozenset("\u200b\u200c\u200d\u2060\ufeff\u00ad")
 
 
-def normalize_for_match(text: str) -> tuple[str, list[int] | None]:
+#: 정규화한 텍스트와 **원문 인덱스 지도**. 지도가 `None` 이면 원문과 같다는 뜻이다.
+Normalized = tuple[str, "list[int] | None"]
+
+
+def normalize_for_match(text: str) -> Normalized:
     """검사용으로 정규화한 텍스트와 **원문 인덱스 지도**.
 
     전각 하이픈(`－`)·NBSP·전각 숫자로 쓴 주민번호는 눈에는 같은데 패턴에 안
@@ -638,10 +642,18 @@ class Guard:
     async def _run_stage1(
         self, prompt: str, system: str | None, rules: Sequence[GuardRule]
     ) -> list[Detection]:
-        """1단 패턴. 큰 프롬프트는 **스레드 풀로 넘긴다.**
+        """1단 패턴. 큰 프롬프트는 스레드 풀로 넘긴다.
 
-        200KB × 20패턴 = 40~80ms 를 이벤트 루프 위에서 동기로 돌면 그동안 다른 모든
-        요청이 멈춘다.
+        **머리 막힘 방어로 세지 말 것.** 그러라고 넣은 장치지만 실측으로 값을 하지
+        않는다: 200KB 제출 2건이 도는 동안 루프 최대 정지가 켰을 때 95.8ms, 껐을 때
+        95.3ms 로 **차이가 없었다**(각 12회 중앙값, `python -m app.loadtest`).
+        `re` 가 GIL 을 놓지 않아서, 스캔을 옮겨도 그 스레드가 GIL 을 쥐고 있으면
+        자기 일을 하려는 이벤트 루프는 여전히 선다. 스캔 자체는 경합 때문에 9%
+        느려진다.
+
+        그래도 유지하는 이유는 최악값이 조금 낫고(경합이 유리하게 풀리면 절반까지
+        떨어진다) 끄면 그 여지마저 없기 때문이다. 큰 프롬프트에 대한 실효 방어는
+        역할별 `max_prompt_chars` 다 — capacity.md §6.2-b.
         """
         haystack = prompt if system is None else f"{prompt}\n{system}"
         pattern_rules = [r for r in rules if r.kind == "pattern"]
@@ -663,14 +675,19 @@ class Guard:
         """
         detections: list[Detection] = []
 
+        # **정규화는 텍스트당 한 번이다.** 규칙 루프 안에서 하면 같은 문자열을
+        # 규칙 수만큼 다시 훑는다 — 큰 프롬프트에서 그것이 스캔 원가의 3분의 1이었다.
+        normalized_prompt = normalize_for_match(prompt)
+        normalized_system = normalize_for_match(system or "")
+
         for rule in rules:
             if rule.kind != "pattern" or not rule.pattern:
                 continue
             compiled = self._compile(rule.pattern)
 
-            spans, unverified = self._match_spans(compiled, rule, prompt)
+            spans, unverified = self._match_spans(compiled, rule, normalized_prompt)
             system_spans, system_unverified = self._match_spans(
-                compiled, rule, system or ""
+                compiled, rule, normalized_system
             )
 
             if spans or system_spans:
@@ -713,12 +730,14 @@ class Guard:
         """
         if rule.kind != "pattern" or not rule.pattern:
             return 0
-        verified, _ = self._match_spans(self._compile(rule.pattern), rule, text)
+        verified, _ = self._match_spans(
+            self._compile(rule.pattern), rule, normalize_for_match(text)
+        )
         return len(verified)
 
     @staticmethod
     def _match_spans(
-        compiled: re.Pattern[str], rule: GuardRule, text: str
+        compiled: re.Pattern[str], rule: GuardRule, normalized: Normalized
     ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
         """(체크섬을 통과한 스팬, 통과하지 못한 스팬).
 
@@ -726,13 +745,14 @@ class Guard:
         않다. 버리면 숫자 나열이 전부 PII 가 되는 오탐 홍수를 막는 대신,
         체크섬 자체가 성립하지 않게 된 식별자 체계(2020-10 이후 주민등록번호)를
         통째로 놓친다. 나눠서 돌려주면 규칙이 그 둘에 다른 등급을 줄 수 있다.
-        """
-        if not text:
-            return [], []
 
-        # **정규화한 사본에서 찾고, 위치는 원문으로 되돌린다.**
-        # 정규화본에 마스킹하면 소비자가 보낸 것과 다른 텍스트가 저장·전송된다.
-        haystack, index = normalize_for_match(text)
+        **정규화본을 받는다 — 여기서 정규화하지 않는다.** 정규화는 텍스트의 성질이지
+        규칙의 성질이 아니라서, 규칙마다 다시 하면 같은 일을 규칙 수만큼 반복한다.
+        실측으로 200KB 프롬프트 한 건에서 규칙 30개 × 0.85ms ≒ 25ms 가 그렇게 샜다.
+        """
+        haystack, index = normalized
+        if not haystack:
+            return [], []
 
         def to_source(span: tuple[int, int]) -> tuple[int, int]:
             if index is None:

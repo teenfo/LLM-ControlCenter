@@ -17,7 +17,10 @@ settings:
   raw_prompt_retention_days: 7
 
   # 이 크기를 넘는 프롬프트의 1단 정규식은 스레드 풀로 넘긴다.
-  # 안 하면 200KB 프롬프트 한 건이 이벤트 루프를 40~80ms 잡아 다른 모든 요청을 세운다.
+  #
+  # 이 값을 머리 막힘 방어로 세지 말 것. 실측으로 값을 하지 않는다 — re 가 GIL 을
+  # 놓지 않아서 스캔을 옮겨도 이벤트 루프는 그대로 선다(capacity.md §6.2-b).
+  # 큰 프롬프트가 루프를 세우는 것이 문제라면 역할의 max_prompt_chars 를 낮춘다.
   stage1_threadpool_threshold_bytes: 16384
 
   # audit -> block 승격 게이트. 정답셋 기준 오탐률이 이보다 높으면 승격을 거부한다.
