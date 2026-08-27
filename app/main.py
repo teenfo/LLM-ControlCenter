@@ -905,6 +905,10 @@ async def tenant_guard_rules(request: Request) -> Response:
         )
         return _ok(request, {
             "locale_pack": pack,
+            # **항상 켜지는 팩도 보여준다.** "켜진 팩" 을 로케일 팩 하나로만 답하면
+            # 인젝션 팩처럼 로케일과 무관하게 도는 것이 화면에서 사라지고, 관리자는
+            # 자기가 무엇을 켜 두고 있는지 절반만 안다.
+            "always_on_packs": sorted(ctx.config.always_on_packs),
             "tenant_rules": ctx.store.list_tenant_guard_rules(scope),
             # 실제로 적용되는 값. 베이스라인과 병합된 결과다.
             "effective": [

@@ -248,14 +248,25 @@ class Config:
     pricing: Pricing
     thresholds: Thresholds
     catalog: tuple[CatalogEntry, ...]
+    #: `always_on: true` 를 선언한 팩 이름. **설정의 플래그가 실제로 여기로 온다.**
+    #:
+    #: 예전에는 `rules_for_locales` 가 `"common"` 을 이름으로 하드코딩해서, YAML 의
+    #: `always_on` 은 읽는 사람에게만 참인 죽은 플래그였다 — `always_on: true` 를 단
+    #: 새 팩이 조용히 안 켜졌고, 그 사실은 그 팩이 잡아야 할 것을 놓칠 때까지 안 드러난다.
+    always_on_packs: frozenset[str] = frozenset({"common"})
 
     def rules_for_locales(self, locales: Iterable[str]) -> tuple[GuardRule, ...]:
-        """켜진 로케일 팩 + 항상 켜지는 common 팩의 규칙.
+        """켜진 로케일 팩 + **항상 켜지는 팩**의 규칙.
 
         팩을 안 켜면 그 나라 PII 는 안 잡힌다. 그래서 관제 UI 가 켜진 팩을 상시 표시한다 —
         안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.
+
+        로케일과 무관하게 켜져야 하는 것이 둘이다: 카드번호·이메일처럼 형태가 만국
+        공통인 것(`common`), 그리고 **인젝션 구문처럼 공격자가 언어를 고르는 것**.
+        한국어 테넌트에 영어 탈옥 문장을 넣는 것을 막는 데 테넌트의 로케일은 아무
+        상관이 없다.
         """
-        wanted = {"common", *locales}
+        wanted = {*self.always_on_packs, *locales}
         return tuple(r for r in self.guard_rules if r.locale_pack in wanted)
 
 
@@ -404,11 +415,18 @@ def _guard_rule_from_dict(raw: Mapping[str, Any], locale_pack: str) -> GuardRule
     )
 
 
-def _load_guard(raw: Mapping[str, Any]) -> tuple[tuple[GuardRule, ...], GuardSettings]:
+def _load_guard(
+    raw: Mapping[str, Any],
+) -> tuple[tuple[GuardRule, ...], GuardSettings, frozenset[str]]:
     rules: list[GuardRule] = []
     seen: set[str] = set()
+    # `common` 은 이름으로도 항상 켜진다 — 기존 설정이 그 팩에 `always_on` 을
+    # 안 적었을 수 있고, 플래그를 진짜로 만드는 변경이 그 팩을 끄면 안 된다.
+    always_on: set[str] = {"common"}
 
     for pack_name, pack in (raw.get("locale_packs") or {}).items():
+        if (pack or {}).get("always_on"):
+            always_on.add(pack_name)
         for rule_raw in (pack or {}).get("rules") or ():
             rule = _guard_rule_from_dict(rule_raw, pack_name)
             if rule.id in seen:
@@ -441,7 +459,7 @@ def _load_guard(raw: Mapping[str, Any]) -> tuple[tuple[GuardRule, ...], GuardSet
             settings_raw.get("classifier_min_schema_compliance", 0.98)
         ),
     )
-    return tuple(rules), settings
+    return tuple(rules), settings, frozenset(always_on)
 
 
 def load_config(config_dir: str | Path) -> Config:
@@ -469,7 +487,9 @@ def load_config(config_dir: str | Path) -> Config:
         for name, raw in _read_yaml(base / "lanes.yaml").items()
     }
 
-    guard_rules, guard_settings = _load_guard(_read_yaml(base / "guard.yaml"))
+    guard_rules, guard_settings, always_on_packs = _load_guard(
+        _read_yaml(base / "guard.yaml")
+    )
 
     pricing_raw = _read_yaml(base / "pricing.yaml")
     defaults = pricing_raw.pop("defaults", {}) or {}
@@ -505,6 +525,7 @@ def load_config(config_dir: str | Path) -> Config:
         pricing=pricing,
         thresholds=thresholds,
         catalog=catalog,
+        always_on_packs=always_on_packs,
     )
     validate_cross_references(config)
     return config

@@ -422,7 +422,7 @@ def test_classification_never_invents_a_rule():
 
 def test_classification_prompt_carries_the_descriptions():
     rules = (GuardRule(id="deal", kind="llm", action="block", description="인수합병 논의"),)
-    prompt = _classification_prompt("본문", rules)
+    prompt = _classification_prompt("본문", rules, fence="F" * 16, canary="c" * 16)
     assert "deal: 인수합병 논의" in prompt
     assert "본문" in prompt
 

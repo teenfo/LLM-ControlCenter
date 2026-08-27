@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any, Callable, Mapping, Sequence
 
 from .base import (
@@ -32,6 +33,29 @@ EMBED_DIMENSIONS = 8
 
 #: 호출 기록의 상한. 시연을 며칠 켜 둬도 메모리가 늘지 않게.
 MAX_CALL_LOG = 1000
+
+
+#: 분류기 프롬프트의 카나리아 표식. 파이프라인의 `CANARY_MARK` 와 같은 값이지만
+#: **임포트하지 않는다** — 프로바이더가 파이프라인을 알면 의존 방향이 뒤집힌다.
+#: 두 상수가 갈리면 `test_the_mock_answers_the_classifier_compliantly` 가 실패한다.
+_CANARY = re.compile(r"CANARY=([0-9a-f]{16})")
+
+
+def _compliant_classifier_reply(prompt: str) -> str | None:
+    """분류기 프롬프트면 **형식을 지키는 모델**처럼 답한다.
+
+    목은 "제어 가능한 가짜 백엔드" 다. 카나리아를 안 돌려주면 파이프라인이 그것을
+    지시 이탈로 읽어 `on_classifier_error` 를 태우므로, 목으로 도는 데모와 테스트가
+    전부 분류 실패 상태가 된다 — 목이 흉내 내야 할 것은 **인증을 통과한 모델**이다.
+
+    인젝션에 넘어간 모델을 흉내 내려면 `reply` 를 직접 지정한다. 그쪽이 우선한다.
+    """
+    found = _CANARY.search(prompt)
+    if not found:
+        return None
+    # 판정은 하지 않는다. 목이 맥락을 진짜로 읽을 수는 없고, 읽는 척하면 가드 2단이
+    # 목에서 "동작하는 것처럼" 보여 진짜 모델 없이 통과한다.
+    return f"CANARY={found.group(1)}\nNONE"
 
 
 class MockProvider:
@@ -126,7 +150,8 @@ class MockProvider:
 
         return GenerationResult(
             text=self.reply if self.reply is not None
-            else f"[mock:{self.node_name}/{model}] {digest}",
+            else _compliant_classifier_reply(prompt)
+            or f"[mock:{self.node_name}/{model}] {digest}",
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,

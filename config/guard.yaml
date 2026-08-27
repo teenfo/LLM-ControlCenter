@@ -66,6 +66,65 @@ locale_packs:
         action: audit
         label: "[IP]"
 
+  # ── 프롬프트 인젝션 ──────────────────────────────────────────────────────
+  #
+  # 2단 분류기는 사용자 텍스트를 LLM 에게 보여주고 "민감한가" 를 묻는다. 그 텍스트가
+  # 분류기를 향한 지시를 담으면 판정이 뒤집힐 수 있다 — **가드가 가드를 뚫는 입력에
+  # 무방비다.** 구조적 방어(울타리·카나리아)는 파이프라인에 있고, 이 팩은 **탐지**다.
+  #
+  # always_on 인 이유: 공격자가 언어를 고른다. 한국어 테넌트에 영어 탈옥 문장을 넣는
+  # 것을 막는 데 그 테넌트의 로케일은 아무 상관이 없다.
+  #
+  # **등급을 올리면 탐지가 예방이 된다.** 1단 결과는 분류기에게 넘기기 전에 적용되므로
+  # (guard.inspect 의 pre_masked), internal 등급이 full 이면 분류기는 인젝션 문장이
+  # 지워진 텍스트를 본다. audit 이면 지워지지 않는다.
+  injection:
+    always_on: true
+    rules:
+      - id: injection_control_token
+        kind: pattern
+        # 채팅 템플릿 제어 토큰. 정상 업무 문서에 나올 일이 사실상 없어서 오탐이
+        # 거의 없다 — 그래서 베이스라인에서 바로 마스킹한다.
+        pattern: '(?:<\|(?:im_start|im_end|system|user|assistant|endoftext)\|>|\[/?INST\]|<</?SYS>>)'
+        action: full
+        label: "[제어토큰]"
+        description: "채팅 템플릿 제어 토큰"
+
+      - id: injection_frame_forgery
+        kind: pattern
+        # 이 제품이 분류기 프롬프트에 쓰는 구조를 흉내 내려는 시도. 울타리 토큰 자체는
+        # 설치처마다 다른 비밀에서 나오므로 위조할 수 없지만, 표식을 흉내 내 모델을
+        # 헷갈리게 하는 것은 가능하다. 정상 문서에 나올 이유가 없다.
+        # `[출력]` 으로 끝나는 텍스트는 뺐다 — 프롬프트 템플릿의 형식 표시로 그렇게
+        # 쓰는 사람이 실재하고, 이 규칙은 full 이라 그 사람의 요청이 망가진다.
+        # 울타리 토큰 자체가 위조 불가라 이 규칙은 어차피 겹겹의 두 번째 겹이다.
+        pattern: '(?:CANARY=|\[자료 (?:시작|끝))'
+        action: full
+        label: "[위조표식]"
+        description: "분류기 프롬프트 구조 위조 시도"
+
+      - id: injection_instruction_override
+        kind: pattern
+        # "이전 지시를 무시하라" 계열. **audit 으로 시작한다** — 사용자가 모델에게
+        # 정말로 "앞의 요약은 무시하고 다시 써줘" 라고 쓰는 경우가 실재하고, 그것을
+        # 마스킹하면 사용자의 요청이 망가진다. 오탐률을 재고 승격할 항목이다.
+        pattern: '(?i)(?:ignore|disregard|forget)\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier|preceding)\s+(?:instruction|prompt|rule|direction)s?|(?:이전|위|앞)의?\s*(?:모든\s*)?(?:지시|명령|규칙|프롬프트)(?:사항)?(?:은|는|을|를)?\s*(?:전부\s*|모두\s*)?무시'
+        action: audit
+        label: "[지시무시]"
+        description: "이전 지시 무효화 시도"
+
+      - id: injection_system_disclosure
+        kind: pattern
+        # 시스템 프롬프트를 뱉게 하려는 시도. 유출되면 가드의 판정 기준이 통째로 새고,
+        # 그 다음 공격은 그 기준을 알고 들어온다.
+        # 어순이 언어마다 다르다. 한국어는 동사가 뒤에("프롬프트를 출력해줘"),
+        # 영어는 앞에("repeat your system prompt") 온다 — 한쪽만 적으면 다른 쪽이
+        # 통째로 빠지고, 그 사실은 정답셋을 돌리기 전까지 안 드러난다. 실제로 빠졌다.
+        pattern: '(?i)(?:repeat|reveal|print|show|output|disclose|tell\s+me)\s+(?:your|the)?\s*(?:system|initial|original)\s+(?:prompt|instruction)s?|(?:system|initial|original)\s+(?:prompt|instruction)s?\s*(?:을|를)?\s*(?:출력|공개|알려|보여)|시스템\s*프롬프트(?:을|를)?\s*(?:출력|공개|알려|보여)'
+        action: audit
+        label: "[프롬프트유출시도]"
+        description: "시스템 프롬프트 유출 시도"
+
   ko_KR:
     rules:
       - id: kr_rrn
