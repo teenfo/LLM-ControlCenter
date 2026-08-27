@@ -274,7 +274,8 @@ HTTP (Starlette)                                              main.py · meta.py
 배경        레인 루프 · 헬스 · 모델 설치 · 보존 · 감시         scheduler.py · models.py
 운영        알림 · 메트릭 · 구조화 로그 · 진단 번들            notify.py · observability.py
 설치        부트스트랩 · CLI · 백업 스냅샷 · 복원              bootstrap.py · cli.py ·
-                                                              backup.py · restore.py
+                                                              backup.py · restore.py ·
+                                                              cli_paths.py
 설정                                                          config.py · i18n.py
 ```
 
@@ -297,6 +298,19 @@ HTTP (Starlette)                                              main.py · meta.py
 
 캐시는 두지 않는다. 무효화를 빠뜨린 캐시가 이 저장소에서 이미 한 번 사고를 냈다
 (가드 정규식 캐시 — 관리자가 고친 규칙이 재기동 전까지 옛 규칙으로 돌았다).
+
+### `cli_paths.py` — 저장소 배치와 설치본 배치가 다르다
+
+저장소에서는 `config/`·`locales/`·`static/`·`clients/` 가 루트에 있고, 휠로
+설치하면 `app/bundled_*/` 안에 들어간다. 디렉터리를 실제로 옮기지 않는 이유는
+컴포즈의 `./config:/app/config:ro` 마운트와 설치 문서가 그 경로를 쓰기 때문이다.
+
+한쪽만 보면 다른 쪽에서 깨진다. 실제로 `pip install .` 로 설치한 것은 **기동조차
+못 했다** — `-e` 설치와 도커 WORKDIR 에서만 도는 패키징이었고, 그 둘을 벗어나는
+순간 `설정 파일이 없다: .../site-packages/config/nodes.yaml` 로 죽었다.
+
+`main` 과 `cli` 가 둘 다 이 해석을 필요로 하는데 `main` → `cli` 임포트는
+순환이라 별도 모듈로 뒀다.
 
 ### `restore.py` — 위험한 부분을 쉘에 두지 않는다
 

@@ -1,0 +1,60 @@
+# 역할 = 모델 정책. 두 줄 계약:
+#   1. 역할 이름이 계약이고, 모델은 정책이다 — 소비자는 모델명을 하드코딩하지 않는다.
+#   2. 프롬프트는 호출자 소유다 — 요청의 system 이 우선하고, 없을 때만 아래 기본값을 쓴다.
+#
+# 클러스터가 되면서 "정책"의 범위가 넓어졌다. 역할 이름 뒤에서 바뀌는 것이 이제 모델뿐 아니라
+# 어느 기계에서 도는지(placement), 돈이 드는지, 데이터가 어디까지 가는지까지다.
+#
+# placement 의 티어는 노드의 tags 또는 노드 이름과 매칭된다. 선언 순서가 곧 선호도이며,
+# 이 순서는 모델 친화·부하 같은 성능 휴리스틱보다 항상 우선한다.
+# placement 에 external 티어를 적지 않으면 그 역할은 절대 경계 밖으로 나가지 않는다.
+
+summarize:
+  model: demo-small
+  kind: generate
+  lane: interactive
+  timeout: 120
+  options: {temperature: 0.2}
+  placement: [internal, external]      # 내부 우선, 없으면 경계 밖으로 폴백
+  tier_models:
+    external: demo-cloud
+  system: "주어진 문서를 핵심만 간결하게 요약한다. 원문에 없는 사실을 추가하지 않는다."
+
+classify:
+  model: demo-medium
+  kind: generate
+  lane: interactive
+  timeout: 120
+  options: {temperature: 0.0}
+  placement: [internal]                # 경계 밖으로 나가지 않는다
+  max_prompt_chars: 40000
+
+analyze:
+  model: demo-medium
+  kind: generate
+  lane: batch
+  timeout: 300
+  options: {temperature: 0.3}
+  placement: [internal]
+
+embed:
+  model: demo-small
+  kind: embed                          # 큐 밖 동기 경로. 단 배치·경계·비용은 우회하지 않는다
+  lane: batch
+  timeout: 60
+  placement: [internal]
+
+# 가드 2단 분류 전용 역할.
+# placement 가 internal 로 고정된 것이 이 제품의 핵심 안전장치다 —
+# "이거 민감해?"를 물으려고 원문을 경계 밖으로 보내면 필터가 스스로 유출 경로가 된다.
+# 이 역할은 guard 레인에서 돈다. 대형 batch 잡 뒤에 줄 서면 필터 한 번에 수 분이 걸리고,
+# 보안 경로가 head-of-line blocking 에 걸리는 것은 설계 실패다.
+_guard_classify:
+  model: guard-classifier
+  kind: generate
+  lane: guard
+  timeout: 20
+  options: {temperature: 0.0}
+  placement: [internal]
+  internal_only: true                  # 설정으로도 external 티어를 추가할 수 없다
+  max_prompt_chars: 40000

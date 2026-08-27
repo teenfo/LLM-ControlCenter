@@ -138,8 +138,6 @@
   "ui.revoke": "Revoke",
   "ui.token_shown_once": "This value is shown only now. Save it.",
   "ui.register_node": "Register node",
-  "ui.api_key_env": "API key env var",
-  "ui.auth_header_env": "Auth header env var",
   "ui.drain": "Drain",
   "ui.undrain": "Undrain",
   "ui.approve": "Approve",

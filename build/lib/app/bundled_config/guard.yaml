@@ -1,0 +1,177 @@
+# 플랫폼 베이스라인 가드 규칙 = 하한선.
+# 테넌트는 이 위에 규칙을 더하거나 등급을 올릴 수만 있고, 낮추거나 끌 수 없다.
+# 테넌트가 플랫폼의 PII 차단을 끌 수 있으면 제품의 보증 자체가 사라지기 때문이다.
+#
+# 등급:  off | audit | partial | full | block
+#   audit   — 통과시키되 탐지 사실만 기록. 새 규칙의 오탐률을 재는 용도
+#   partial — keep_tail 만큼 남기고 마스킹
+#   full    — 전체 치환
+#   block   — 요청 거부(422). 원문은 응답에 싣지 않는다
+# 티어별로 다르게 줄 수 있다:  action: {internal: audit, external: block}
+
+settings:
+  # 2단 분류가 실패했을 때. 분류 실패는 "민감하지 않음" 판정이 아니다.
+  on_classifier_error: mask          # block | mask | allow
+
+  # 원문 암호문 보존 기간. 테넌트 관리자가 조정한다.
+  raw_prompt_retention_days: 7
+
+  # 이 크기를 넘는 프롬프트의 1단 정규식은 스레드 풀로 넘긴다.
+  # 안 하면 200KB 프롬프트 한 건이 이벤트 루프를 40~80ms 잡아 다른 모든 요청을 세운다.
+  stage1_threadpool_threshold_bytes: 16384
+
+  # audit -> block 승격 게이트. 정답셋 기준 오탐률이 이보다 높으면 승격을 거부한다.
+  promotion_max_false_positive_rate: 0.02
+
+  # 2단 분류 모델 등록 게이트. 구조화 출력 준수율이 이보다 낮으면 등록을 거부한다.
+  # hybrid thinking 계열은 structured output 이 깨지는 미해결 이슈가 있어 여기 걸린다.
+  classifier_min_schema_compliance: 0.98
+
+# 로케일 팩 — i18n 의 진짜 영향은 번역이 아니라 이것이다.
+# 개인정보의 "형태" 자체가 나라마다 다르므로, 팩을 안 켜면 그 나라 PII 는 안 잡힌다.
+# 안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.
+locale_packs:
+
+  common:
+    always_on: true                  # 로케일과 무관하게 항상 켜진다
+    rules:
+      - id: credit_card
+        kind: pattern
+        pattern: '\b(?:\d[ -]?){12,18}\d\b'
+        checksum: luhn               # 체크섬이 없으면 숫자 나열이 전부 카드가 된다
+        action: full
+        label: "[카드번호]"
+
+      - id: email
+        kind: pattern
+        pattern: '\b[\w.+-]+@[\w-]+\.[\w.-]+\b'
+        action: audit                # 오탐이 아니라 "정상 업무 데이터"인 경우가 많다
+        label: "[이메일]"
+
+      - id: iban
+        kind: pattern
+        # IBAN 은 관례상 4자리씩 띄어 쓴다. 붙여쓴 형태만 잡으면 실제 문서의 대부분을
+        # 놓친다 — 구분자를 허용하고 체크섬이 비영숫자를 걷어낸다.
+        pattern: '\b[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]){11,30}\b'
+        checksum: iban_mod97
+        action: full
+        label: "[계좌번호]"
+
+      - id: ipv4
+        kind: pattern
+        # 앞뒤로 숫자나 점이 더 붙으면 IP 가 아니다. 이 lookaround 가 없으면
+        # 버전 문자열(1.2.3.4.5)에서 앞 네 마디가 IP 로 잡힌다 — 버전 번호는
+        # 문서에 흔해서 이 오탐 하나가 규칙을 통째로 꺼버리게 만든다.
+        pattern: '(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])'
+        action: audit
+        label: "[IP]"
+
+  ko_KR:
+    rules:
+      - id: kr_rrn
+        kind: pattern
+        # 7번째 자리: 1-4 내국인, 5-8 외국인등록번호. 1-4 만 보면 외국인등록번호가
+        # 통째로 빠진다 — 그것도 이 나라에서 개인을 특정하는 번호다.
+        pattern: '\b\d{6}[-\s]?[1-8]\d{6}\b'
+        checksum: kr_rrn             # 체크섬 없이는 13자리 숫자가 전부 걸린다
+        # **2020-10 부여체계 개편으로 뒷자리가 임의번호가 됐다.**
+        # 그 이후 발급·재발급된 번호는 검증식이 성립하지 않아 약 90% 가
+        # "체크섬 실패 = PII 아님" 으로 읽히고 마스킹 없이 통과한다(실측).
+        #
+        # 체크섬을 빼면 13자리 숫자가 전부 걸려 오탐이 쏟아지고, 오탐이 쏟아지면
+        # 관리자가 규칙을 꺼버린다 — 안 켜진 필터는 없는 필터다(C2).
+        # 그래서 버리지 않고 `audit` 로 남긴다: 마스킹하지 않으므로 오탐 피해가
+        # 없고, **얼마나 지나가고 있는지가 보인다.** 오탐률을 재고 나면 관제
+        # UI 에서 `kr_rrn:unverified` 를 승격시키면 된다 — 그것이 audit 등급의 용도다.
+        checksum_failed_action: audit
+        action: full
+        label: "[주민등록번호]"
+
+      - id: kr_biz_no
+        kind: pattern
+        pattern: '\b\d{3}-?\d{2}-?\d{5}\b'
+        checksum: kr_biz
+        action: full
+        label: "[사업자등록번호]"
+
+      - id: kr_phone
+        kind: pattern
+        pattern: '\b01[016789][-\s]?\d{3,4}[-\s]?\d{4}\b'
+        action: partial
+        keep_tail: 4
+        label: "[휴대폰]"
+
+      - id: kr_passport
+        kind: pattern
+        pattern: '\b[MSRO]\d{8}\b'
+        action: audit
+        label: "[여권번호]"
+
+  en_US:
+    rules:
+      - id: us_ssn
+        kind: pattern
+        pattern: '\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b'
+        action: full
+        label: "[SSN]"
+
+      - id: us_ein
+        kind: pattern
+        pattern: '\b\d{2}-\d{7}\b'
+        action: audit
+        label: "[EIN]"
+
+      - id: us_phone
+        kind: pattern
+        pattern: '\b(?:\+1[-\s]?)?\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4}\b'
+        action: partial
+        keep_tail: 4
+        label: "[PHONE]"
+
+  ja_JP:
+    rules:
+      - id: jp_mynumber
+        kind: pattern
+        pattern: '\b\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
+        checksum: jp_mynumber
+        action: full
+        label: "[マイナンバー]"
+
+      - id: jp_phone
+        kind: pattern
+        pattern: '\b0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}\b'
+        action: partial
+        keep_tail: 4
+        label: "[電話番号]"
+
+# 2단 — 관리자가 문장으로 정의하는 "맥락". 패턴으로는 안 잡히고 문장으로만 드러나는 민감성.
+# 로케일과 무관하므로 팩 밖에 둔다.
+context_rules:
+  - id: medical_context
+    kind: llm
+    description: "환자 진료 기록, 병명, 처방 내역, 검사 결과가 포함된 내용"
+    action: audit
+    label: "[의료정보]"
+
+  - id: hr_evaluation
+    kind: llm
+    description: "특정 개인에 대한 인사 평가, 징계, 급여 협상 내용"
+    action: audit
+    label: "[인사정보]"
+
+  - id: undisclosed_financials
+    kind: llm
+    description: "공시 전 재무 수치, 실적 추정치, 미공개 계약 조건"
+    action: {internal: audit, external: block}   # 안에서는 보되 밖으로는 안 내보낸다
+    label: "[미공개재무]"
+
+# 베이스라인 등급을 왜 이렇게 잡았나
+#
+# 체크섬으로 검증되는 규칙(주민번호·카드·IBAN·마이넘버)은 오탐률이 낮으므로 full(마스킹)로 시작한다.
+# 마스킹은 요청을 막지 않으므로 도입 첫날 프로덕션을 세우지 않는다.
+#
+# 패턴만 있는 규칙(이메일·IP·EIN)과 2단 맥락 규칙은 audit 으로 시작한다.
+# 새 규칙을 바로 block 으로 켜면 오탐이 쏟아지고, 오탐이 쏟아지면 관리자가 규칙을 꺼버린다.
+# audit 로 며칠 재고 오탐 검토 큐에서 오탐률을 확인한 뒤 승격시키는 것이 의도한 운영 흐름이다.
+#
+# block 은 베이스라인에 하나도 없다. 차단은 설치처가 자기 데이터를 보고 결정할 일이다.

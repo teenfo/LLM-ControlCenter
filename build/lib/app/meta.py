@@ -119,15 +119,6 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "tenant_settings": ("테넌트 설정 — 기본 로케일·원문 보관 기간·예산.", "tenant_admin", False),
     "tenant_overrides": ("역할 오버라이드 조회·설정·해제.", "tenant_admin", False),
     "tenant_jobs": ("자기 테넌트의 작업 목록. 마스킹본만 보인다.", "tenant_admin", False),
-    "ui_index": (
-        "관제 UI 첫 화면. `app.js` 참조에 버전을 박아 내보낸다 — "
-        "정적으로 내보내면 업그레이드 후 브라우저가 캐시한 옛 JS 를 새 API 에 대고 돈다.",
-        "public", False,
-    ),
-    "ui_index_slash": (
-        "관제 UI 첫 화면(슬래시 포함). `ui_index` 와 같다.",
-        "public", False,
-    ),
     "tenant_job_raw": ("원문 단건 복호화. **열람 자체가 감사에 남는다.**", "tenant_admin", False),
     "tenant_job_review": (
         "크래시 복구가 남긴 `needs_review` 잡을 사람이 종결시킨다. "

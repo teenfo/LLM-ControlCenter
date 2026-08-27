@@ -22,12 +22,7 @@ from typing import Any, Callable, Mapping
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import (
-    HTMLResponse,
-    JSONResponse,
-    PlainTextResponse,
-    Response,
-)
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -1553,20 +1548,6 @@ async def platform_evals(request: Request) -> Response:
     return _ok(request, {"results": [r.as_metrics() for r in results]})
 
 
-async def ui_index(request: Request) -> Response:
-    """관제 UI 의 첫 화면. **`app.js` 참조에 버전을 박아 내보낸다.**
-
-    인증은 없다 — 이 화면 자체는 토큰 입력 폼이고, 데이터는 전부 인증된 API 에서
-    가져온다. 정적 파일로 그냥 내보내던 것과 같은 노출 범위다.
-    """
-    ctx: AppContext = request.app.state.ctx
-    path = ctx.static_dir / "index.html"
-    if not path.is_file():
-        raise ApiError("not_found", status=404)
-    html = path.read_text(encoding="utf-8").replace("__VERSION__", ctx.version)
-    return HTMLResponse(html)
-
-
 async def metrics(request: Request) -> Response:
     """Prometheus/OpenMetrics.
 
@@ -1725,11 +1706,5 @@ def _routes(ctx: AppContext) -> list[Any]:
     ]
     if ctx.static_dir.is_dir():
         # 관제 UI. 외부 CDN 을 쓰지 않으므로 전부 여기서 나간다.
-        #
-        # `index.html` 만 따로 낸다 — **`app.js` 참조에 버전을 박아야 하기 때문**이다.
-        # 정적으로 내보내면 업그레이드 후에도 브라우저가 캐시한 옛 JS 를 새 API 에
-        # 대고 돌리고, 그 증상은 "일부 화면만 이상하다" 로 나타나서 원인을 찾기 어렵다.
-        routes.append(Route("/ui", ui_index, name="ui_index"))
-        routes.append(Route("/ui/", ui_index, name="ui_index_slash"))
         routes.append(Mount("/ui", StaticFiles(directory=ctx.static_dir, html=True), name="ui"))
     return routes

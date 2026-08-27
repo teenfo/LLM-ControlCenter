@@ -18,7 +18,6 @@ const state = {
   session: null,
   tab: null,
   strings: {},
-  refreshTimer: null,
 };
 
 // ── 문자열 ────────────────────────────────────────────────────────────────
@@ -239,50 +238,21 @@ function renderTabs() {
   }
 }
 
-//: 자동 갱신 주기(ms). **노드가 죽어도 새로고침 전까지 과거 화면을 본다** —
-//: 관제 화면이 과거를 보여주면 그건 관제가 아니다.
-const REFRESH_INTERVAL_MS = 15000;
-
-//: 진행 중인 갱신의 세대. 탭을 빠르게 옮기면 **먼저 시작한 요청이 나중에 도착해**
-//: 이전 탭의 내용을 현재 탭 위에 그린다 — 세대가 어긋난 결과는 버린다.
-let refreshGeneration = 0;
-
-async function refresh(options) {
-  const quiet = options && options.quiet;
+async function refresh() {
   const tabs = tabsFor(state.session);
   const tab = tabs.find((x) => x.id === state.tab) || tabs[0];
   state.tab = tab.id;
   renderTabs();
 
-  const generation = ++refreshGeneration;
   const view = $('view');
-  // 자동 갱신은 화면을 비우지 않는다 — 15초마다 깜빡이면 읽을 수가 없다.
-  if (!quiet) view.replaceChildren(el('p', { class: 'muted', text: t('ui.loading') }));
+  view.replaceChildren(el('p', { class: 'muted', text: t('ui.loading') }));
   try {
     const nodes = await tab.render();
-    if (generation !== refreshGeneration) return;   // 지나간 탭의 결과다
     view.replaceChildren.apply(view, [].concat(nodes));
   } catch (err) {
-    if (generation !== refreshGeneration) return;
-    if (!quiet) {
-      showError(err);
-      view.replaceChildren(el('p', { class: 'muted', text: t('ui.empty') }));
-    }
+    showError(err);
+    view.replaceChildren(el('p', { class: 'muted', text: t('ui.empty') }));
   }
-}
-
-function startAutoRefresh() {
-  if (state.refreshTimer) clearInterval(state.refreshTimer);
-  state.refreshTimer = setInterval(() => {
-    // 탭이 안 보이면 안 부른다 — 열어 둔 탭이 서버를 계속 두드릴 이유가 없다.
-    if (document.hidden || !state.token) return;
-    refresh({ quiet: true });
-  }, REFRESH_INTERVAL_MS);
-}
-
-function stopAutoRefresh() {
-  if (state.refreshTimer) clearInterval(state.refreshTimer);
-  state.refreshTimer = null;
 }
 
 // ── 플랫폼: 개요 ──────────────────────────────────────────────────────────
@@ -408,14 +378,6 @@ function registerNodeForm() {
         data_boundary: boundary.value,
         base_url: fields.base_url.value.trim() || undefined,
         max_concurrent: Number(fields.max_concurrent.value) || 1,
-        // **경계 밖 노드는 서버가 TLS + 인증을 강제한다**(D9). 폼에 입력 수단이
-        // 없어서 external 노드 등록이 항상 실패했다 — 화면에 있는데 절대 안 되는
-        // 기능이 가장 나쁘다.
-        //
-        // 값이 아니라 **환경 변수 이름**을 받는다. 자격증명 자체를 DB 에 넣으면
-        // 백업·내보내기·진단 번들이 전부 그것을 나르게 된다.
-        api_key_env: fields.api_key_env.value.trim() || undefined,
-        auth_header_env: fields.auth_header_env.value.trim() || undefined,
       };
       try {
         const result = await api('/v1/platform/nodes', { method: 'POST', body });
@@ -432,8 +394,6 @@ function registerNodeForm() {
     el('div', {}, [el('label', { for: 'node-boundary', text: t('ui.boundary_internal') }), boundary]),
     input('base_url', 'base_url', 'url'),
     input('max_concurrent', t('ui.concurrency'), 'number'),
-    input('api_key_env', t('ui.api_key_env')),
-    input('auth_header_env', t('ui.auth_header_env')),
     el('button', { class: 'primary', type: 'submit', text: t('ui.create') }),
   ]);
 }
@@ -1025,11 +985,9 @@ async function connect(token) {
   $('login').hidden = true;
   $('shell').hidden = false;
   await refresh();
-  startAutoRefresh();
 }
 
 function disconnect() {
-  stopAutoRefresh();
   state.token = null;
   state.session = null;
   try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) { /* 무시 */ }

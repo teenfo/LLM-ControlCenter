@@ -232,18 +232,9 @@ def collect(
 
     # -- 알림 --
     if notifier is not None:
-        # **"발송" 과 "발생" 은 다르다.**
-        #
-        # `history` 는 채널이 하나도 없어도, 전 채널이 실패해도 늘어난다. 그것을
-        # `sent` 라고 부르면 대시보드가 "알림이 나가고 있다" 고 말하는데 실제로는
-        # 아무 데도 안 간다 — 알림이 막으려던 상황이 정확히 그것이다.
         gauge(
-            "notifications_raised", "발생한 알림 사건 수(채널 도달 여부와 무관)",
+            "notifications_sent", "발송한 알림 수",
             [({}, float(len(notifier.history)))],
-        )
-        gauge(
-            "notification_channels", "붙어 있는 알림 채널 수. 0 이면 아무 데도 안 간다",
-            [({}, float(len(notifier.channel_names)))],
         )
 
     # -- 임계값 -- 문서·UI·경고가 같은 값을 인용하도록 노출한다.

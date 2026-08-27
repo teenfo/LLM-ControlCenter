@@ -802,3 +802,57 @@ def test_the_response_language_follows_the_request(client, acme):
         "/v1/roles", headers={**auth(acme["service"]), "Accept-Language": "en-US"}
     )
     assert ko.headers["content-language"] != en.headers["content-language"]
+
+
+# ── 감사 LOW — 무한 성장과 메트릭 의미 ──────────────────────────────────────
+
+
+def test_the_notification_history_is_bounded():
+    """상시 구동 프로세스에서 무한 리스트는 그냥 누수다."""
+    from app.notify import MAX_HISTORY, Notifier
+
+    notifier = Notifier([], now=FakeClock(), min_interval_seconds=0.0)
+    for n in range(MAX_HISTORY + 50):
+        notifier.send("node_offline", node=f"n{n}")
+
+    assert len(notifier.history) == MAX_HISTORY
+
+
+def test_the_mock_call_log_is_bounded():
+    """**Demo 프로파일은 상시 구동 대상이다** — 며칠 켜 둔 시연 노트북에서 샌다."""
+    import asyncio as _asyncio
+
+    from app.config import Node
+    from app.providers.mock import MAX_CALL_LOG, MockProvider
+
+    provider = MockProvider(Node(name="d", provider="mock", models=("m",)))
+
+    async def hammer():
+        for _ in range(MAX_CALL_LOG + 50):
+            await provider.generate(model="m", prompt="x")
+
+    _asyncio.run(hammer())
+    assert len(provider.call_log) == MAX_CALL_LOG
+
+
+def test_the_metric_does_not_claim_delivery_it_cannot_see(harness, client, acme):
+    """**"발송" 과 "발생" 은 다르다.**
+
+    `history` 는 채널이 하나도 없어도, 전 채널이 실패해도 늘어난다. 그것을 `sent`
+    라고 부르면 대시보드가 "알림이 나가고 있다" 고 말하는데 실제로는 아무 데도
+    안 간다 — 알림이 막으려던 상황이 정확히 그것이다.
+    """
+    body = client.get("/metrics", headers=auth(acme["platform_admin"])).text
+
+    assert "llmcc_notifications_sent" not in body
+    assert "llmcc_notifications_raised" in body
+    assert "llmcc_notification_channels" in body
+
+
+def test_the_channel_count_is_visible(harness, client, acme):
+    """0 이면 아무 데도 안 간다 — 그 사실이 대시보드에 있어야 한다."""
+    harness.notifier._channels.clear()
+    body = client.get("/metrics", headers=auth(acme["platform_admin"])).text
+
+    line = next(l for l in body.splitlines() if l.startswith("llmcc_notification_channels"))
+    assert line.endswith("0.0")

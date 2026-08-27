@@ -1128,3 +1128,64 @@ def test_scripts_resolve_the_interpreter_the_same_way(name):
     text = (ROOT / name).read_text(encoding="utf-8")
     assert 'PY="${LCC_PYTHON:-python3}"' in text
     assert 'command -v "$PY"' in text
+
+
+# ── 감사 LOW — `pip install .` 로는 기동조차 못 했다 ────────────────────────
+
+
+def test_the_wheel_carries_the_bundled_assets():
+    """`include = ["app*"]` 만 두면 config·locales·static·clients 가 배포물에서 빠진다.
+
+    실측으로 `설정 파일이 없다: .../site-packages/config/nodes.yaml` 로 죽었다 —
+    **`-e` 설치와 도커 WORKDIR 에서만 도는 패키징**이었다.
+    """
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        config = tomllib.load(handle)
+
+    mapping = config["tool"]["setuptools"]["package-dir"]
+    assert mapping["app.bundled_config"] == "config"
+    assert mapping["app.bundled_locales"] == "locales"
+    assert mapping["app.bundled_static"] == "static"
+    assert mapping["app.bundled_clients"] == "clients"
+
+    data = config["tool"]["setuptools"]["package-data"]
+    assert "*.yaml" in data["app.bundled_config"]
+    assert "*.json" in data["app.bundled_locales"]
+
+
+def test_asset_lookup_handles_both_layouts():
+    """저장소에서는 루트에, 설치본에서는 패키지 아래에 있다 — 한쪽만 보면 깨진다."""
+    from app.cli_paths import PACKAGE, ROOT as APP_ROOT, bundled
+
+    # 이 저장소에서 돌 때는 루트를 본다.
+    assert bundled("config") == APP_ROOT / "config"
+    assert bundled("config").is_dir()
+
+    # 설치본 배치는 이름 규칙으로 찾는다.
+    assert (PACKAGE / "bundled_config").name == "bundled_config"
+
+
+@pytest.mark.parametrize("name", ["config", "locales", "static", "clients"])
+def test_every_bundled_asset_resolves(name):
+    from app.cli_paths import bundled
+
+    assert bundled(name).is_dir(), name
+
+
+def test_nothing_hardcodes_the_repo_layout_for_assets():
+    """`ROOT / "static"` 같은 직접 조립이 남아 있으면 설치본에서 그 경로가 없다."""
+    import re
+
+    offenders = []
+    for path in (ROOT / "app").rglob("*.py"):
+        if path.name == "cli_paths.py":
+            continue
+        source = path.read_text(encoding="utf-8")
+        for number, line in enumerate(source.splitlines(), 1):
+            if re.search(r'parent\.parent\s*/\s*"(config|locales|static|clients)"', line):
+                offenders.append(f"{path.name}:{number}")
+            if re.search(r'ROOT\s*/\s*"(config|locales|static|clients)"', line):
+                offenders.append(f"{path.name}:{number}")
+    assert not offenders, f"저장소 배치를 직접 조립한다: {offenders}"

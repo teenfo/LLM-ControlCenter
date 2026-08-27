@@ -411,3 +411,45 @@ def test_an_unbound_caller_cannot_open_a_bound_ciphertext(harness, client, acme)
         harness.vault.open(
             wrapped, Sealed(nonce=row.prompt_nonce, ciphertext=row.prompt_cipher)
         )
+
+
+# ── 감사 LOW — 내보내기가 전량을 메모리에 올린다 ────────────────────────────
+
+
+def test_the_export_is_capped(harness, client, acme, monkeypatch):
+    """512MB 프로파일에서 전량 적재가 프로세스를 죽인다."""
+    import app.store as store_module
+
+    monkeypatch.setattr(store_module, "EXPORT_ROW_LIMIT", 3)
+    scope = TenantScope("acme")
+    for _ in range(6):
+        harness.store.create_job(
+            scope, service_id="acme-web", role="r", lane="interactive", prompt_masked="x",
+        )
+
+    body = harness.store.export_tenant(scope)
+    assert len(body["jobs"]) == 3
+
+
+def test_a_truncated_export_says_so(harness, monkeypatch):
+    """**조용히 자르면 설치처는 그것을 전량으로 믿고 원본을 지운다.**"""
+    import app.store as store_module
+
+    monkeypatch.setattr(store_module, "EXPORT_ROW_LIMIT", 2)
+    scope = TenantScope("acme")
+    for _ in range(5):
+        harness.store.create_job(
+            scope, service_id="acme-web", role="r", lane="interactive", prompt_masked="x",
+        )
+
+    body = harness.store.export_tenant(scope)
+    assert body["truncated"]["jobs"] is True
+    assert body["row_limit"] == 2
+
+
+def test_a_small_export_is_not_marked_truncated(harness, client, acme):
+    submit(client, acme, prompt="하나")
+    body = harness.store.export_tenant(TenantScope("acme"))
+
+    assert body["truncated"]["jobs"] is False
+    assert body["jobs"]

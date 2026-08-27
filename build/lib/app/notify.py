@@ -46,10 +46,6 @@ log = logging.getLogger("llmcc.notify")
 #: 블로킹 채널 발송용 스레드 풀. **알림은 저빈도**라 작게 잡고, 프로세스 전체가
 #: 하나를 나눠 쓴다 — 알림기마다 풀을 두면 테스트에서만 수십 개가 생긴다.
 #: 큐가 밀리면 발송이 늦어질 뿐 요청 경로는 그대로다(그게 넘긴 이유다).
-#: 진단용 이력의 상한. 관제 UI 는 최근 20건만 보여주고, 그보다 오래된 것은
-#: 감사와 구조화 로그에 남는다 — 여기 무한히 쌓을 이유가 없다.
-MAX_HISTORY = 500
-
 _POOL_WORKERS = 4
 _pool_lock = threading.Lock()
 _shared_pool: futures.ThreadPoolExecutor | None = None
@@ -355,10 +351,6 @@ class Notifier:
 
         body = self._render(event, clean)
         self.history.append({"ts": now, "event": event, "detail": clean, "body": body})
-        if len(self.history) > MAX_HISTORY:
-            # **상시 구동 프로세스에서 무한 리스트는 그냥 누수다.** 이력은 진단용이라
-            # 최근 것만 있으면 되고, 오래된 것은 감사와 로그에 남는다.
-            del self.history[:-MAX_HISTORY]
 
         for channel in self._channels:
             self._deliver(channel, f"LLM ControlCenter · {event}", body, clean, event)

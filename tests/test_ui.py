@@ -315,3 +315,78 @@ def test_the_missing_model_endpoint_actually_returns_it(harness, client, acme):
     ).json()
     assert body["missing"], "역할이 요구하는 모델이 없는데 missing 이 비어 있다"
     assert {"node", "model"} <= set(body["missing"][0])
+
+
+# ── 감사 LOW — 자원·UI ──────────────────────────────────────────────────────
+
+
+def test_the_script_reference_carries_a_version():
+    """**업그레이드 후 브라우저가 캐시한 옛 JS 를 새 API 에 대고 돈다.**
+
+    증상은 "일부 화면만 이상하다" 로 나타나서 원인을 찾기 어렵다.
+    """
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert "app.js?v=" in html
+
+
+def test_the_served_index_substitutes_the_real_version(client):
+    """플레이스홀더가 그대로 나가면 버전이 안 바뀌어 캐시버스팅이 아니다."""
+    from app.main import VERSION
+
+    response = client.get("/ui")
+    assert response.status_code == 200
+    assert "__VERSION__" not in response.text
+    assert f"app.js?v={VERSION}" in response.text
+
+
+def test_the_ui_refreshes_itself():
+    """노드가 죽어도 새로고침 전까지 과거 화면을 본다 — 그건 관제가 아니다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "startAutoRefresh" in source
+    assert "REFRESH_INTERVAL_MS" in source
+    assert "document.hidden" in source, "안 보이는 탭도 서버를 두드린다"
+
+
+def test_a_stale_refresh_does_not_paint_over_the_current_tab():
+    """탭을 빠르게 옮기면 먼저 시작한 요청이 나중에 도착해 이전 탭 내용을 그린다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "refreshGeneration" in source
+    assert "generation !== refreshGeneration" in source
+
+
+def test_the_node_form_can_supply_authentication():
+    """**경계 밖 노드는 서버가 TLS + 인증을 강제한다**(D9).
+
+    폼에 입력 수단이 없어서 external 노드 등록이 항상 실패했다 — 화면에 있는데
+    절대 안 되는 기능이 가장 나쁘다.
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    form = source[source.index("function registerNodeForm"):]
+    form = form[:form.index("\nfunction ")]
+
+    assert "api_key_env" in form
+    assert "auth_header_env" in form
+
+
+def test_the_form_takes_env_var_names_not_secrets():
+    """자격증명 자체를 DB 에 넣으면 백업·내보내기·진단 번들이 전부 그것을 나른다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    form = source[source.index("function registerNodeForm"):]
+    form = form[:form.index("\nfunction ")]
+
+    assert "api_key:" not in form and "auth_header:" not in form
+
+
+def test_an_external_node_registered_with_auth_is_accepted(harness, client, acme, monkeypatch):
+    """폼을 고쳤는데 서버가 여전히 거절하면 소용없다 — 양쪽을 함께 못박는다."""
+    monkeypatch.setenv("DEMO_NODE_KEY", "secret")
+
+    response = client.post(
+        "/v1/platform/nodes",
+        json={
+            "name": "rented", "provider": "mock", "data_boundary": "external",
+            "base_url": "https://rented.example", "api_key_env": "DEMO_NODE_KEY",
+        },
+        headers=auth(acme["platform_admin"]),
+    )
+    assert response.status_code in (200, 201), response.text

@@ -30,10 +30,6 @@ from .base import (
 EMBED_DIMENSIONS = 8
 
 
-#: 호출 기록의 상한. 시연을 며칠 켜 둬도 메모리가 늘지 않게.
-MAX_CALL_LOG = 1000
-
-
 class MockProvider:
     """제어 가능한 가짜 백엔드.
 
@@ -68,8 +64,6 @@ class MockProvider:
         self.fail_next = 0            # 다음 N회 호출을 실패시킨다
         self.fail_retryable = True
         self.installed: set[str] = set(self._models)
-        #: 데모·테스트용 호출 기록. **Demo 프로파일은 상시 구동 대상이라**
-        #: 상한이 없으면 며칠 켜 둔 시연 노트북에서 그냥 메모리 누수다.
         self.call_log: list[dict[str, Any]] = []
 
     # -- 연출 --------------------------------------------------------------
@@ -108,7 +102,7 @@ class MockProvider:
         if self.capabilities.requires_model_install and model not in self.installed:
             raise ModelNotFound(model, self.node_name)
 
-        self._log({"op": "generate", "model": model, "chars": len(prompt)})
+        self.call_log.append({"op": "generate", "model": model, "chars": len(prompt)})
         self._loaded = model
 
         digest = hashlib.sha256(f"{model}|{system}|{prompt}".encode()).hexdigest()[:12]
@@ -132,7 +126,7 @@ class MockProvider:
         if self.capabilities.requires_model_install and model not in self.installed:
             raise ModelNotFound(model, self.node_name)
 
-        self._log({"op": "embed", "model": model, "count": len(inputs)})
+        self.call_log.append({"op": "embed", "model": model, "count": len(inputs)})
 
         vectors = []
         for text in inputs:
@@ -146,11 +140,6 @@ class MockProvider:
         )
 
     # -- 헬스·모델 ----------------------------------------------------------
-
-    def _log(self, entry: dict[str, Any]) -> None:
-        self.call_log.append(entry)
-        if len(self.call_log) > MAX_CALL_LOG:
-            del self.call_log[:-MAX_CALL_LOG]
 
     async def health(self, *, timeout: float = 10.0) -> HealthResult:
         if not self.online:

@@ -68,10 +68,6 @@ RETAINABLE_STATUSES = TERMINAL_STATUSES
 #: 관제 대시보드 폴링이 감사 테이블을 무한 증식시키던 것을 막는다.
 AUDIT_COALESCE_SECONDS = 300.0
 
-#: 내보내기 한 종류당 행 상한. 512MB 프로파일에서 전량 적재가 프로세스를 죽인다.
-#: 잘린 사실은 결과에 실어 **조용히 자르지 않는다.**
-EXPORT_ROW_LIMIT = 50_000
-
 #: 검토를 마친 가드 이벤트의 보존. 승격 게이트의 표본이므로 잡보다 길다.
 REVIEWED_EVENT_RETENTION_DAYS = 180
 
@@ -1201,12 +1197,6 @@ class SqliteStore:
         `prompt_cipher` · `prompt_nonce` 는 담지 않는다. 내보내기 파일이 원문을 나르면
         보관 기간과 접근 감사가 그 파일 밖에서 모두 무력화된다.
         """
-        # **상한을 둔다.** 잡 수십만 건인 테넌트를 내보내면 전량이 메모리에 올라오고
-        # JSON 직렬화가 그것을 한 번 더 복제한다 — 컨트롤 플레인 512MB 프로파일에서
-        # 내보내기 한 번이 프로세스를 죽인다.
-        #
-        # 잘린 사실은 결과에 싣는다(아래 `truncated`). 조용히 자르면 설치처는
-        # 그것을 전량으로 믿고 원본을 지운다.
         where, params = self._scoped_where(scope)
         jobs = [
             {
@@ -1214,37 +1204,20 @@ class SqliteStore:
                 for k in row.keys()
                 if k not in ("prompt_cipher", "prompt_nonce")
             }
-            for row in self._conn.execute(
-                f"SELECT * FROM jobs WHERE {where} ORDER BY created_at DESC LIMIT ?",
-                [*params, EXPORT_ROW_LIMIT + 1],
-            )
+            for row in self._conn.execute(f"SELECT * FROM jobs WHERE {where}", params)
         ]
-        def capped(table: str, order: str) -> list[dict[str, Any]]:
-            clause, values = self._scoped_where(scope)
-            return [
-                dict(row)
-                for row in self._conn.execute(
-                    f"SELECT * FROM {table} WHERE {clause} ORDER BY {order} DESC LIMIT ?",
-                    [*values, EXPORT_ROW_LIMIT + 1],
-                )
-            ]
-
-        usage = capped("usage", "ts")
-        events = capped("filter_events", "ts")
-        audit = capped("admin_audit", "ts")
-
-        # 어느 한 종류라도 상한을 넘겼으면 그 사실을 싣는다.
-        truncated = {
-            name: len(rows) > EXPORT_ROW_LIMIT
-            for name, rows in (
-                ("jobs", jobs), ("usage", usage),
-                ("filter_events", events), ("audit", audit),
-            )
-        }
-        jobs = jobs[:EXPORT_ROW_LIMIT]
-        usage = usage[:EXPORT_ROW_LIMIT]
-        events = events[:EXPORT_ROW_LIMIT]
-        audit = audit[:EXPORT_ROW_LIMIT]
+        where, params = self._scoped_where(scope)
+        usage = [dict(row) for row in self._conn.execute(f"SELECT * FROM usage WHERE {where}", params)]
+        where, params = self._scoped_where(scope)
+        events = [
+            dict(row)
+            for row in self._conn.execute(f"SELECT * FROM filter_events WHERE {where}", params)
+        ]
+        where, params = self._scoped_where(scope)
+        audit = [
+            dict(row)
+            for row in self._conn.execute(f"SELECT * FROM admin_audit WHERE {where}", params)
+        ]
 
         tenant = self.get_tenant(scope.tenant_id)
         return {
@@ -1262,10 +1235,6 @@ class SqliteStore:
             "usage": usage,
             "filter_events": events,
             "audit": audit,
-            # **조용히 자르지 않는다.** 잘린 것을 전량으로 믿고 원본을 지우면
-            # 그 데이터는 되돌릴 수 없다.
-            "truncated": truncated,
-            "row_limit": EXPORT_ROW_LIMIT,
         }
 
     def record_filter_event(
