@@ -262,6 +262,39 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 f"      rm {stale}    # 그 뒤 다시 `rotate-kek`"
             )
 
+    # **검증을 안 돌리면 끊긴 것을 아무도 모른다.**
+    #
+    # 해시 체인의 값어치는 전부 "언젠가 확인한다" 에 있다. 확인하는 자리가 없으면
+    # 그냥 컬럼 두 개를 더 쓰는 것일 뿐이다.
+    chain = store.verify_audit_chain()
+    if not chain["ok"]:
+        spot = chain["broken_at"]
+        problems.append(
+            f"감사 체인이 어긋납니다 — {chain['reason']}\n"
+            f"    id={spot['id']} · {spot['actor']} · {spot['action']}\n"
+            "    docs/runbook-audit-integrity.md 를 보세요."
+        )
+    elif chain["checked"]:
+        note = f"감사 체인 OK — {chain['checked']}행"
+        if chain["unchained"]:
+            note += f" (체인 이전 {chain['unchained']}행은 검증 대상 아님)"
+        notes.append(note)
+
+    agrees = store.audit_export_still_agrees()
+    if agrees is False:
+        # **체인 검증만으로는 절대 못 잡는 사건이다.** 체인이 통째로 다시 계산되면
+        # 내부 검증은 통과하고, 밖에 내보낸 팁만이 그 사실을 안다.
+        problems.append(
+            "마지막으로 내보낸 감사 팁이 지금 체인에 없습니다 — "
+            "체인이 재계산됐을 수 있습니다.\n"
+            "    내보낸 사본과 대조하세요: docs/runbook-audit-integrity.md"
+        )
+    elif agrees is None and chain["checked"]:
+        warnings.append(
+            "감사를 밖으로 내보낸 적이 없습니다. 체인은 조작을 **드러낼** 뿐 막지 못하고, "
+            "재계산은 외부 사본과의 대조로만 걸립니다 — `audit-export` 를 정기 실행하세요."
+        )
+
     if unopenable:
         problems.append(
             f"현재 마스터 KEK 로 열리지 않는 테넌트 {len(unopenable)}개: "
@@ -389,6 +422,59 @@ def cmd_rotate_kek(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit_export(args: argparse.Namespace) -> int:
+    """감사를 밖으로 내보낸다. **이것이 체인을 의미 있게 만드는 절반이다.**
+
+    체인만으로는 조작을 드러낼 뿐이고, DB 에 쓸 수 있는 공격자는 체인을 통째로 다시
+    계산할 수 있다. 그 재계산은 **밖에 있는 사본**과 대조할 때만 걸린다.
+    """
+    data_dir = Path(args.data or DEFAULT_DATA_DIR)
+    db_path = data_dir / "controlcenter.db"
+    if not db_path.exists():
+        print(f"DB 가 없습니다: {db_path}", file=sys.stderr)
+        return 2
+
+    store = SqliteStore(db_path)
+    try:
+        chain = store.verify_audit_chain()
+        if not chain["ok"] and not args.force:
+            spot = chain["broken_at"]
+            print(
+                f"체인이 이미 어긋나 있습니다 (id={spot['id']}, {chain['reason']}).\n"
+                "  이 상태를 내보내면 어긋난 사본이 '정본' 이 됩니다.\n"
+                "  런북을 먼저 보세요. 그래도 내보내려면 --force.",
+                file=sys.stderr,
+            )
+            return 2
+
+        previous = store.last_audit_export()
+        since = 0 if args.full else int(previous.get("last_id") or 0)
+        rows = store.export_audit_chain(since_id=since)
+        if not rows:
+            print(f"내보낼 새 감사가 없습니다 (마지막 id={since}).")
+            return 0
+
+        target = Path(args.out)
+        # **덮어쓰지 않고 이어 붙인다.** 내보내기의 목적이 밖에 사본을 쌓는 것인데
+        # 매번 덮어쓰면 마지막 회차만 남는다.
+        mode = "w" if args.full else "a"
+        with target.open(mode, encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        store.record_audit_export(tip=rows[-1]["row_hash"], last_id=rows[-1]["id"])
+    finally:
+        store.close()
+
+    print(f"  {len(rows)}행을 {target} 에 {'썼습니다' if args.full else '이어 붙였습니다'}")
+    print(f"  마지막 id {rows[-1]['id']} · 팁 {rows[-1]['row_hash'][:16]}…")
+    print(
+        "\n  이 파일을 **다른 저장소로** 옮기세요. 같은 호스트에 두면 DB 를 고칠 수 있는\n"
+        "  사람이 이 파일도 고칠 수 있어서 대조의 의미가 없습니다."
+    )
+    return 0
+
+
 def _demo_banner(handles: dict[str, Any], host: str, port: int) -> str:
     base = f"http://{host if host != '0.0.0.0' else 'localhost'}:{port}"
     lines = [
@@ -473,6 +559,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="확인 프롬프트를 건너뛴다. 무인 실행용",
     )
     rotate.set_defaults(func=cmd_rotate_kek)
+
+    export = sub.add_parser(
+        "audit-export",
+        help="감사를 JSONL 로 내보낸다 (체인 검증의 나머지 절반)",
+        description=(
+            "해시 체인은 조작을 **드러낼** 뿐 막지 못합니다. DB 에 쓸 수 있는 "
+            "공격자는 체인을 통째로 다시 계산할 수 있고, 그 재계산은 밖에 있는 "
+            "사본과 대조할 때만 걸립니다. 정기 실행하고 결과를 다른 저장소에 두세요."
+        ),
+    )
+    export.add_argument("--out", default="audit-export.jsonl", help="쓸 파일")
+    export.add_argument(
+        "--full", action="store_true",
+        help="처음부터 다시 내보낸다(파일을 덮어쓴다). 기본은 증분",
+    )
+    export.add_argument(
+        "--force", action="store_true",
+        help="체인이 이미 어긋나 있어도 내보낸다",
+    )
+    export.set_defaults(func=cmd_audit_export)
 
     return parser
 

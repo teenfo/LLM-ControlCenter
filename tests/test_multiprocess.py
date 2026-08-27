@@ -7,13 +7,19 @@
 **스레드가 아니라 진짜 프로세스를 쓴다.** 요지가 "프로세스 안의 락은 프로세스를 넘지
 못한다" 이므로, 스레드로 재면 재는 대상이 사라진다.
 
-여기서 확인하는 것 셋:
+여기서 확인하는 것 다섯:
 
 1. 잡 상태 전이가 **정확히 한 번만** 이긴다(CAS)
 2. `_tx()` 의 롤백이 **다른 프로세스에서도** 성립한다
-3. `cluster.place()` 의 슬롯 장부가 **프로세스 로컬이다** — 문서가 한계로 적어 둔
-   그 사실을 실행 가능한 형태로 못박는다. 언젠가 예약을 DB 로 옮기면 3번이
-   실패하고, 그때 부채 표를 함께 고치라는 신호가 된다.
+3. `cluster.place()` 의 슬롯 장부가 **프로세스를 넘어** 성립한다 — 한동안 이 자리에는
+   정반대 단언이 있었다. 예약이 워커 메모리에 있던 시절의 한계를 못박아 두었고,
+   DB 로 옮기면서 그 테스트가 실패해 부채 표를 함께 고치라는 신호를 보냈다.
+4. 같은 멱등성 키로 **한 잡만** 만들어진다
+5. 감사 해시 체인이 **포크되지 않는다**
+
+셋에 공통된 수법이 하나 있다: **유일성은 DB 가 지킨다.** 잡의 멱등성 키도, 노드
+슬롯도, 체인의 앞 고리도 유일 인덱스가 지키고 진 쪽은 실패를 정상 경로로 다룬다.
+애플리케이션 락으로 막으려는 시도는 전부 프로세스 경계에서 진다.
 """
 
 from __future__ import annotations
@@ -133,6 +139,20 @@ def _idempotency_worker(db_path: str, key: str, barrier, results) -> None:
             # **정상 경로다.** 조회를 나란히 통과한 뒤 삽입에서 갈린다.
             results.put(("rejected", None))
     except Exception as exc:                       # pragma: no cover - 진단용
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        store.close()
+
+
+def _audit_worker(db_path: str, barrier, results) -> None:
+    """같은 체인 끝에 나란히 이어 붙이려고 다툰다."""
+    store = SqliteStore(db_path)
+    try:
+        barrier.wait()
+        for n in range(3):
+            store.audit(f"worker-{mp.current_process().name}", "event", target=str(n))
+        results.put(("ok", True))
+    except Exception as exc:  # noqa: BLE001 — 무엇이 터졌는지가 결과다
         results.put(("error", f"{type(exc).__name__}: {exc}"))
     finally:
         store.close()
@@ -354,3 +374,38 @@ def test_only_one_process_creates_the_job_for_a_key(shared_db):
     verify.close()
     assert count is not None
     assert rows == 1, f"같은 키의 잡이 {rows}건 남았다"
+
+
+# ── 5. 감사 체인은 프로세스를 넘어 한 줄로 이어진다 ─────────────────────────
+
+
+def test_the_audit_chain_does_not_fork_across_processes(shared_db):
+    """**포크된 체인은 변조와 구분되지 않는다.**
+
+    감사 기록은 "팁을 읽고 거기 이어 붙인다" 인데, 두 워커가 같은 팁을 나란히 읽는
+    창이 실재한다. 그대로 두면 같은 `prev_hash` 를 가진 행이 둘 생기고, 검증은 그것을
+    "앞 고리가 끊겼다" 로 신고한다 — **정상 운영이 사고로 보이는 것**이다.
+
+    멱등성 키와 같은 수법으로 막는다: 유일 인덱스를 걸고, 진 쪽이 팁을 다시 읽어
+    잇는다. 감사 기록을 잃지 않는 것이 우선이므로 진 쪽은 포기하지 않고 재시도한다.
+    """
+    outcomes = run_workers(_audit_worker, shared_db)
+
+    errors = [o for kind, o in outcomes if kind == "error"]
+    assert not errors, f"워커가 오류를 냈다: {errors}"
+
+    verify = SqliteStore(shared_db)
+    try:
+        written = verify._conn.execute(
+            "SELECT COUNT(*) AS n FROM admin_audit"
+        ).fetchone()["n"]
+        distinct_links = verify._conn.execute(
+            "SELECT COUNT(DISTINCT prev_hash) AS n FROM admin_audit"
+        ).fetchone()["n"]
+        verdict = verify.verify_audit_chain()
+    finally:
+        verify.close()
+
+    assert written == WORKERS * 3, f"감사 {WORKERS * 3}건 중 {written}건만 남았다"
+    assert distinct_links == written, "같은 앞 고리를 가진 행이 있다 — 체인이 포크됐다"
+    assert verdict["ok"], f"프로세스를 넘은 체인이 어긋난다: {verdict}"

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import sqlite3
 import time
@@ -84,6 +85,73 @@ REVIEWED_EVENT_RETENTION_DAYS = 180
 
 #: 감사 보존. 잡보다 길게 둔다(규제 대응) — 다만 상한은 있어야 한다.
 AUDIT_RETENTION_DAYS = 365
+
+#: 보존 정리가 끊어 낸 자리의 해시. `meta` 에 산다.
+AUDIT_ANCHOR_KEY = "audit_chain_anchor"
+
+#: 마지막으로 밖으로 내보낸 시점의 팁. **재계산을 잡는 유일한 근거다.**
+AUDIT_EXPORTED_TIP_KEY = "audit_exported_tip"
+
+#: 체인의 첫 고리. 실제 해시가 아니라 **시작 표시**다 — 첫 행의 `prev_hash` 가 NULL 이면
+#: 유일 인덱스가 안 걸리고(SQLite 에서 NULL 은 서로 다르다), 그러면 여러 워커가 각자
+#: "내가 첫 행" 이라고 주장하는 포크가 생긴다.
+AUDIT_GENESIS = "genesis"
+
+#: 포크 경합에서 졌을 때 다시 시도할 횟수. 워커 수만큼만 지면 되므로 넉넉하다.
+AUDIT_CHAIN_RETRIES = 8
+
+#: 해시 입력의 필드 구분자. **JSON 이 만들 수 없는 문자여야 한다** — 구분자가 데이터에
+#: 나타날 수 있으면 공격자가 필드 경계를 옮기면서 같은 해시를 유지할 수 있다.
+#: `json.dumps` 는 0x20 미만 제어문자를 `\uXXXX` 로 이스케이프하므로 0x1f 는 안 나온다.
+_AUDIT_FIELD_SEP = "\x1f"
+
+
+def _chain_broken(row: Any, reason: str, checked: int, unchained: int) -> dict[str, Any]:
+    """어긋난 자리 하나를 사람이 읽을 수 있게. **id 와 시각과 행위자를 같이 준다** —
+    "체인이 깨졌습니다" 만으로는 아무도 다음 행동을 못 정한다."""
+    return {
+        "ok": False,
+        "checked": checked,
+        "unchained": unchained,
+        "tip": None,
+        "broken_at": {
+            "id": row["id"], "ts": row["ts"],
+            "actor": row["actor"], "action": row["action"],
+        },
+        "reason": reason,
+    }
+
+
+def audit_row_hash(
+    prev_hash: str,
+    *,
+    ts: float,
+    tenant_id: str | None,
+    actor: str,
+    action: str,
+    target: str | None,
+    detail_json: str,
+    outcome: str,
+) -> str:
+    """이 행의 해시. **앞 고리를 포함하므로 한 행만 고쳐도 뒤가 전부 어긋난다.**
+
+    `id` 는 안 넣는다. AUTOINCREMENT 라 삽입 전에는 모르고, 넣으려면 삽입 뒤 UPDATE 를
+    해야 하는데 그것은 "쓰고 나면 안 고친다" 는 이 테이블의 성질과 정면으로 어긋난다.
+    행의 위치는 `prev_hash` 연결이 이미 정한다.
+    """
+    payload = _AUDIT_FIELD_SEP.join(
+        (
+            prev_hash,
+            f"{ts:.6f}",
+            tenant_id or "",
+            actor,
+            action,
+            target or "",
+            detail_json,
+            outcome,
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 #: 평가 이력 보존. 규칙 승격 판단의 근거이므로 잡보다 길다.
 EVAL_RUN_RETENTION_DAYS = 180
 
@@ -399,6 +467,16 @@ CREATE TABLE IF NOT EXISTS tenant_guard_rules (
     PRIMARY KEY (tenant_id, rule_id)
 );
 
+-- 관리 감사. `prev_hash`·`row_hash` 가 순차 해시 체인을 만든다.
+--
+-- **이 체인이 만드는 성질은 "조작하면 드러난다" 이지 "조작할 수 없다" 가 아니다.**
+-- DB 에 쓸 수 있는 공격자는 체인 전체를 다시 계산할 수 있다. 그래서 이 컬럼들만으로
+-- 무결성을 주장하면 과장이고, 진짜 무결성은 **밖으로 내보낸 사본**에서 나온다
+-- (`export_audit_chain`). 재계산은 그 사본과의 대조에서 걸린다.
+--
+-- 두 컬럼이 NULL 인 행은 체인 도입 **이전**에 쓰인 것이다. 소급해 채우지 않는다 —
+-- 소급 계산은 "그때 이 값이었다" 를 증명하지 못하고, 증명하지 못하는 것을 증명한 것처럼
+-- 보이게 만드는 쪽이 아예 없는 것보다 나쁘다.
 CREATE TABLE IF NOT EXISTS admin_audit (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -407,7 +485,9 @@ CREATE TABLE IF NOT EXISTS admin_audit (
     action      TEXT NOT NULL,
     target      TEXT,
     detail_json TEXT NOT NULL DEFAULT '{}',
-    outcome     TEXT NOT NULL DEFAULT 'ok'
+    outcome     TEXT NOT NULL DEFAULT 'ok',
+    prev_hash   TEXT,
+    row_hash    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts ON admin_audit(tenant_id, ts);
 
@@ -484,6 +564,10 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("jobs", "response_cipher", "BLOB"),
     ("jobs", "response_nonce", "BLOB"),
     ("jobs", "idempotency_key", "TEXT"),
+    # 감사 해시 체인. 옛 행은 NULL 로 남는다 — 소급 계산은 "그때 이 값이었다" 를
+    # 증명하지 못하면서 증명한 것처럼 보이게 만든다.
+    ("admin_audit", "prev_hash", "TEXT"),
+    ("admin_audit", "row_hash", "TEXT"),
 )
 
 #: 컬럼이 생긴 **뒤에** 만들어야 하는 인덱스. `_SCHEMA` 에 두면 옛 DB 에서
@@ -495,6 +579,16 @@ _POST_MIGRATION_INDEXES: tuple[str, ...] = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency "
     "ON jobs(tenant_id, service_id, idempotency_key) "
     "WHERE idempotency_key IS NOT NULL",
+    # **체인이 갈라지는 것을 DB 가 막는다.** 같은 이유, 같은 수법이다.
+    #
+    # 감사 기록은 "팁을 읽고 거기 이어 붙인다" 인데, 두 워커가 같은 팁을 나란히
+    # 읽는 창이 실재한다(다중 워커가 지원 구성이다). 그러면 같은 `prev_hash` 를 가진
+    # 행이 둘 생기고 체인이 포크된다 — 그 상태는 변조와 구분되지 않아서, 검증이
+    # 정상 운영을 사고로 신고하게 된다.
+    #
+    # 유일 인덱스를 걸면 진 쪽이 삽입에 실패하고, 팁을 다시 읽어 잇는다.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_chain "
+    "ON admin_audit(prev_hash) WHERE prev_hash IS NOT NULL",
 )
 
 #: 원문을 담은 컬럼. **내보내기와 백업에서 함께 빠진다.**
@@ -2005,37 +2099,86 @@ class SqliteStore:
         경계를 넘은 사실 자체는 지운 적이 없다. 같은 사람이 같은 조회를 N 번 한
         것을 한 줄 + 횟수로 적을 뿐이다. **변경은 절대 합치지 않는다** — 파기
         두 번과 파기 한 번은 다른 사건이다.
+
+        ### 해시 체인
+
+        각 행은 앞 행의 해시를 품는다. 한 행만 고쳐도 그 뒤가 전부 어긋나므로
+        **조작이 드러난다** — 조작을 막지는 못한다. 그 구분은 `admin_audit` 스키마
+        주석과 `docs/runbook-audit-integrity.md` 에 있다.
+
+        **합치기는 그 행이 체인의 끝일 때만 한다.** 합치기는 행을 고치는 연산이라
+        중간 행에 하면 뒤따르는 모든 해시가 어긋나고, 그것은 변조와 구분되지 않는다.
+        끝이 아니면(그 사이 다른 사건이 기록됐다는 뜻이다) 새 행을 쓴다 — 그 편이
+        정직하기도 하다. 폭주를 막으려던 목적은 대부분의 경우 그대로 달성된다.
         """
         now = self._now()
-        if coalesce_seconds > 0:
-            recent = self._conn.execute(
-                "SELECT id, detail_json FROM admin_audit "
-                "WHERE actor = ? AND action = ? AND ts >= ? "
-                "AND tenant_id IS ? AND target IS ? "
-                "ORDER BY ts DESC LIMIT 1",
-                (actor, action, now - coalesce_seconds, tenant_id, target),
+        detail_json = _json(dict(detail or {}))
+
+        for _ in range(AUDIT_CHAIN_RETRIES):
+            tip = self._conn.execute(
+                "SELECT id, detail_json, prev_hash, row_hash FROM admin_audit "
+                "ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            if recent is not None:
-                merged = dict(detail or {})
+            prev_hash = (tip["row_hash"] if tip else None) or AUDIT_GENESIS
+
+            merge_into = None
+            if coalesce_seconds > 0 and tip is not None and tip["row_hash"]:
+                # 후보를 **팁 하나로 한정한다.** 예전에는 창 안의 가장 최근 행을
+                # 찾았는데, 그 행이 끝이 아니면 고치는 순간 체인이 끊긴다.
+                merge_into = self._conn.execute(
+                    "SELECT id, detail_json, prev_hash FROM admin_audit "
+                    "WHERE id = ? AND actor = ? AND action = ? AND ts >= ? "
+                    "AND tenant_id IS ? AND target IS ?",
+                    (tip["id"], actor, action, now - coalesce_seconds,
+                     tenant_id, target),
+                ).fetchone()
+
+            if merge_into is not None:
                 try:
-                    previous = json.loads(recent["detail_json"] or "{}")
+                    previous = json.loads(merge_into["detail_json"] or "{}")
                 except ValueError:
                     previous = {}
+                merged = dict(detail or {})
                 merged["repeats"] = int(previous.get("repeats", 1)) + 1
+                merged_json = _json(merged)
+                # 앞 고리는 그대로다 — 이 행의 자리는 안 바뀌고 내용만 바뀐다.
+                chained = merge_into["prev_hash"] or AUDIT_GENESIS
                 with self._tx():
                     self._conn.execute(
-                        "UPDATE admin_audit SET ts = ?, detail_json = ? WHERE id = ?",
-                        (now, _json(merged), recent["id"]),
+                        "UPDATE admin_audit SET ts = ?, detail_json = ?, row_hash = ? "
+                        "WHERE id = ?",
+                        (
+                            now, merged_json,
+                            audit_row_hash(
+                                chained, ts=now, tenant_id=tenant_id, actor=actor,
+                                action=action, target=target,
+                                detail_json=merged_json, outcome=outcome,
+                            ),
+                            merge_into["id"],
+                        ),
                     )
                 return
 
-        with self._tx():
-            self._conn.execute(
-                "INSERT INTO admin_audit(ts, tenant_id, actor, action, target, "
-                "detail_json, outcome) VALUES(?,?,?,?,?,?,?)",
-                (now, tenant_id, actor, action, target,
-                 _json(dict(detail or {})), outcome),
+            row_hash = audit_row_hash(
+                prev_hash, ts=now, tenant_id=tenant_id, actor=actor, action=action,
+                target=target, detail_json=detail_json, outcome=outcome,
             )
+            try:
+                with self._tx():
+                    self._conn.execute(
+                        "INSERT INTO admin_audit(ts, tenant_id, actor, action, target, "
+                        "detail_json, outcome, prev_hash, row_hash) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (now, tenant_id, actor, action, target, detail_json, outcome,
+                         prev_hash, row_hash),
+                    )
+                return
+            except sqlite3.IntegrityError:
+                # 다른 워커가 같은 팁에 먼저 이었다. 유일 인덱스가 포크를 막아 줬으니
+                # 새 팁을 읽고 그 뒤에 붙는다. **감사 기록을 잃지 않는 것이 우선이다.**
+                continue
+
+        raise RuntimeError("감사 체인 경합이 계속됩니다 — 기록하지 못했습니다")
 
     def list_audit(self, scope: TenantScope, *, limit: int = 100) -> list[sqlite3.Row]:
         where, params = self._scoped_where(scope)
@@ -2045,6 +2188,123 @@ class SqliteStore:
                 [*params, int(limit)],
             )
         )
+
+    # -- 감사 무결성 ----------------------------------------------------------
+    #
+    # **이 절이 만드는 성질을 정확히 적는다: 조작하면 드러난다.**
+    #
+    # 조작을 막지는 못한다. DB 에 쓸 수 있는 공격자는 고친 행부터 끝까지 다시 계산해
+    # 검증을 통과시킬 수 있다. 그래서 체인만으로 컴플라이언스를 주장하면 과장이고,
+    # 진짜 무결성은 **밖으로 내보낸 사본**에서 나온다 — 재계산은 그 사본의 팁과
+    # 대조할 때 걸린다. `export_audit_chain` 이 그 사본을 만든다.
+
+    def verify_audit_chain(self, *, limit: int | None = None) -> dict[str, Any]:
+        """체인을 처음부터 다시 계산해 **첫 번째 어긋난 자리**를 지목한다.
+
+        전부를 세지 않고 첫 자리만 내는 이유: 한 행이 어긋나면 그 뒤는 전부 어긋나므로
+        건수는 정보가 아니다. 사람이 알아야 할 것은 **어디서부터**다.
+
+        해시가 NULL 인 행은 체인 도입 이전 구간이다. 어긋난 것이 아니라 **보증 범위
+        밖**이므로 그렇게 센다 — 섞으면 옛 설치처가 업그레이드하자마자 "변조됨" 을 본다.
+        """
+        anchor = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (AUDIT_ANCHOR_KEY,)
+        ).fetchone()
+        expected = anchor["value"] if anchor else AUDIT_GENESIS
+
+        sql = (
+            "SELECT id, ts, tenant_id, actor, action, target, detail_json, outcome, "
+            "prev_hash, row_hash FROM admin_audit ORDER BY id"
+        )
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+
+        unchained = 0
+        checked = 0
+        tip = None
+        for row in self._conn.execute(sql):
+            if row["row_hash"] is None:
+                unchained += 1
+                continue
+            recomputed = audit_row_hash(
+                row["prev_hash"] or AUDIT_GENESIS,
+                ts=row["ts"], tenant_id=row["tenant_id"], actor=row["actor"],
+                action=row["action"], target=row["target"],
+                detail_json=row["detail_json"], outcome=row["outcome"],
+            )
+            if row["prev_hash"] != expected:
+                return _chain_broken(row, "앞 고리가 끊겼습니다", checked, unchained)
+            if recomputed != row["row_hash"]:
+                return _chain_broken(row, "행 내용이 해시와 다릅니다", checked, unchained)
+            expected = row["row_hash"]
+            tip = row["row_hash"]
+            checked += 1
+
+        return {
+            "ok": True, "checked": checked, "unchained": unchained,
+            "tip": tip, "broken_at": None, "reason": None,
+        }
+
+    def audit_chain_tip(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT row_hash FROM admin_audit WHERE row_hash IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row["row_hash"] if row else None
+
+    def export_audit_chain(self, *, since_id: int = 0) -> list[dict[str, Any]]:
+        """내보낼 행들. **밖에 사본이 있어야 체인이 의미를 갖는다.**
+
+        `since_id` 로 증분 내보내기를 한다 — 매번 전량을 내보내면 1년치가 쌓인 뒤에는
+        아무도 안 돌리고, 안 돌리는 절차는 없는 절차다.
+        """
+        return [
+            dict(row)
+            for row in self._conn.execute(
+                "SELECT id, ts, tenant_id, actor, action, target, detail_json, "
+                "outcome, prev_hash, row_hash FROM admin_audit "
+                "WHERE id > ? ORDER BY id",
+                (int(since_id),),
+            )
+        ]
+
+    def record_audit_export(self, *, tip: str | None, last_id: int) -> None:
+        """무엇을 어디까지 내보냈는지. 다음 검증이 이것과 대조한다."""
+        with self._tx():
+            for key, value in (
+                (AUDIT_EXPORTED_TIP_KEY, _json({"tip": tip, "last_id": last_id})),
+            ):
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+
+    def last_audit_export(self) -> dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (AUDIT_EXPORTED_TIP_KEY,)
+        ).fetchone()
+        if row is None:
+            return {"tip": None, "last_id": 0}
+        try:
+            return json.loads(row["value"])
+        except ValueError:
+            return {"tip": None, "last_id": 0}
+
+    def audit_export_still_agrees(self) -> bool | None:
+        """내보낸 시점의 팁이 **지금도 체인 안에 있는가.**
+
+        `None` 은 내보낸 적이 없다는 뜻이다(판정 불가). `False` 면 그 해시가 사라졌다 —
+        누군가 그 지점 이후를 다시 계산했다는 뜻이고, **체인 검증만으로는 절대 못 잡는
+        사건이다.** 이것이 내보내기를 체인과 한 묶음으로 내는 이유 그 자체다.
+        """
+        exported = self.last_audit_export()
+        if not exported.get("tip"):
+            return None
+        found = self._conn.execute(
+            "SELECT 1 FROM admin_audit WHERE row_hash = ?", (exported["tip"],)
+        ).fetchone()
+        return found is not None
 
     # -- 전 테넌트 조회 (명시적 · 감사 남김) -------------------------------------
 
@@ -2388,10 +2648,28 @@ class SqliteStore:
             # **감사와 평가 이력도 자란다.** 플랫폼 개요 화면이 호출마다 감사를
             # 남기므로 대시보드를 열어 두기만 해도 무한 증식한다. 감사는 잡보다
             # 오래 보관하되(규제 대응) 상한은 있어야 한다.
+            #
+            # **정리는 체인을 끊는다 — 끊긴 자리를 앵커로 남긴다.**
+            #
+            # 옛 행을 지우면 살아남은 첫 행의 `prev_hash` 가 가리키는 행이 없어진다.
+            # 그대로 두면 검증이 매년 보존 경계에서 "끊겼다" 고 신고하고, **정상 운영이
+            # 사고로 보이는 검증은 곧 꺼진다.** 그래서 지우기 직전 마지막 행의 해시를
+            # 적어 두고, 검증은 거기서부터 잇는다.
+            audit_cutoff = now - AUDIT_RETENTION_DAYS * 86400
+            doomed_tip = self._conn.execute(
+                "SELECT row_hash FROM admin_audit WHERE ts < ? AND row_hash IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (audit_cutoff,),
+            ).fetchone()
             audits = self._conn.execute(
-                "DELETE FROM admin_audit WHERE ts < ?",
-                (now - AUDIT_RETENTION_DAYS * 86400,),
+                "DELETE FROM admin_audit WHERE ts < ?", (audit_cutoff,)
             ).rowcount
+            if doomed_tip is not None:
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (AUDIT_ANCHOR_KEY, doomed_tip["row_hash"]),
+                )
             evals = self._conn.execute(
                 "DELETE FROM eval_runs WHERE ts < ?",
                 (now - EVAL_RUN_RETENTION_DAYS * 86400,),
