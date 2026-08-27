@@ -283,6 +283,36 @@ CREATE TABLE IF NOT EXISTS admin_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts ON admin_audit(tenant_id, ts);
 
+-- 가드 정답셋. **합성 샘플만 담는다.**
+--
+-- 실제 트래픽에서 수확할 수 없는 이유가 있다: filter_events 는 설계상 매칭된 값을
+-- 남기지 않으므로(감사가 유출 경로가 되면 안 되니까) 거기서 텍스트를 꺼낼 방법이 없다.
+-- 그래서 정답셋은 사람이 만든 합성 샘플이고, 실제 트래픽의 오탐률은 검토 큐가 따로 잰다.
+CREATE TABLE IF NOT EXISTS eval_fixtures (
+    id           TEXT PRIMARY KEY,
+    tenant_id    TEXT,              -- NULL 이면 번들 기본 세트(전 테넌트 공용)
+    rule_id      TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    expect_match INTEGER NOT NULL,  -- 1=양성(잡혀야 함) 0=음성(안 잡혀야 함)
+    source       TEXT NOT NULL DEFAULT 'manual',
+    note         TEXT,
+    created_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fixtures_rule ON eval_fixtures(rule_id, tenant_id);
+
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id          TEXT PRIMARY KEY,
+    ts          REAL NOT NULL,
+    tenant_id   TEXT,
+    kind        TEXT NOT NULL,      -- 'rules' | 'classifier'
+    subject     TEXT NOT NULL,      -- 규칙 id 또는 모델 이름
+    system_hash TEXT,               -- 어떤 프롬프트 버전에서 잰 값인가 (C8)
+    passed      INTEGER NOT NULL DEFAULT 0,
+    total       INTEGER NOT NULL DEFAULT 0,
+    metrics_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_eval_runs ON eval_runs(kind, subject, ts);
+
 -- 레이트리밋 카운터. 1초 버킷을 합산해 슬라이딩 윈도를 만든다.
 --
 -- 프로세스 메모리에 두지 않는 이유: API 워커를 N개 띄우면 각자 자기 카운터를 갖게 되어
@@ -828,6 +858,137 @@ class SqliteStore:
                 f"SELECT * FROM filter_events WHERE {where} ORDER BY ts DESC LIMIT ?",
                 [*params, int(limit)],
             )
+        )
+
+    def review_filter_event(
+        self, scope: TenantScope, event_id: int, verdict: str
+    ) -> bool:
+        """오탐 검토 큐의 판정. `verdict` 는 'true_positive' | 'false_positive'.
+
+        **값이 아니라 판정만 남긴다.** 검토자는 원문을 UI 에서 보지만 그 텍스트는
+        여기 들어오지 않는다 — 들어오면 감사 테이블이 곧 PII 저장소가 된다.
+        """
+        if verdict not in ("true_positive", "false_positive"):
+            raise StoreError(f"알 수 없는 판정: {verdict}")
+
+        where, params = self._scoped_where(scope, "id = ?")
+        params.append(event_id)
+        cur = self._conn.execute(
+            f"UPDATE filter_events SET reviewed = 1, verdict = ? WHERE {where}",
+            [verdict, *params],
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def review_stats(self, scope: TenantScope, rule_id: str | None = None) -> dict[str, dict[str, int]]:
+        """규칙별 검토 집계 — 실제 트래픽 기준 오탐률의 근거."""
+        extra = "reviewed = 1"
+        params_extra: list[Any] = []
+        if rule_id:
+            extra += " AND rule_id = ?"
+            params_extra.append(rule_id)
+
+        where, params = self._scoped_where(scope, extra)
+        params.extend(params_extra)
+
+        stats: dict[str, dict[str, int]] = {}
+        for row in self._conn.execute(
+            f"SELECT rule_id, verdict, COUNT(*) AS n FROM filter_events "
+            f"WHERE {where} GROUP BY rule_id, verdict",
+            params,
+        ):
+            stats.setdefault(row["rule_id"], {})[row["verdict"]] = row["n"]
+        return stats
+
+    # -- 정답셋 · 평가 이력 -----------------------------------------------------
+
+    def add_fixture(
+        self,
+        rule_id: str,
+        text: str,
+        expect_match: bool,
+        *,
+        scope: TenantScope | None = None,
+        source: str = "manual",
+        note: str | None = None,
+    ) -> str:
+        """정답셋 샘플 하나. `scope` 가 없으면 번들 기본 세트(전 테넌트 공용)다."""
+        fixture_id = uuid.uuid4().hex[:16]
+        self._conn.execute(
+            "INSERT INTO eval_fixtures(id, tenant_id, rule_id, text, expect_match, "
+            "source, note, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                fixture_id, scope.tenant_id if scope else None, rule_id, text,
+                int(expect_match), source, note, self._now(),
+            ),
+        )
+        self._conn.commit()
+        return fixture_id
+
+    def list_fixtures(
+        self, *, scope: TenantScope | None = None, rule_id: str | None = None
+    ) -> list[sqlite3.Row]:
+        """번들 기본 세트 + (스코프가 있으면) 그 테넌트가 추가한 것."""
+        conditions = ["(tenant_id IS NULL" + (" OR tenant_id = ?)" if scope else ")")]
+        params: list[Any] = [scope.tenant_id] if scope else []
+        if rule_id:
+            conditions.append("rule_id = ?")
+            params.append(rule_id)
+
+        return list(
+            self._conn.execute(
+                f"SELECT * FROM eval_fixtures WHERE {' AND '.join(conditions)} "
+                f"ORDER BY rule_id, created_at",
+                params,
+            )
+        )
+
+    def delete_fixture(self, scope: TenantScope, fixture_id: str) -> bool:
+        """테넌트가 추가한 것만 지울 수 있다. 번들 기본 세트는 못 지운다."""
+        where, params = self._scoped_where(scope, "id = ?")
+        params.append(fixture_id)
+        cur = self._conn.execute(f"DELETE FROM eval_fixtures WHERE {where}", params)
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def record_eval_run(
+        self,
+        kind: str,
+        subject: str,
+        *,
+        passed: int,
+        total: int,
+        metrics: Mapping[str, Any] | None = None,
+        tenant_id: str | None = None,
+        system_hash: str | None = None,
+    ) -> str:
+        run_id = uuid.uuid4().hex[:16]
+        self._conn.execute(
+            "INSERT INTO eval_runs(id, ts, tenant_id, kind, subject, system_hash, "
+            "passed, total, metrics_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            (run_id, self._now(), tenant_id, kind, subject, system_hash,
+             passed, total, _json(dict(metrics or {}))),
+        )
+        self._conn.commit()
+        return run_id
+
+    def latest_eval_run(self, kind: str, subject: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM eval_runs WHERE kind = ? AND subject = ? "
+            "ORDER BY ts DESC LIMIT 1",
+            (kind, subject),
+        ).fetchone()
+
+    def list_eval_runs(self, *, kind: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        if kind:
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM eval_runs WHERE kind = ? ORDER BY ts DESC LIMIT ?",
+                    (kind, int(limit)),
+                )
+            )
+        return list(
+            self._conn.execute("SELECT * FROM eval_runs ORDER BY ts DESC LIMIT ?", (int(limit),))
         )
 
     # -- 역할 오버라이드 ------------------------------------------------------

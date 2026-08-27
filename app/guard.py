@@ -355,6 +355,19 @@ class Guard:
                 )
         return detections
 
+    def probe_rule(self, rule: GuardRule, text: str) -> int:
+        """이 규칙이 텍스트에서 몇 번 걸리는가. 정답셋 평가가 쓰는 원시 연산이다.
+
+        `inspect()` 는 등급·경계·계층을 전부 적용하므로 "이 규칙이 이 문장을 잡는가" 만
+        묻기에는 과하다. 평가는 규칙 하나를 격리해서 봐야 한다.
+        """
+        if rule.kind != "pattern" or not rule.pattern:
+            return 0
+        compiled = self._compiled.get(rule.id)
+        if compiled is None:
+            compiled = self._compiled[rule.id] = re.compile(rule.pattern)
+        return len(self._match_spans(compiled, rule, text))
+
     @staticmethod
     def _match_spans(
         compiled: re.Pattern[str], rule: GuardRule, text: str
