@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# 런타임 데이터 — 절대 커밋하지 않는다
+*.db
+*.db-wal
+*.db-shm
+/data/
+/keys/
+.env
+
+# 오프라인 번들 산출물
+/dist/
+/bundle/
