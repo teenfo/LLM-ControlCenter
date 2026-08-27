@@ -17,6 +17,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
+# 클라우드 프로바이더는 선택적이다. 로컬 노드만 쓰는 설치처가 클라우드 SDK 를
+# 강제로 받을 이유가 없고, 에어갭 설치에서는 아예 설치되지 않는다.
+anthropic = ["anthropic>=0.40"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
