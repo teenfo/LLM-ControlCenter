@@ -26,6 +26,7 @@
   "error.model_not_installed": "Model '{model}' is not installed.",
   "error.no_placement": "No node is available to run this role.",
   "error.capacity_impossible": "No node has the capacity to run model '{model}'.",
+  "error.boundary_impossible": "This request cannot reach any node within its allowed data boundary.",
   "error.administrative_wait_timeout": "Timed out waiting for an available node.",
   "error.node_unreachable": "Cannot reach node '{node}'.",
   "error.backend_unavailable": "Backend unavailable. Please retry later.",

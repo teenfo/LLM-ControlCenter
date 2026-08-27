@@ -831,3 +831,182 @@ def test_the_estimator_errs_high_not_low():
     assert estimate_input_tokens("") == 0
     # 영어는 그보다 낮게 잡힌다 — 같은 길이라도 토큰이 적다.
     assert estimate_input_tokens("a" * 100) < estimate_input_tokens("가" * 100)
+
+
+# ── 감사 M3·M4 — 프로브 한 바퀴가 죽은 노드 수에 비례한다 ────────────────────
+
+
+class SlowProvider:
+    """응답이 늦는 노드. 죽은 노드의 타임아웃을 흉내 낸다."""
+
+    name = "slow"
+
+    def __init__(self, seconds: float = 0.3) -> None:
+        from app.providers.base import Capabilities
+
+        self.capabilities = Capabilities(
+            requires_model_install=False, uses_memory_budget=False, metered=False
+        )
+        self.seconds = seconds
+
+    async def health(self, *, timeout: float = 10.0):
+        import asyncio as _asyncio
+
+        from app.providers import HealthResult
+
+        await _asyncio.sleep(self.seconds)
+        return HealthResult(ok=False, error="타임아웃")
+
+
+class ExplodingProvider:
+    """200 에 비정형 본문을 주는 노드 — 앞에 리버스 프록시가 선 구성이 흔하다."""
+
+    name = "exploding"
+
+    def __init__(self) -> None:
+        from app.providers.base import Capabilities
+
+        self.capabilities = Capabilities(
+            requires_model_install=False, uses_memory_budget=False, metered=False
+        )
+
+    async def health(self, *, timeout: float = 10.0):
+        raise KeyError("name")
+
+
+def _three_node_cluster(store, clock, providers) -> Cluster:
+    config = build_config(
+        nodes={
+            name: Node(name=name, provider="mock", data_boundary="internal",
+                       tags=("internal",), models=("m",))
+            for name in ("a-node", "b-node", "c-node")
+        },
+        roles={"r": Role(name="r", model="m", placement=("internal",))},
+    )
+    return Cluster(config, store, now=clock, providers=providers)
+
+
+async def test_probing_dead_nodes_does_not_take_n_times_the_timeout(store, clock):
+    """순차로 돌면 죽은 노드 N 대에 한 바퀴가 N × 타임아웃이다.
+
+    그 사이 살아난 노드는 계속 못 쓴다 — 느린 노드 하나가 나머지 전부의 갱신을
+    미루면 안 된다.
+    """
+    import time as _time
+
+    cluster = _three_node_cluster(
+        store, clock, {name: SlowProvider(0.3) for name in ("a-node", "b-node", "c-node")}
+    )
+
+    started = _time.monotonic()
+    await cluster.probe_all()
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 0.6, f"프로브가 순차로 돌았다 ({elapsed:.2f}초)"
+
+
+async def test_one_broken_node_does_not_stop_the_probe_cycle(store, clock):
+    """**사전순 뒤 노드들이 매 주기 프로브를 못 받는다.**
+
+    그리고 정작 문제의 노드는 unhealthy 판정도 못 받아 계속 배치된다 —
+    배경 루프의 `suppress` 가 그 사실을 통째로 삼킨다.
+    """
+    from app.providers.mock import MockProvider
+
+    cluster = _three_node_cluster(store, clock, {
+        "a-node": ExplodingProvider(),
+        "b-node": MockProvider(Node(name="b-node", provider="mock", models=("m",))),
+        "c-node": MockProvider(Node(name="c-node", provider="mock", models=("m",))),
+    })
+
+    results = await cluster.probe_all()
+
+    assert set(results) == {"a-node", "b-node", "c-node"}, "뒤 노드들이 프로브를 못 받았다"
+    assert results["b-node"] is True and results["c-node"] is True
+
+
+async def test_a_broken_node_is_counted_as_a_failure(store, clock):
+    """예외를 위로 흘리면 그 노드는 실패로도 안 세어져 계속 후보로 남는다."""
+    cluster = _three_node_cluster(store, clock, {"a-node": ExplodingProvider()})
+
+    assert await cluster.probe("a-node") is False
+    assert cluster.nodes["a-node"].consecutive_failures == 1
+    assert "프로브 예외" in (cluster.nodes["a-node"].last_error or "")
+
+
+# ── 감사 M6 — 영원히 못 도는 잡을 900초 기다리게 한다 ────────────────────────
+
+
+def test_a_boundary_blocked_job_fails_instead_of_waiting(cluster):
+    """가드가 좁힌 경계는 **이 잡의 생애 동안 변하지 않는다.**
+
+    그런데도 WAIT 로 두면 소비자는 15분을 매달린 뒤 `administrative_wait_timeout`
+    을 받는다 — "관리자를 기다렸다" 는 뜻이라 실제 원인을 아무도 못 찾는다.
+    """
+    result = place(cluster, "summarize", allowed_boundaries=())
+
+    assert result.outcome == FAIL
+    assert result.code == "boundary_impossible"
+
+
+def test_an_internal_only_role_with_only_external_nodes_fails(store, clock):
+    """역할의 `internal_only` 도 오버라이드 불가 필드라 바뀌지 않는다."""
+    config = build_config(
+        nodes={"out": Node(name="out", provider="mock", data_boundary="external",
+                           tags=("external",), models=("m",))},
+        roles={"g": Role(name="g", model="m", placement=("external",), internal_only=True)},
+    )
+    c = Cluster(config, store, now=clock)
+    c.nodes["out"].status = HEALTHY
+    c.nodes["out"].models = frozenset({"m"})
+
+    result = c.place(
+        job_id="j", tenant_id="acme", service_id="acme-web", role=config.roles["g"]
+    )
+    assert result.outcome == FAIL
+    assert result.code == "boundary_impossible"
+
+
+def test_an_administrative_absence_still_waits(cluster):
+    """**관리자가 되돌릴 수 있는 것을 하드 실패시키면 정비 5분에 그 티어가 전멸한다.**"""
+    for name in ("in-1", "in-2"):
+        cluster.nodes[name].status = UNHEALTHY
+
+    result = place(cluster, "classify")
+
+    assert result.outcome == WAIT, "헬스는 관리자가 되돌릴 수 있다"
+
+
+def test_airgap_and_affinity_are_administrative_not_permanent(store, clock):
+    """에어갭도 `tenant_affinity` 도 관리자가 바꿀 수 있다 — 기다릴 값이 있다."""
+    config = build_config(
+        nodes={"out": Node(name="out", provider="mock", data_boundary="external",
+                           tags=("external",), models=("m",))},
+        roles={"r": Role(name="r", model="m", placement=("external",))},
+    )
+    c = Cluster(config, store, now=clock, airgap=True)
+    c.nodes["out"].status = HEALTHY
+    c.nodes["out"].models = frozenset({"m"})
+
+    result = c.place(
+        job_id="j", tenant_id="acme", service_id="acme-web", role=config.roles["r"]
+    )
+    assert result.outcome == WAIT
+    assert result.rejections["out"] == "airgap_external_disabled"
+
+
+def test_a_permanent_reason_is_reported_even_when_the_node_is_also_down(store, clock):
+    """순서가 진단의 정확도를 정한다 — 헬스를 먼저 보면 영구 조건이 가려진다."""
+    config = build_config(
+        nodes={"out": Node(name="out", provider="mock", data_boundary="external",
+                           tags=("external",), models=("m",))},
+        roles={"g": Role(name="g", model="m", placement=("external",), internal_only=True)},
+    )
+    c = Cluster(config, store, now=clock)
+    c.nodes["out"].status = UNHEALTHY      # 죽어 있기도 하다
+
+    result = c.place(
+        job_id="j", tenant_id="acme", service_id="acme-web", role=config.roles["g"]
+    )
+    assert result.rejections["out"] == "boundary_internal_only"
+    assert result.outcome == FAIL

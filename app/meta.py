@@ -41,6 +41,9 @@ ERROR_CODES: tuple[tuple[str, int, bool], ...] = (
     ("payload_too_large", 413, False),
     ("guard_blocked", 422, False),
     ("capacity_impossible", 422, False),
+    # 재시도 불가 — 가드가 좁힌 경계나 역할의 internal_only 때문에 어떤 노드로도
+    # 갈 수 없다. 관리자도 못 푸는 조건이라 503(재시도 가능)이 아니다.
+    ("boundary_impossible", 422, False),
     ("wrong_kind", 400, False),
     ("empty_input", 400, False),
     ("invalid_json", 400, False),

@@ -35,6 +35,11 @@ from .store import SqliteStore, TenantScope
 DEFAULT_WAIT_SECONDS = 30.0
 MAX_WAIT_SECONDS = 300.0
 POLL_INTERVAL = 0.05
+#: 폴 간격을 매번 이 배로 늘린다. 짧은 잡은 여전히 첫 폴에서 잡히고, 긴 잡은
+#: 확인 빈도가 빠르게 떨어진다.
+POLL_BACKOFF = 1.6
+#: 그래도 이 이상 벌어지지는 않는다 — 완료 후 응답까지의 지연 상한이다.
+MAX_POLL_INTERVAL = 0.5
 
 #: 2단 분류를 수행하는 역할. `internal_only` 이므로 경계 밖으로 나갈 수 없다.
 GUARD_ROLE = "_guard_classify"
@@ -319,7 +324,7 @@ class Pipeline:
             prompt_hash=hash_prompt(masked, tenant["end_user_salt"]),
             # `system_hash` 는 솔트가 없다 — 테넌트를 가로질러 "같은 프롬프트 전략을
             # 쓰는가" 를 비교해야 하고, system 프롬프트는 저엔트로피가 아니다.
-            system_hash=hash_system(system or role_config.system),
+            system_hash=hash_system(system),
             allowed_boundaries=sorted(verdict.allowed_boundaries),
             placement=role_config.placement,
             tier_models=role_config.tier_models,
@@ -356,8 +361,20 @@ class Pipeline:
 
         self._check_size(prompt, role_config)
 
+        # **프롬프트는 호출자 소유다** — 요청의 `system` 이 우선하고, 없을 때만
+        # 역할 기본값을 쓴다(B0). 그 해석을 **여기서** 끝낸다.
+        #
+        # 이 줄이 없었을 때: 가드도 저장도 요청의 `system` 만 보았고, 그래서
+        # 역할 기본 system 이 **추론에 전혀 전달되지 않았다.** 그런데
+        # `system_hash` 는 기본값을 보낸 것처럼 해싱해서, 프롬프트 드리프트
+        # 추적까지 "쓰고 있다" 고 거짓 보고했다.
+        #
+        # 기본값도 가드를 지난다 — 관리자가 역할 system 에 실수로 넣은 PII 가
+        # 필터를 우회하면 안 된다.
+        effective_system = system or role_config.system
+
         # ② 가드 — 저장보다, 배치보다 먼저.
-        verdict = await self._inspect(role_config, tenant, prompt, system)
+        verdict = await self._inspect(role_config, tenant, prompt, effective_system)
 
         if verdict.blocked:
             # 차단된 프롬프트는 어떤 노드에도 가지 않고 평문으로 저장되지도 않는다.
@@ -371,7 +388,7 @@ class Pipeline:
             scope,
             principal=principal, role_config=role_config, tenant=tenant,
             end_user_hash=end_user_hash, verdict=verdict, raw_prompt=prompt,
-            system=system, priority=priority, metadata=metadata,
+            system=effective_system, priority=priority, metadata=metadata,
         )
         self._record_guard_events(
             scope, verdict, job_id=job_id, service_id=principal.service_id
@@ -428,17 +445,27 @@ class Pipeline:
         # 멈춘 단조 시계) 시각 비교만으로는 **루프가 영원히 안 끝난다** — 연결 하나가
         # 워커를 영구히 붙잡는 것은 대기 상한을 둔 이유 자체를 무효로 만든다.
         remaining_polls = int(budget / POLL_INTERVAL) + 1
+        interval = POLL_INTERVAL
 
         while True:
-            job = self._store.get_job(scope, job_id)
-            if job is None:
+            # **상태 한 칸만 읽는다.** `get_job` 은 `SELECT *` 라 마스킹본·암호문·
+            # 응답까지 끌어오는데, 폴링이 보는 것은 이 한 칸뿐이다. 대기가 수십 건
+            # 겹치면 그 전량이 초당 수백 번 오가며 이벤트 루프를 점유한다.
+            status = self._store.job_status(scope, job_id)
+            if status is None:
                 raise ApiError("job_not_found", status=404)
-            if job.status in _TERMINAL:
+            if status in _TERMINAL or self._now() >= deadline or remaining_polls <= 0:
+                job = self._store.get_job(scope, job_id)
+                if job is None:
+                    raise ApiError("job_not_found", status=404)
                 return self._to_submission(scope, job)
-            if self._now() >= deadline or remaining_polls <= 0:
-                return self._to_submission(scope, job)
+
             remaining_polls -= 1
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(interval)
+            # **간격을 늘린다.** 첫 폴은 빨라야 짧은 잡이 즉시 돌아오고, 오래 걸리는
+            # 잡을 20회/초로 확인할 이유는 없다. 고정 50ms 는 그 둘을 같은 값으로
+            # 다루느라 긴 대기에 부하를 몰아준다.
+            interval = min(interval * POLL_BACKOFF, MAX_POLL_INTERVAL)
 
     def cancel(self, scope: TenantScope, job_id: str, *, actor: str) -> Submission:
         """대기 중인 잡을 취소한다.

@@ -512,3 +512,115 @@ async def test_starvation_trips_are_counted(store, clock):
     await scheduler.tick("interactive")
 
     assert scheduler.snapshot()["interactive"]["starvation_trips"] >= 1
+
+
+# ── 감사 M5 — 태스크 참조를 버리고, 종료가 실행 중인 잡을 버린다 ─────────────
+
+
+async def test_the_execute_task_is_held(parts, store):
+    """**`create_task` 의 반환을 버리면 GC 가 실행 도중에 가져갈 수 있다.**
+
+    그러면 잡은 `running` 인 채 남고 `finally` 가 안 돌아 슬롯·메모리·비용 예약이
+    영영 안 풀린다 — 부하가 없는데 큐가 쌓이는 그 증상이다.
+    """
+    cluster, scheduler = parts
+    enqueue(store, ACME)
+
+    await scheduler.tick("interactive")
+    assert scheduler._inflight, "실행 태스크를 붙잡고 있지 않다"
+
+    await drain(scheduler)
+    assert not scheduler._inflight, "끝난 태스크가 안 치워진다"
+
+
+async def test_stop_waits_for_running_jobs(store, clock):
+    """루프만 취소하고 나가면 in-flight 실행이 미정리 상태로 파괴된다.
+
+    그 잡들은 DB 에 `running` 으로 남아 다음 기동의 크래시 복구 경로를 탄다 —
+    **정상 종료가 크래시처럼 보이고**, 배포할 때마다 그렇게 된다.
+    """
+    cluster, scheduler = build(store, clock)
+    job_id = enqueue(store, ACME)
+
+    await scheduler.tick("interactive")
+    assert store.get_job(ACME, job_id).status == "running"
+
+    await scheduler.stop()
+
+    assert store.get_job(ACME, job_id).status == "ok", "종료가 실행 중인 잡을 버렸다"
+
+
+async def test_stop_does_not_hang_forever_on_a_stuck_job(store, clock):
+    """기다리는 데 상한이 없으면 오케스트레이터가 SIGKILL 을 보낸다."""
+    import time as _time
+
+    cluster, scheduler = build(store, clock)
+
+    async def never_ends(*args, **kwargs):
+        await asyncio.sleep(60)
+
+    scheduler._inflight.add(asyncio.create_task(never_ends()))
+
+    started = _time.monotonic()
+    await scheduler.stop(drain_seconds=0.1)
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 1.0, f"종료가 {elapsed:.1f}초 매달렸다"
+    assert not scheduler._inflight
+
+
+# ── 감사 M7 — 모델 미설치가 재배치 없이 잡을 죽인다 ──────────────────────────
+
+
+async def test_a_missing_model_is_retried_on_another_node(store, clock):
+    """**"이 노드에서 안 된다" 와 "어디서도 안 된다" 는 다르다.**
+
+    기동 직후에는 인벤토리가 비어 있어 배치 필터가 노드를 통과시킨다(모른다는
+    이유로 막으면 전부 대기한다). 그렇게 잘못 간 잡이 재배치 없이 죽으면,
+    그 모델을 가진 노드가 멀쩡히 놀고 있는데도 요청이 실패한다.
+    """
+    from app.providers.base import ModelNotFound
+
+    cluster, scheduler = build(store, clock)
+    job_id = enqueue(store, ACME)
+
+    # in-1 만 그 모델이 없다고 답한다.
+    original = cluster.nodes["in-1"].provider.generate
+
+    async def refuse(*args, **kwargs):
+        raise ModelNotFound(kwargs.get("model", "?"), "in-1")
+
+    cluster.nodes["in-1"].provider.generate = refuse
+    try:
+        await drain(scheduler, rounds=10)
+    finally:
+        cluster.nodes["in-1"].provider.generate = original
+
+    job = store.get_job(ACME, job_id)
+    assert job.status in ("ok", "queued"), f"재배치 없이 죽었다: {job.error_code}"
+    if job.status == "ok":
+        assert job.node != "in-1"
+
+
+async def test_a_missing_model_still_gives_up_eventually(store, clock):
+    """모든 노드에 없으면 결국 끝난다 — 무한 재시도가 되면 안 된다."""
+    from app.providers.base import ModelNotFound
+
+    cluster, scheduler = build(store, clock)
+    job_id = enqueue(store, ACME)
+
+    for state in cluster.nodes.values():
+        async def refuse(*args, **kwargs):
+            raise ModelNotFound(kwargs.get("model", "?"), "any")
+
+        state.provider.generate = refuse
+
+    for _ in range(20):
+        await drain(scheduler, rounds=2)
+        clock.advance(30)          # 재시도 백오프를 넘긴다
+        if store.get_job(ACME, job_id).status == "failed":
+            break
+
+    job = store.get_job(ACME, job_id)
+    assert job.status == "failed"
+    assert job.error_code == "model_not_installed"

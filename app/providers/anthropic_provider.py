@@ -181,7 +181,9 @@ class AnthropicProvider:
         노드가 모델을 선언했으면 그것을 쓰고, 안 했으면 API 에 물어본다.
         """
         try:
-            listing = await self._client.models.list()
+            # **받은 timeout 을 실제로 넘긴다.** 안 넘기면 SDK 기본값(보통 10분)이
+            # 적용되어 헬스 프로브 하나가 주기를 통째로 잡아먹는다.
+            listing = await self._client.models.list(timeout=timeout)
             available = tuple(m.id for m in listing.data)
         except Exception as exc:
             return HealthResult(ok=False, error=str(self._translate(exc)))

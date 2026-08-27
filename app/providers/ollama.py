@@ -145,6 +145,12 @@ class OllamaProvider:
             models = tuple(m["name"] for m in response.json().get("models", []))
         except httpx.HTTPError as exc:
             return HealthResult(ok=False, error=str(exc))
+        except (ValueError, KeyError, TypeError) as exc:
+            # **200 인데 우리가 아는 모양이 아니다.** 앞에 리버스 프록시가 서서
+            # 로그인 페이지를 돌려주는 구성이 흔하다. 도달은 했지만 이 노드는
+            # Ollama 로서 쓸 수 없으므로 실패로 본다 — 예외를 위로 올리면
+            # 프로브 사이클 전체가 끊긴다.
+            return HealthResult(ok=False, error=f"응답을 해석할 수 없다: {exc}")
 
         loaded = None
         try:
@@ -152,7 +158,7 @@ class OllamaProvider:
             if running.status_code == 200:
                 entries = running.json().get("models", [])
                 loaded = entries[0]["name"] if entries else None
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
             # 로드된 모델을 못 알아내도 노드가 죽은 것은 아니다.
             # 모델 친화는 최적화일 뿐이라 없어도 배치는 돈다.
             pass

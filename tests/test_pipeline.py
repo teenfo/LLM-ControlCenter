@@ -20,7 +20,7 @@ from app.pipeline import (
     is_public_role,
 )
 from app.store import TenantScope
-from tests.conftest import seed_tenant
+from tests.conftest import auth, seed_tenant
 
 VALID_RRN = "990101-1234563"
 VALID_CARD = "4111 1111 1111 1111"
@@ -434,3 +434,141 @@ def test_underscore_roles_are_internal():
     assert is_public_role("summarize")
     assert not is_public_role(GUARD_ROLE)
     assert not is_public_role("_anything")
+
+
+# ── 감사 M1 — 역할 기본 system 이 추론에 전달되지 않는다 ─────────────────────
+#
+# roles.yaml 의 계약은 "요청의 system 이 우선하고 **없을 때만** 역할 기본값을 쓴다"
+# 인데, 없을 때 아무것도 안 썼다. 그런데 `system_hash` 는 기본값을 보낸 것처럼
+# 해싱해서 프롬프트 드리프트 추적까지 "쓰고 있다" 고 거짓 보고했다.
+
+
+async def test_the_role_default_system_actually_reaches_the_job(harness, client, acme):
+    """저장된 잡이 역할 기본 system 을 들고 있어야 스케줄러가 그것을 보낸다."""
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+
+    job = harness.store.get_job(TenantScope("acme"), job_id)
+    assert job.system_masked == harness.config.roles["summarize"].system
+
+
+async def test_the_request_system_still_wins(harness, client, acme):
+    """**프롬프트는 호출자 소유다** — 기본값이 요청을 덮으면 계약 위반이다."""
+    job_id = client.post(
+        "/v1/generate",
+        json={"role": "summarize", "prompt": "안녕", "system": "내가 정한다", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+
+    job = harness.store.get_job(TenantScope("acme"), job_id)
+    assert job.system_masked == "내가 정한다"
+
+
+async def test_the_role_default_system_goes_through_the_guard(harness, config, store, clock):
+    """관리자가 역할 기본 system 에 실수로 넣은 PII 가 필터를 우회하면 안 된다."""
+    import dataclasses
+
+    from app.cluster import Cluster
+    from app.guard import Guard
+    from app.pipeline import Pipeline
+
+    role = config.roles["summarize"]
+    leaky = dataclasses.replace(role, system="담당자 lee@example.com 에게 문의")
+    patched = dataclasses.replace(config, roles={**config.roles, "summarize": leaky})
+
+    store.create_tenant("acme", "Acme", end_user_salt=b"salt")
+    store.create_service(TenantScope("acme"), "acme-web", "web")
+    cluster = Cluster(patched, store, now=clock)
+    pipeline = Pipeline(patched, store, cluster, Guard(patched), now=clock)
+
+    verdict = await pipeline._inspect(leaky, store.get_tenant("acme"), "본문", leaky.system)
+    assert "lee@example.com" not in (verdict.system_for("internal") or "")
+
+
+async def test_the_system_hash_reflects_what_was_actually_sent(harness, client, acme):
+    """해시가 "보냈다" 고 말하는데 안 보냈으면 드리프트 추적이 거짓말을 한다."""
+    from app.identity import hash_system
+
+    default_job = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    custom_job = client.post(
+        "/v1/generate",
+        json={"role": "summarize", "prompt": "안녕", "system": "다른 전략", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+
+    scope = TenantScope("acme")
+    default_row = harness.store.get_job(scope, default_job)
+    custom_row = harness.store.get_job(scope, custom_job)
+
+    assert default_row.system_hash == hash_system(harness.config.roles["summarize"].system)
+    assert custom_row.system_hash == hash_system("다른 전략")
+    assert default_row.system_hash != custom_row.system_hash
+
+
+# ── 감사 M8 — 대기 폴링이 잡 전체를 초당 20회 읽는다 ─────────────────────────
+
+
+async def test_waiting_reads_only_the_status_column(harness, client, acme, monkeypatch):
+    """`get_job` 은 `SELECT *` 다 — 폴링이 보는 것은 상태 한 칸뿐인데."""
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="queued")
+
+    full_reads = 0
+    original = harness.store.get_job
+
+    def counted(*args, **kwargs):
+        nonlocal full_reads
+        full_reads += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(harness.store, "get_job", counted)
+    await harness.pipeline.wait_for(scope, job_id, seconds=0.4)
+
+    # 마지막에 한 번만 전체를 읽는다. 폴마다 읽으면 이 수가 폴 횟수만큼 는다.
+    assert full_reads == 1, f"대기 중 잡 전체를 {full_reads}회 읽었다"
+
+
+async def test_the_poll_interval_backs_off(harness, client, acme):
+    """짧은 잡은 첫 폴에서 잡히고, 긴 잡을 20회/초로 확인할 이유는 없다."""
+    import asyncio
+
+    from app.pipeline import MAX_POLL_INTERVAL, POLL_BACKOFF, POLL_INTERVAL
+
+    assert POLL_BACKOFF > 1.0
+    assert POLL_INTERVAL < MAX_POLL_INTERVAL
+
+    scope = TenantScope("acme")
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+    harness.store.update_job(scope, job_id, status="queued")
+
+    intervals: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording(seconds, *args, **kwargs):
+        intervals.append(seconds)
+        return await real_sleep(0)
+
+    import app.pipeline as pipeline_module
+
+    original = pipeline_module.asyncio.sleep
+    pipeline_module.asyncio.sleep = recording
+    try:
+        await harness.pipeline.wait_for(scope, job_id, seconds=2.0)
+    finally:
+        pipeline_module.asyncio.sleep = original
+
+    assert len(intervals) > 3
+    assert intervals[-1] > intervals[0], "간격이 안 늘어난다"
+    assert max(intervals) <= MAX_POLL_INTERVAL

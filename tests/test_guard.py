@@ -688,3 +688,127 @@ def test_the_compile_cache_is_bounded():
     for n in range(MAX_COMPILED_PATTERNS + 20):
         guard._compile(rf"unique-pattern-{n}-\d+")
     assert len(guard._compiled) <= MAX_COMPILED_PATTERNS
+
+
+#: 체크섬을 통과하는 예시 번호(2020-10 이전 부여 규칙). 아래 테스트의 "검증된" 쪽.
+GOOD_RRN = "900101-1234568"
+
+#: 패턴은 맞지만 체크섬은 틀린 번호 — 2020-10 이후 임의번호가 정확히 이 모양이다.
+RANDOMIZED_RRN = "900101-1111111"
+
+
+# ── 감사 M2 — 체크섬이 성립하지 않게 된 식별자 체계 ──────────────────────────
+#
+# 한국 주민등록번호는 2020-10 부여체계 개편으로 뒷자리가 임의번호가 됐다. 그 이후
+# 발급·재발급된 번호는 검증식이 성립하지 않아 **약 90% 가 "체크섬 실패 = PII 아님"
+# 으로 읽히고 마스킹 없이 통과한다.** 체크섬을 빼면 13자리 숫자가 전부 걸려 오탐이
+# 쏟아지고, 오탐이 쏟아지면 관리자가 규칙을 꺼버린다 — 안 켜진 필터는 없는 필터다.
+
+
+def test_the_post_2020_rrn_scheme_defeats_the_checksum():
+    """전제를 먼저 못박는다 — 이게 사실이 아니면 아래 테스트가 무의미하다."""
+    import random
+
+    from app.guard import kr_rrn
+
+    rng = random.Random(7)
+    passed = sum(
+        kr_rrn("900101" + str(rng.randint(1, 4)) + "".join(str(rng.randint(0, 9)) for _ in range(6)))
+        for _ in range(2000)
+    )
+    assert passed < 300, "임의 뒷자리가 체크섬을 통과하고 있다 — 전제가 틀렸다"
+
+
+def test_a_checksum_failure_can_be_kept_as_audit(clock):
+    """**버리는 것이 늘 맞지는 않다.** 남겨야 얼마나 지나가는지가 보인다."""
+    from app.config import GuardRule
+    from app.guard import UNVERIFIED_SUFFIX, Guard
+
+    rule = GuardRule(
+        id="kr_rrn", kind="pattern", action="full", label="[주민등록번호]",
+        pattern=r"\b\d{6}[-\s]?[1-8]\d{6}\b", checksum="kr_rrn",
+        checksum_failed_action="audit", locale_pack="ko_KR",
+    )
+    guard = Guard(make_config((rule,)))
+
+    detections = guard._scan(f"번호는 {RANDOMIZED_RRN} 입니다", None, (rule,))
+    ids = {d.rule_id for d in detections}
+
+    assert f"kr_rrn{UNVERIFIED_SUFFIX}" in ids, "체크섬 실패 매치가 통째로 사라졌다"
+
+
+def test_the_unverified_hit_does_not_mask_by_default():
+    """`audit` 는 기록만 한다 — 오탐 피해 없이 규모를 잴 수 있는 것이 이 등급의 값이다."""
+    from app.config import GuardRule
+    from app.guard import Guard
+
+    rule = GuardRule(
+        id="kr_rrn", kind="pattern", action="full", label="[주민등록번호]",
+        pattern=r"\b\d{6}[-\s]?[1-8]\d{6}\b", checksum="kr_rrn",
+        checksum_failed_action="audit", locale_pack="ko_KR",
+    )
+    guard = Guard(make_config((rule,)))
+    detections = guard._scan(f"번호는 {RANDOMIZED_RRN} 입니다", None, (rule,))
+
+    unverified = next(d for d in detections if d.rule_id.endswith(":unverified"))
+    assert set(unverified.actions.values()) == {"audit"}
+
+
+def test_a_verified_hit_keeps_the_full_grade():
+    """체크섬을 통과한 것은 여전히 원래 등급으로 마스킹된다."""
+    from app.config import GuardRule
+    from app.guard import Guard
+
+    rule = GuardRule(
+        id="kr_rrn", kind="pattern", action="full", label="[주민등록번호]",
+        pattern=r"\b\d{6}[-\s]?[1-8]\d{6}\b", checksum="kr_rrn",
+        checksum_failed_action="audit", locale_pack="ko_KR",
+    )
+    guard = Guard(make_config((rule,)))
+    detections = guard._scan(f"번호는 {GOOD_RRN} 입니다", None, (rule,))
+
+    verified = next(d for d in detections if d.rule_id == "kr_rrn")
+    assert set(verified.actions.values()) == {"full"}
+
+
+def test_the_two_confidences_do_not_share_a_rule_id():
+    """같은 id 로 뭉치면 승격 게이트의 오탐률 표본에 확신도가 다른 둘이 섞인다."""
+    from app.config import GuardRule
+    from app.guard import Guard
+
+    rule = GuardRule(
+        id="kr_rrn", kind="pattern", action="full", label="[주민등록번호]",
+        pattern=r"\b\d{6}[-\s]?[1-8]\d{6}\b", checksum="kr_rrn",
+        checksum_failed_action="audit", locale_pack="ko_KR",
+    )
+    guard = Guard(make_config((rule,)))
+    detections = guard._scan(f"{GOOD_RRN} 와 {RANDOMIZED_RRN}", None, (rule,))
+
+    assert {d.rule_id for d in detections} == {"kr_rrn", "kr_rrn:unverified"}
+
+
+def test_dropping_the_failure_stays_the_default():
+    """표기하지 않은 규칙은 예전처럼 버린다 — 카드번호 오탐이 되살아나면 안 된다."""
+    from app.config import GuardRule
+    from app.guard import Guard
+
+    rule = GuardRule(
+        id="card", kind="pattern", action="full", label="[카드]",
+        pattern=r"\b(?:\d[ -]?){13,19}\b", checksum="luhn", locale_pack="common",
+    )
+    guard = Guard(make_config((rule,)))
+
+    assert guard._scan("숫자 1234567890123456 입니다", None, (rule,)) == []
+
+
+def test_the_shipped_rrn_rule_covers_foreign_registration_numbers():
+    """7번째 자리 5-8 은 외국인등록번호다 — 그것도 개인을 특정하는 번호다."""
+    import re
+
+    from app.config import load_config
+
+    config = load_config(REPO_CONFIG)
+    rule = next(r for r in config.guard_rules if r.id == "kr_rrn")
+
+    assert re.search(rule.pattern, "900101-5234567"), "외국인등록번호가 패턴에 안 걸린다"
+    assert rule.checksum_failed_action == "audit", "체크섬 실패를 통째로 버리고 있다"

@@ -38,6 +38,11 @@ ACTION_STRENGTH = {"off": 0, "audit": 1, "partial": 2, "full": 3, "block": 4}
 MAX_COMPILED_PATTERNS = 512
 
 STAGE_PATTERN = "pattern"
+
+#: 체크섬을 통과하지 못한 매치의 규칙 id 접미사. 확신도가 다른 탐지를 같은 id 로
+#: 뭉치면 승격 게이트의 오탐률 표본이 섞이고 관제 UI 가 둘을 구분하지 못한다.
+UNVERIFIED_SUFFIX = ":unverified"
+
 STAGE_LLM = "llm"
 
 
@@ -433,8 +438,10 @@ class Guard:
                 continue
             compiled = self._compile(rule.pattern)
 
-            spans = self._match_spans(compiled, rule, prompt)
-            system_spans = self._match_spans(compiled, rule, system or "")
+            spans, unverified = self._match_spans(compiled, rule, prompt)
+            system_spans, system_unverified = self._match_spans(
+                compiled, rule, system or ""
+            )
 
             if spans or system_spans:
                 detections.append(
@@ -450,6 +457,22 @@ class Guard:
                         keep_tail=rule.keep_tail,
                     )
                 )
+
+            # 체크섬이 틀린 매치는 **다른 규칙 id 로** 낸다. 같은 id 로 뭉치면
+            # 승격 게이트가 "이 규칙의 오탐률" 을 재는 표본에 확신도가 다른 둘이
+            # 섞이고, 관제 UI 도 둘을 구분하지 못한다.
+            failed_action = rule.checksum_failed_action
+            if failed_action and failed_action != "off" and (unverified or system_unverified):
+                detections.append(
+                    Detection(
+                        rule_id=f"{rule.id}{UNVERIFIED_SUFFIX}", stage=STAGE_PATTERN,
+                        actions={INTERNAL: failed_action, EXTERNAL: failed_action},
+                        spans=tuple(unverified),
+                        system_spans=tuple(system_unverified),
+                        label=rule.label or f"[{rule.id}]",
+                        keep_tail=rule.keep_tail,
+                    )
+                )
         return detections
 
     def probe_rule(self, rule: GuardRule, text: str) -> int:
@@ -460,21 +483,31 @@ class Guard:
         """
         if rule.kind != "pattern" or not rule.pattern:
             return 0
-        return len(self._match_spans(self._compile(rule.pattern), rule, text))
+        verified, _ = self._match_spans(self._compile(rule.pattern), rule, text)
+        return len(verified)
 
     @staticmethod
     def _match_spans(
         compiled: re.Pattern[str], rule: GuardRule, text: str
-    ) -> list[tuple[int, int]]:
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """(체크섬을 통과한 스팬, 통과하지 못한 스팬).
+
+        둘을 나누는 이유: 체크섬 불일치를 **버리는 것**이 기본이지만 늘 맞지는
+        않다. 버리면 숫자 나열이 전부 PII 가 되는 오탐 홍수를 막는 대신,
+        체크섬 자체가 성립하지 않게 된 식별자 체계(2020-10 이후 주민등록번호)를
+        통째로 놓친다. 나눠서 돌려주면 규칙이 그 둘에 다른 등급을 줄 수 있다.
+        """
         if not text:
-            return []
+            return [], []
         validator = CHECKSUMS.get(rule.checksum) if rule.checksum else None
-        return [
-            match.span()
-            for match in compiled.finditer(text)
-            # 체크섬 불일치는 오탐이다. 걸러내지 않으면 숫자 나열이 전부 PII 가 된다.
-            if validator is None or validator(match.group(0))
-        ]
+        if validator is None:
+            return [m.span() for m in compiled.finditer(text)], []
+
+        verified: list[tuple[int, int]] = []
+        unverified: list[tuple[int, int]] = []
+        for match in compiled.finditer(text):
+            (verified if validator(match.group(0)) else unverified).append(match.span())
+        return verified, unverified
 
     def _apply_classifier_failure(self, boundaries: frozenset[str]) -> frozenset[str]:
         policy = self._settings.on_classifier_error

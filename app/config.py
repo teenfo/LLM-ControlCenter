@@ -146,6 +146,14 @@ class GuardRule:
     #: 체크섬 검증기 이름. 없으면 패턴만으로 판정한다.
     #: 체크섬이 없으면 숫자 나열이 전부 PII 가 되고, 오탐이 쏟아지면 관리자가 규칙을 꺼버린다.
     checksum: str | None = None
+    #: 패턴은 맞는데 **체크섬이 틀린** 매치에 적용할 등급. 기본은 버린다(`off`).
+    #:
+    #: 버리는 것이 늘 맞지는 않다. 한국 주민등록번호는 2020-10 부여체계 개편으로
+    #: 뒷자리가 임의번호가 되어 **체크섬이 성립하지 않는다** — 그 이후 발급·재발급된
+    #: 번호는 전부 "체크섬 실패 = PII 아님" 으로 읽혀 마스킹 없이 통과한다.
+    #: 체크섬을 없애면 오탐이 쏟아져 관리자가 규칙을 꺼버리고(C2), 그대로 두면
+    #: 진짜 PII 가 샌다. 그래서 **세 번째 칸**을 둔다 — `audit` 로 남겨서 보이게 한다.
+    checksum_failed_action: str | None = None
     keep_tail: int = 0
     description: str | None = None
     #: 이 규칙이 속한 로케일 팩. common 은 항상 켜진다.
@@ -364,6 +372,17 @@ def _guard_rule_from_dict(raw: Mapping[str, Any], locale_pack: str) -> GuardRule
             "— 관리자가 맥락을 문장으로 정의하는 것이 이 규칙의 전부다"
         )
 
+    failed_action = raw.get("checksum_failed_action")
+    if failed_action is not None:
+        if not raw.get("checksum"):
+            raise ConfigError(
+                f"가드 규칙 {rule_id}: checksum 없이 checksum_failed_action 은 의미가 없다"
+            )
+        if failed_action not in GUARD_ACTIONS:
+            raise ConfigError(
+                f"가드 규칙 {rule_id}: checksum_failed_action 은 {GUARD_ACTIONS} 중 하나여야 한다"
+            )
+
     return GuardRule(
         id=str(rule_id),
         kind=kind,
@@ -371,6 +390,7 @@ def _guard_rule_from_dict(raw: Mapping[str, Any], locale_pack: str) -> GuardRule
         label=str(raw.get("label", "")),
         pattern=pattern,
         checksum=raw.get("checksum"),
+        checksum_failed_action=failed_action,
         keep_tail=int(raw.get("keep_tail", 0)),
         description=raw.get("description"),
         locale_pack=locale_pack,

@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from dataclasses import dataclass, field
@@ -27,7 +28,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .config import EXTERNAL, INTERNAL, Config, ConfigError, Node, Role, node_from_dict
 from .cost import CostAccountant
 from .i18n import ApiError
-from .providers import Provider, build_provider
+from .providers import HealthResult, Provider, build_provider
 from .store import SqliteStore, TenantScope
 
 # 배치 결과
@@ -43,6 +44,14 @@ DRAINING = "draining"
 #: 직전 실패 노드 탈락 사유. **다른 후보가 없으면 되살린다** — 배제는 선호이지
 #: 금지가 아니다. 노드 한 대짜리 구성에서 금지는 곧 재시도 불능이다.
 LAST_FAILED = "last_failed_node"
+
+#: **이 잡의 생애 동안 변하지 않는** 탈락 사유. 관리자가 무엇을 해도 풀리지 않는다 —
+#: 역할의 `internal_only` 는 오버라이드 불가 필드이고, 가드 판정은 제출 시점에 잡에
+#: 박힌다. 전부 이것뿐이면 기다릴 이유가 없으므로 즉시 실패시킨다.
+#:
+#: 에어갭·`tenant_affinity`·헬스는 여기 없다 — 관리자가 되돌릴 수 있고, 되돌릴 수
+#: 있는 것을 하드 실패시키면 정비 5분에 그 티어 잡이 전멸한다(B5).
+PERMANENT_REJECTIONS = frozenset({"boundary_internal_only", "boundary_blocked_by_guard"})
 
 #: 노드 등록 본문이 받는 필드. `name` 은 따로 뽑으므로 여기 없다.
 NODE_REGISTRATION_FIELDS = frozenset(
@@ -359,6 +368,30 @@ class Cluster:
         """노드가 이 잡을 받을 수 없는 이유. `None` 이면 후보다."""
         node = state.node
 
+        # **바뀔 수 없는 것을 먼저 본다.**
+        #
+        # 순서가 진단의 정확도를 정한다. 헬스를 먼저 보면, 경계 때문에 애초에 못 가는
+        # 노드가 마침 unhealthy 일 때 "unhealthy" 로 보고되고, 그 잡은 노드가 살아나면
+        # 될 것처럼 대기하다 900초 뒤 `administrative_wait_timeout` 으로 죽는다 —
+        # 관리자를 기다렸다는 뜻인데 사실은 어떤 관리자도 풀 수 없는 조건이었다.
+        #
+        # 데이터 경계 — 두 겹이다.
+        #   ① 역할의 internal_only: 어떤 상황에서도 경계 밖에 가지 않는다(설정으로 못 푼다).
+        #   ② 가드가 좁힌 허용 경계: 차단 등급에 걸린 경계가 여기서 빠져 있다.
+        # 둘 다 **이 잡의 생애 동안 변하지 않는다** — 역할의 internal_only 는 오버라이드
+        # 불가 필드이고, 가드 판정은 제출 시점에 잡에 박힌다.
+        if role.internal_only and not node.is_internal:
+            return "boundary_internal_only"
+        if node.data_boundary not in allowed_boundaries:
+            return "boundary_blocked_by_guard"
+
+        # 아래부터는 관리자가 되돌릴 수 있는 것들이다.
+        if self._airgap and not node.is_internal:
+            return "airgap_external_disabled"
+
+        if not node.allows_tenant(tenant_id):
+            return "tenant_affinity"
+
         if not node.enabled:
             return "disabled"
         if state.status == DRAINING:
@@ -368,20 +401,6 @@ class Cluster:
         # 기동 직후가 항상 정지 상태가 된다.
         if state.status == UNHEALTHY:
             return "unhealthy"
-
-        if not node.allows_tenant(tenant_id):
-            return "tenant_affinity"
-
-        # 데이터 경계 — 두 겹이다.
-        #   ① 역할의 internal_only: 어떤 상황에서도 경계 밖에 가지 않는다(설정으로 못 푼다).
-        #   ② 가드가 좁힌 허용 경계: 차단 등급에 걸린 경계가 여기서 빠져 있다.
-        if self._airgap and not node.is_internal:
-            return "airgap_external_disabled"
-
-        if role.internal_only and not node.is_internal:
-            return "boundary_internal_only"
-        if node.data_boundary not in allowed_boundaries:
-            return "boundary_blocked_by_guard"
 
         if state.provider.capabilities.requires_model_install and model not in state.models:
             # 헬스 프로브 전에는 models 가 비어 있다. 그때는 막지 않는다 —
@@ -421,6 +440,20 @@ class Cluster:
         판정 기준은 현재 사용량이 아니라 노드 **용량**이다. 21GB 모델을 20GB 노드뿐인
         클러스터에 던지면 큐가 비어도 못 도니까 조용히 쌓아두지 않는다.
         """
+        # **영원히 못 도는 것을 900초 기다리게 하지 않는다.**
+        #
+        # 모든 후보가 이 잡의 생애 동안 변하지 않는 이유로 탈락했다면, 기다려도
+        # 달라지지 않는다. 그런데도 WAIT 로 두면 소비자는 15분을 매달린 뒤
+        # `administrative_wait_timeout` 을 받는다 — "관리자를 기다렸다" 는 뜻이라
+        # 실제 원인(가드가 경계를 좁혔다)을 아무도 못 찾는다.
+        if rejections and all(r in PERMANENT_REJECTIONS for r in rejections.values()):
+            return PlacementResult(
+                FAIL,
+                reason=_dominant_reason(rejections),
+                code="boundary_impossible",
+                rejections=rejections,
+            )
+
         for tier in tiers:
             for state in self._nodes.values():
                 if not state.node.matches_tier(tier):
@@ -488,7 +521,18 @@ class Cluster:
         if state is None:
             return False
 
-        result = await state.provider.health()
+        # **프로바이더가 예외를 던져도 여기서 끝난다.**
+        #
+        # 노드가 200 에 비정형 본문을 주면 `health()` 안의 JSON 파싱이 터진다.
+        # 그 예외가 여기를 지나 `probe_all` 까지 올라가면 **그 다음 노드들이 이번
+        # 주기에 프로브를 못 받고**, 정작 문제의 노드는 unhealthy 판정도 못 받아
+        # 계속 배치된다. 배경 루프의 `suppress` 가 그 사실을 통째로 삼킨다.
+        #
+        # 프로바이더는 나중에 추가되는 것이고, 이 모듈이 그것을 신뢰할 이유가 없다.
+        try:
+            result = await state.provider.health()
+        except Exception as exc:
+            result = HealthResult(ok=False, error=f"프로브 예외: {exc}")
         state.last_probe_at = self._now()
 
         if result.ok:
@@ -500,7 +544,20 @@ class Cluster:
         return result.ok
 
     async def probe_all(self) -> dict[str, bool]:
-        return {name: await self.probe(name) for name in self._nodes}
+        """모든 노드를 **동시에** 프로브한다.
+
+        순차로 돌면 죽은 노드 N 대에 한 바퀴가 N × 타임아웃이다 — 노드 5대가
+        죽으면 50초짜리 주기가 되고, 그 사이 살아난 노드는 계속 못 쓴다.
+        느린 노드 하나가 나머지 전부의 갱신을 미루면 안 된다.
+        """
+        names = list(self._nodes)
+        results = await asyncio.gather(
+            *(self.probe(name) for name in names), return_exceptions=True
+        )
+        return {
+            name: (result is True)
+            for name, result in zip(names, results)
+        }
 
     # -- 등록 -----------------------------------------------------------------
 

@@ -37,6 +37,11 @@ from .store import SqliteStore, TenantScope
 
 LANE_POLL_SECONDS = 0.5
 
+#: 종료 시 진행 중인 실행을 기다리는 상한. 노드가 응답하지 않으면 잡 타임아웃까지
+#: 걸릴 수 있는데, 종료가 그만큼 매달리면 오케스트레이터가 SIGKILL 을 보낸다 —
+#: 그러면 우아한 종료를 시도한 의미가 없어진다.
+DRAIN_SECONDS = 20.0
+
 
 @dataclass
 class LaneStats:
@@ -92,6 +97,10 @@ class Scheduler:
         self._lane_running: dict[str, int] = {name: 0 for name in config.lanes}
         self._stats: dict[str, LaneStats] = {name: LaneStats() for name in config.lanes}
         self._tasks: list[asyncio.Task[Any]] = []
+        #: 진행 중인 `_execute`. 루프 태스크와 달리 **취소하면 안 되는** 것들이다 —
+        #: 노드는 이미 추론을 돌리고 있고, 여기서 끊으면 그 잡이 `running` 인 채
+        #: 남아 다음 기동의 크래시 복구 경로를 탄다. 정상 종료가 크래시처럼 보인다.
+        self._inflight: set[asyncio.Task[Any]] = set()
         self._stopping = asyncio.Event()
 
     # -- 수명주기 --------------------------------------------------------------
@@ -114,7 +123,17 @@ class Scheduler:
         self._tasks.append(asyncio.create_task(self._retention_loop(), name="retention"))
         self._tasks.append(asyncio.create_task(self._watch_loop(), name="watch"))
 
-    async def stop(self) -> None:
+    async def stop(self, *, drain_seconds: float = DRAIN_SECONDS) -> None:
+        """루프를 멈추고 **진행 중인 실행은 끝나기를 기다린다.**
+
+        루프만 취소하고 나가면 in-flight `_execute` 가 미정리 상태로 파괴된다.
+        그 잡들은 DB 에 `running` 으로 남고, 다음 기동의 크래시 복구가 그것을
+        재큐하거나(중복 실행) `needs_review` 로 세운다 — **정상 종료가 크래시
+        복구 경로를 타는 것**이고, 배포할 때마다 그렇게 된다.
+
+        기다리는 데 상한을 둔다. 노드가 응답하지 않으면 잡의 타임아웃까지
+        걸릴 수 있는데, 종료가 그만큼 매달리면 오케스트레이터가 SIGKILL 을 보낸다.
+        """
         self._stopping.set()
         for task in self._tasks:
             task.cancel()
@@ -122,6 +141,17 @@ class Scheduler:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._tasks.clear()
+
+        if self._inflight:
+            _done, pending = await asyncio.wait(
+                tuple(self._inflight), timeout=drain_seconds
+            )
+            for task in pending:
+                # 상한을 넘겼다. 취소하되 **왜 그랬는지가 보이게** 남긴다 —
+                # 조용히 버리면 다음 기동의 needs_review 를 아무도 설명 못 한다.
+                task.cancel()
+                self._notify("crash_recovery_needs_review", {"requeued": 0, "needs_review": 1})
+            self._inflight.clear()
 
     # -- 레인 루프 -------------------------------------------------------------
 
@@ -249,7 +279,15 @@ class Scheduler:
             tier=placement.tier, started_at=self._now(),
             wait_reason=None, wait_since=None,
         )
-        asyncio.create_task(self._execute(scope, job.id, lane, placement))
+        # **참조를 붙잡는다.** `create_task` 의 반환을 버리면 이벤트 루프는 태스크를
+        # 약한 참조로만 들고 있어서, GC 가 실행 도중에 가져갈 수 있다. 그러면 잡은
+        # `running` 인 채 남고 `_execute` 의 `finally` 가 안 돌아 슬롯·메모리·비용
+        # 예약이 영영 안 풀린다 — 부하가 없는데 큐가 쌓이는 그 증상이다.
+        task = asyncio.create_task(
+            self._execute(scope, job.id, lane, placement), name=f"exec:{job.id}"
+        )
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
         return True
 
     def _record_wait(self, scope: TenantScope, job: Any, reason: str, lane: str) -> None:
@@ -355,7 +393,18 @@ class Scheduler:
             return
 
         attempts = job.attempts + 1
-        retriable = exc.retryable and attempts <= self._thresholds.max_retries
+        # **"이 노드에서 안 된다" 와 "어디서도 안 된다" 는 다르다.**
+        #
+        # `ModelNotFound` 는 `retryable=False` 다 — 같은 노드에 다시 보내도 결과가
+        # 같으니 맞는 판정이다. 그런데 재시도가 **재배치를 동반**하므로 다음 시도는
+        # 다른 노드로 간다. 기동 직후에는 인벤토리가 비어 있어 배치 필터가 노드를
+        # 통과시키는데(모른다는 이유로 막으면 전부 대기한다), 그렇게 잘못 간 잡이
+        # 여기서 재배치 없이 죽는다 — 그 모델을 가진 노드가 멀쩡히 놀고 있는데도.
+        #
+        # 모델 설치 요청 경로는 `_fail` 이 그대로 태운다. 여기서는 다른 노드를
+        # 한 번 더 시도할 뿐이고, 전부 없으면 결국 그 경로로 간다.
+        rebindable = exc.code == "model_not_installed"
+        retriable = (exc.retryable or rebindable) and attempts <= self._thresholds.max_retries
 
         if retriable:
             # **재시도는 재배치를 동반한다.** 직전 실패 노드를 남겨 배치가 그 노드를 피한다.

@@ -26,6 +26,7 @@
   "error.model_not_installed": "모델 '{model}'이(가) 설치되어 있지 않습니다.",
   "error.no_placement": "이 역할을 실행할 수 있는 노드가 없습니다.",
   "error.capacity_impossible": "어떤 노드의 용량으로도 모델 '{model}'을(를) 실행할 수 없습니다.",
+  "error.boundary_impossible": "이 요청은 허용된 데이터 경계 안의 어떤 노드로도 보낼 수 없습니다.",
   "error.administrative_wait_timeout": "사용 가능한 노드를 기다리다 시간이 초과되었습니다.",
   "error.node_unreachable": "노드 '{node}'에 연결할 수 없습니다.",
   "error.backend_unavailable": "백엔드를 사용할 수 없습니다. 잠시 후 다시 시도하세요.",

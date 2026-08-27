@@ -708,6 +708,20 @@ class SqliteStore:
         self._conn.commit()
         return job_id
 
+    def job_status(self, scope: TenantScope, job_id: str) -> str | None:
+        """상태 한 칸만. **대기 폴링이 매번 잡 전체를 읽지 않게 한다.**
+
+        `get_job` 은 `SELECT *` 라 마스킹본·암호문·응답까지 끌어온다. 완료를
+        기다리는 요청이 수십 건이면 그 전량이 초당 수백 번 오간다 — 정작 폴링이
+        보는 것은 이 한 칸뿐이다.
+        """
+        where, params = self._scoped_where(scope, "id = ?")
+        params.append(job_id)
+        row = self._conn.execute(
+            f"SELECT status FROM jobs WHERE {where}", params
+        ).fetchone()
+        return row["status"] if row else None
+
     def get_job(self, scope: TenantScope, job_id: str) -> JobRow | None:
         where, params = self._scoped_where(scope, "id = ?")
         params.append(job_id)
