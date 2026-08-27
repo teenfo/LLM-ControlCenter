@@ -38,7 +38,7 @@ from app.cluster import Cluster
 from app.crypto import ENV_MASTER_KEY, KeyVault
 from app.guard import Guard
 from app.store import SqliteStore, TenantScope
-from tests.conftest import auth
+from tests.conftest import auth, seed_tenant
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1042,3 +1042,89 @@ def test_the_ciphertext_is_gone_even_when_verification_fails(tmp_path, vault_wit
     strip = body.index("prompt_cipher = NULL")
     verify = body.index("백업의 테넌트가 원본보다")
     assert strip < verify, "암호문 제거가 검증보다 뒤에 있다"
+
+
+# ── 감사 M24·M27 — 클라이언트와 스크립트 ────────────────────────────────────
+
+
+def test_the_client_rate_limit_example_does_not_crash_itself():
+    """**오류 계약 시범이 목적인 파일에서 정확히 그 시범 경로가 깨졌다.**
+
+    설치처 개발자가 그대로 복사해 쓰는 코드다.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "lcc_client", ROOT / "clients" / "client.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    # `@dataclass` 가 문자열 애노테이션을 풀 때 sys.modules 를 본다.
+    sys.modules["lcc_client"] = module
+    try:
+        spec.loader.exec_module(module)
+
+        limited = module.RateLimited(
+            429, {"code": "rate_limited", "scope": "tenant", "retry_after": 12}
+        )
+        # 예시가 부르는 두 속성이 실제로 있어야 한다.
+        assert limited.scope == "tenant"
+        assert limited.retry_after == 12.0
+    finally:
+        sys.modules.pop("lcc_client", None)
+
+
+def test_a_rate_limited_response_actually_carries_retry_after(harness, client):
+    """클라이언트가 지키라고 문서에 적은 값을 서버가 안 주고 있었다."""
+    tokens = seed_tenant(harness, "tight", rate_limit=1)
+    client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(tokens["service"]),
+    )
+    second = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(tokens["service"]),
+    )
+
+    assert second.status_code == 429
+    body = second.json()
+    assert body["scope"] in ("tenant", "service", "end_user")
+    assert 1 <= float(body["retry_after"]) <= 60
+
+
+def test_the_client_never_branches_on_a_message_string():
+    """로케일이 바뀌면 한국어 메시지로 분기한 코드가 조용히 실패한다(§5.4)."""
+    source = (ROOT / "clients" / "client.py").read_text(encoding="utf-8")
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or stripped.startswith('"'):
+            continue
+        assert 'message ==' not in stripped, line
+        assert '"message")' not in stripped or "get(" in stripped
+
+
+@pytest.mark.parametrize("name", ["preflight.sh", "doctor.sh", "backup.sh", "restore.sh"])
+def test_scripts_do_not_call_bare_python_on_the_host(name):
+    """**README 권장 데모 OS(Xubuntu 24.04)에 `python` 바이너리가 없다.**
+
+    컨테이너 안(`docker compose exec`)은 예외다 — 이미지에는 `python` 이 있다.
+    """
+    offenders = []
+    for number, line in enumerate((ROOT / name).read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "docker compose exec" in stripped or "docker compose run" in stripped:
+            continue
+        if stripped.startswith("PY=") or "|| PY=" in stripped:
+            continue     # 해석기를 고르는 줄 자체는 대상이 아니다
+        if re.search(r"(^|[^3\w\"$/-])python(?!3)\b", stripped):
+            offenders.append(f"{number}: {stripped}")
+    assert not offenders, f"{name} 이 호스트에서 `python` 을 부른다:\n" + "\n".join(offenders)
+
+
+@pytest.mark.parametrize("name", ["doctor.sh", "backup.sh", "restore.sh"])
+def test_scripts_resolve_the_interpreter_the_same_way(name):
+    """세 스크립트가 각자 다르게 찾으면 한 곳만 고쳐 놓고 고쳤다고 믿게 된다."""
+    text = (ROOT / name).read_text(encoding="utf-8")
+    assert 'PY="${LCC_PYTHON:-python3}"' in text
+    assert 'command -v "$PY"' in text

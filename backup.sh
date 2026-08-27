@@ -12,6 +12,12 @@
 
 set -eu
 
+# 호스트의 파이썬. **`python` 이 아니라 `python3` 이다** — README 가 권장하는
+# 데모 OS(Xubuntu 24.04)에 `python` 바이너리가 없어서, 그대로 두면 이 스크립트가
+# 설치처의 절반에서 "command not found" 로 끝난다.
+PY="${LCC_PYTHON:-python3}"
+command -v "$PY" >/dev/null 2>&1 || PY=python
+
 DEST="${1:-./backups}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 WORK=$(mktemp -d)
@@ -26,7 +32,7 @@ if docker compose ps --status running 2>/dev/null | grep -q controlcenter; then
 else
   DB="${LCC_DATA_DIR:-./data}/controlcenter.db"
   [ -f "$DB" ] || { printf 'DB 를 찾을 수 없습니다: %s\n' "$DB" >&2; exit 1; }
-  python -m app.backup "$DB" "$WORK/controlcenter.db"
+  "$PY" -m app.backup "$DB" "$WORK/controlcenter.db"
 fi
 
 cp -r config "$WORK/config"

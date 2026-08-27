@@ -101,12 +101,22 @@ KNOWN_EVENTS: tuple[str, ...] = (
     "budget_warn",
     "budget_exhausted",
     "guard_blocks_spike",
+    "guard_blocks_normal",
     "classifier_error_rate",
+    "classifier_error_normal",
     "crash_recovery_needs_review",
 )
 
 #: 좋은 소식인 이벤트. 기동 직후에는 보내지 않는다(원칙 ②).
-RECOVERY_EVENTS = frozenset({"node_recovered", "model_ready"})
+RECOVERY_EVENTS = frozenset({
+    "node_recovered",
+    "model_ready",
+    # **정상 상태도 좋은 소식이다.** 이것이 빠져 있어서 재기동 후 첫 워치 주기마다
+    # "차단 0건 급증" 알림이 나갔다 — 첫 관측은 무조건 전이로 보이기 때문이다.
+    # 그리고 회복 전이도 "급증" 이벤트로 발송돼 제목과 내용이 반대였다.
+    "guard_blocks_normal",
+    "classifier_error_normal",
+})
 
 
 def redact(detail: Mapping[str, Any]) -> dict[str, Any]:

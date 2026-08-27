@@ -68,6 +68,22 @@ class RateLimited(ControlCenterError):
     def scope(self) -> str:
         return str(self.params.get("scope", ""))
 
+    @property
+    def retry_after(self) -> float | None:
+        """서버가 준 재시도 간격(초). 없으면 `None`.
+
+        이 속성이 없어서 아래 예시의 한도 초과 처리 코드가 `AttributeError` 로
+        죽었다 — **오류 계약 시범이 목적인 파일에서 정확히 그 시범 경로가.**
+        설치처 개발자가 그대로 복사해 쓰는 코드다.
+        """
+        value = self.params.get("retry_after")
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
 
 @dataclass
 class Result:

@@ -9,6 +9,12 @@
 
 set -eu
 
+# 호스트의 파이썬. **`python` 이 아니라 `python3` 이다** — README 가 권장하는
+# 데모 OS(Xubuntu 24.04)에 `python` 바이너리가 없어서, 그대로 두면 이 스크립트가
+# 설치처의 절반에서 "command not found" 로 끝난다.
+PY="${LCC_PYTHON:-python3}"
+command -v "$PY" >/dev/null 2>&1 || PY=python
+
 ARGS=""
 BUNDLE=""
 for arg in "$@"; do
@@ -42,4 +48,4 @@ fi
 
 [ -n "$BUNDLE" ] && ARGS=$(printf '%s' "$ARGS" | sed "s|/data/$BUNDLE|./$BUNDLE|")
 # shellcheck disable=SC2086
-exec python -m app doctor $ARGS
+exec "$PY" -m app doctor $ARGS

@@ -274,7 +274,13 @@ class RateLimiter:
             if self._store.rate_count(key, since) >= limit:
                 raise ApiError(
                     "rate_limited", status=429, retryable=True,
-                    params={"scope": scope_name, "limit": limit},
+                    params={
+                        "scope": scope_name, "limit": limit,
+                        # **언제 다시 오면 되는지를 준다.** 이 값이 없으면 소비자는
+                        # 자기 판단으로 재시도하고, 그 판단은 대개 "바로 다시" 다 —
+                        # 그러면 한도에 걸린 소비자가 입구를 계속 두드린다.
+                        "retry_after": self._retry_after(key, since),
+                    },
                 )
 
         for _, key, _ in checks:
@@ -292,9 +298,25 @@ class RateLimiter:
         if self._store.rate_count(key, since) >= limit:
             raise ApiError(
                 "rate_limited", status=429, retryable=True,
-                params={"scope": scope_label, "limit": limit},
+                params={
+                    "scope": scope_label, "limit": limit,
+                    "retry_after": self._retry_after(key, since),
+                },
             )
         self._store.bump_rate_counter(key, bucket)
+
+    def _retry_after(self, key: str, since: int) -> int:
+        """윈도가 다시 열릴 때까지 남은 초.
+
+        슬라이딩 윈도라 **가장 오래된 요청이 빠져나가는 시점**이 곧 여유가 생기는
+        시점이다. 그것을 모르면 창 길이(60초)를 통째로 돌려주는데, 그러면 1초만
+        기다리면 되는 소비자도 1분을 쉰다.
+        """
+        oldest = self._store.oldest_rate_bucket(key, since)
+        if oldest is None:
+            return 1
+        remaining = int(oldest + RATE_WINDOW_SECONDS - self._now())
+        return max(1, min(RATE_WINDOW_SECONDS, remaining))
 
     def prune(self) -> int:
         """윈도를 벗어난 버킷을 정리한다. 스케줄러의 보존 루프가 주기적으로 부른다."""

@@ -27,10 +27,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
+import logging
+
 from .cluster import FAIL, WAIT, Cluster, Placement
 from .config import EXTERNAL, Config
 from .cost import CostAccountant
 from .models import ModelRegistrar
+from .observability import log_event
 from .roles import RoleResolver, resolver_for
 from .providers import BackendError
 from .store import SqliteStore, TenantScope
@@ -41,6 +44,8 @@ LANE_POLL_SECONDS = 0.5
 #: 걸릴 수 있는데, 종료가 그만큼 매달리면 오케스트레이터가 SIGKILL 을 보낸다 —
 #: 그러면 우아한 종료를 시도한 의미가 없어진다.
 DRAIN_SECONDS = 20.0
+
+log = logging.getLogger("llmcc.scheduler")
 
 
 @dataclass
@@ -66,6 +71,21 @@ def _longest_outbound(job: Any) -> str:
         job.system_external or job.system_masked or ""
     )
     return max(internal, external, key=len)
+
+
+def _loop_failure(loop: str, exc: BaseException) -> None:
+    """배경 루프의 실패를 **구조화 로그로 남긴다.**
+
+    루프를 죽이지 않는 것과 실패를 감추는 것은 다르다. `suppress(Exception)` 만
+    두면 헬스 프로브가 매 주기 터져도 화면에는 "노드 상태 unknown" 만 보이고,
+    아무도 왜인지 모른다 — "조용한 실패를 시끄럽게" 원칙의 정반대다.
+
+    본문·비밀은 안 담는다. 담기는 것은 어느 루프가 어떤 예외로 죽었는가뿐이다.
+    """
+    log_event(
+        log, "배경 루프 실패",
+        loop=loop, error_type=type(exc).__name__, error=str(exc)[:200],
+    )
 
 
 class Scheduler:
@@ -159,8 +179,9 @@ class Scheduler:
         while not self._stopping.is_set():
             try:
                 await self.tick(lane)
-            except Exception:  # 한 틱의 실패가 레인을 죽이면 안 된다
-                pass
+            except Exception as exc:
+                # 한 틱의 실패가 레인을 죽이면 안 된다 — 다만 **조용히는 아니다.**
+                _loop_failure(f"lane:{lane}", exc)
             await asyncio.sleep(LANE_POLL_SECONDS)
 
     async def tick(self, lane: str) -> int:
@@ -449,25 +470,31 @@ class Scheduler:
     async def _health_loop(self) -> None:
         interval = self._thresholds.health_probe_interval_seconds
         while not self._stopping.is_set():
-            with contextlib.suppress(Exception):
+            try:
                 await self._cluster.probe_all()
+            except Exception as exc:
+                _loop_failure("health", exc)
             await asyncio.sleep(interval)
 
     async def _models_loop(self) -> None:
         """미설치 탐지 · 승인된 모델 설치. 레지스트러가 없으면 아무것도 안 한다."""
         while not self._stopping.is_set():
             if self._registrar is not None:
-                with contextlib.suppress(Exception):
+                try:
                     self._registrar.detect_missing()
                     await self._registrar.process_approved()
+                except Exception as exc:
+                    _loop_failure("models", exc)
             await asyncio.sleep(self._thresholds.health_probe_interval_seconds)
 
     async def _watch_loop(self) -> None:
         """사람이 모르면 조용히 멈추는 지점을 주기적으로 본다."""
         while not self._stopping.is_set():
             await asyncio.sleep(self._thresholds.health_probe_interval_seconds * 2)
-            with contextlib.suppress(Exception):
+            try:
                 self.run_watches()
+            except Exception as exc:
+                _loop_failure("watch", exc)
 
     def run_watches(self) -> dict[str, Any]:
         """예산 소진 · 가드 차단 급증 · 분류 실패율.
@@ -505,9 +532,13 @@ class Scheduler:
         blocks = self._store.recent_filter_event_count("block", since=self._now() - 3600)
         spike = blocks >= self._thresholds.guard_block_spike_per_hour
         findings["guard_blocks_last_hour"] = blocks
+        # **상태마다 다른 이벤트를 준다** — 노드 헬스가 offline/recovered 를
+        # 나눠 쓰는 것과 같은 이유다. 하나로 쓰면 회복 전이가 "급증" 제목으로
+        # 나가고, 첫 관측(재기동 직후)마다 "0건 급증" 이 나간다.
         self._notifier.observe(
             "guard:blocks", "spike" if spike else "normal",
-            event="guard_blocks_spike", count=blocks,
+            event="guard_blocks_spike" if spike else "guard_blocks_normal",
+            count=blocks,
         )
 
         # 분류 실패는 판정이 아니다. 실패율이 오르면 관리자가 알아야 한다.
@@ -516,14 +547,17 @@ class Scheduler:
         bad = rate >= self._thresholds.classifier_failure_rate_warn
         self._notifier.observe(
             "guard:classifier", "degraded" if bad else "ok",
-            event="classifier_error_rate", percent=round(rate * 100, 1),
+            event="classifier_error_rate" if bad else "classifier_error_normal",
+            percent=round(rate * 100, 1),
         )
         return findings
 
     async def _retention_loop(self) -> None:
         while not self._stopping.is_set():
-            with contextlib.suppress(Exception):
+            try:
                 self.run_retention()
+            except Exception as exc:
+                _loop_failure("retention", exc)
             await asyncio.sleep(3600)
 
     def run_retention(self) -> dict[str, int]:

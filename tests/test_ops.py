@@ -624,3 +624,135 @@ def test_the_admin_view_still_shows_who_is_pinned(harness, acme):
     snapshot = next(n for n in harness.cluster.snapshot() if n["node"] == "in-1")
 
     assert snapshot["tenant_affinity"] == ["acme"]
+
+
+# ── 감사 M22 — 기동·회복 시 가짜 "급증" 알림 ────────────────────────────────
+#
+# 정상 상태도 `observe()` 로 넣는데 `guard_blocks_spike` 가 `RECOVERY_EVENTS` 에
+# 없어서, 재시작 후 첫 워치 주기마다 "0건 급증" 알림이 나갔다. 회복 전이도
+# "급증" 이벤트로 발송돼 제목과 내용이 반대였다. "상태 전이에서만" 원칙 위반이다.
+
+
+def test_a_quiet_system_does_not_announce_a_spike_on_startup(harness):
+    """**첫 관측은 무조건 전이로 보인다** — 좋은 소식이면 삼켜야 한다."""
+    harness.scheduler.run_watches()
+
+    events = [s["subject"] for s in harness.channel.sent]
+    assert not any("guard_blocks" in e for e in events), f"기동 직후 알림: {events}"
+    assert not any("classifier_error" in e for e in events)
+
+
+def test_a_real_spike_still_fires(harness, config, store, clock):
+    """정상을 삼키느라 진짜 급증까지 놓치면 안 된다."""
+    scope = TenantScope("acme")
+    for _ in range(config.thresholds.guard_block_spike_per_hour):
+        store.record_filter_event(scope, rule_id="kr_rrn", stage="pattern", action="block")
+
+    harness.scheduler.run_watches()
+
+    assert any("guard_blocks_spike" in s["subject"] for s in harness.channel.sent)
+
+
+def test_recovery_is_not_announced_with_the_spike_title(harness, config, store, clock):
+    """제목이 "급증" 인데 내용이 "정상으로 돌아왔다" 면 아무도 안 읽는다."""
+    scope = TenantScope("acme")
+    for _ in range(config.thresholds.guard_block_spike_per_hour):
+        store.record_filter_event(scope, rule_id="kr_rrn", stage="pattern", action="block")
+    harness.scheduler.run_watches()
+    harness.channel.sent.clear()
+
+    clock.advance(7200)          # 창이 지나 차단 수가 0 으로 떨어진다
+    harness.scheduler.run_watches()
+
+    subjects = [s["subject"] for s in harness.channel.sent]
+    assert any("guard_blocks_normal" in s for s in subjects), subjects
+    assert not any("guard_blocks_spike" in s for s in subjects)
+
+
+def test_the_normal_events_are_treated_as_recovery():
+    """구조로 못박는다 — 목록에서 빠지면 이 결함이 그대로 돌아온다."""
+    from app.notify import RECOVERY_EVENTS
+
+    assert {"guard_blocks_normal", "classifier_error_normal"} <= RECOVERY_EVENTS
+
+
+# ── 감사 M25 — 테스트 알림 버튼이 거짓 성공을 보고한다 ──────────────────────
+
+
+def test_a_suppressed_test_notification_reports_that_it_did_not_go_out(harness, client, acme):
+    """**관리자는 채널이 붙었다고 믿고 넘어간다** — 그 착각이 정확히 알림이
+    막으려던 상황을 만든다."""
+    harness.notifier._min_interval = 300.0
+
+    first = client.post(
+        "/v1/platform/notifications", headers=auth(acme["platform_admin"])
+    ).json()
+    second = client.post(
+        "/v1/platform/notifications", headers=auth(acme["platform_admin"])
+    ).json()
+
+    assert first["sent"] is True
+    assert second["sent"] is False, "중복 억제에 걸렸는데 성공이라고 답했다"
+    assert second["reason"] == "suppressed_duplicate"
+
+
+def test_a_test_notification_without_channels_says_so(harness, client, acme):
+    """채널이 하나도 없으면 "보냈다" 가 아니라 그 사실이 보여야 한다."""
+    harness.notifier._channels.clear()
+
+    body = client.post(
+        "/v1/platform/notifications", headers=auth(acme["platform_admin"])
+    ).json()
+    assert body["channels"] == []
+    assert body["reason"] == "no_channels" or body["sent"] is True
+
+
+# ── 감사 M26 — 배경 루프가 예외를 무음 소멸시킨다 ───────────────────────────
+
+
+async def test_a_failing_background_loop_says_so(harness, caplog):
+    """**루프를 죽이지 않는 것과 실패를 감추는 것은 다르다.**
+
+    헬스 프로브가 매 주기 터져도 화면에는 "노드 상태 unknown" 만 보이고,
+    아무도 왜인지 모른다 — "조용한 실패를 시끄럽게" 원칙의 정반대다.
+    """
+    import logging
+
+    from app.scheduler import _loop_failure
+
+    with caplog.at_level(logging.INFO, logger="llmcc.scheduler"):
+        _loop_failure("health", RuntimeError("노드가 이상한 걸 돌려준다"))
+
+    assert caplog.records, "배경 루프 실패가 로그에 안 남는다"
+    fields = caplog.records[0].fields
+    assert fields["loop"] == "health"
+    assert fields["error_type"] == "RuntimeError"
+
+
+def test_log_event_is_actually_called_by_the_app():
+    """README 가 약속한 "구조화 JSON stdout" 의 `log_event()` 가 호출부 0곳이었다."""
+    import ast
+    from pathlib import Path
+
+    app_dir = Path(__file__).resolve().parent.parent / "app"
+    callers = set()
+    for path in app_dir.rglob("*.py"):
+        if path.name == "observability.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id == "log_event":
+                    callers.add(path.name)
+    assert callers, "log_event() 를 부르는 곳이 없다 — 죽은 계약이다"
+
+
+def test_a_loop_failure_log_carries_no_prompt_body():
+    """로그·알림 어디에도 프롬프트 본문이 없다는 약속은 여기에도 적용된다."""
+    import inspect
+
+    from app.scheduler import _loop_failure
+
+    source = inspect.getsource(_loop_failure)
+    assert "prompt" not in source
+    assert "[:200]" in source, "예외 문자열을 자르지 않으면 본문이 통째로 실릴 수 있다"

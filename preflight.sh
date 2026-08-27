@@ -31,7 +31,7 @@ if command -v docker >/dev/null 2>&1; then
   fi
   docker info >/dev/null 2>&1 || fail "docker 데몬에 연결할 수 없습니다. 실행 중인지, 권한이 있는지 확인하세요."
 else
-  warn "docker 가 없습니다. 네이티브 실행 경로를 쓰려면: pip install -e . && python -m app --demo"
+  warn "docker 가 없습니다. 네이티브 실행 경로를 쓰려면: pip install -e . && python3 -m app --demo"
 fi
 
 # -- 포트 --

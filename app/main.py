@@ -1536,9 +1536,20 @@ async def platform_notifications(request: Request) -> Response:
         return _ok(request, snapshot)
 
     # 테스트 발송 — 채널이 실제로 닿는지는 보내 봐야 안다.
-    ctx.notifier.send("node_recovered", node="(테스트)")
-    ctx.store.audit(principal.token_id, "test_notification")
-    return _ok(request, {"sent": True, "channels": list(ctx.notifier.channel_names)})
+    #
+    # **반환값을 버리면 안 된다.** 5분 중복 억제에 걸린 두 번째 테스트는 아무
+    # 데도 안 나가는데 무조건 `sent: true` 를 돌려주고 있었다. 관리자는 채널이
+    # 붙었다고 믿고 넘어가며, 그 착각이 정확히 알림이 막으려던 상황을 만든다.
+    sent = ctx.notifier.send("node_recovered", node="(테스트)")
+    ctx.store.audit(principal.token_id, "test_notification", detail={"sent": sent})
+    return _ok(request, {
+        "sent": sent,
+        # 안 나갔으면 왜 안 나갔는지를 말한다 — "false" 만 주면 채널 오류인지
+        # 중복 억제인지 구분할 수 없다.
+        "reason": None if sent else ("no_channels" if not ctx.notifier.channel_names
+                                     else "suppressed_duplicate"),
+        "channels": list(ctx.notifier.channel_names),
+    })
 
 
 # ── 라우트 ──────────────────────────────────────────────────────────────────

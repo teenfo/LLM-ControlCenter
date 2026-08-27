@@ -244,3 +244,74 @@ def test_settings_view_can_tell_a_capped_value_from_an_applied_one(client, acme)
     body = client.get("/v1/admin/settings", headers=auth(acme["tenant_admin"])).json()
     assert body["raw_prompt_retention_days_requested"] == 999
     assert body["raw_prompt_retention_days"] < 999
+
+
+# ── 감사 M23 — 로그인 화면이 항상 원시 i18n 키를 표시한다 ───────────────────
+
+
+def test_static_strings_do_not_overwrite_the_fallback_when_empty():
+    """**모든 설치의 첫 화면이 `"ui.sign_in"` 으로 깨져 보였다.**
+
+    `t()` 는 없는 키를 키 자체로 돌려주는데(누락이 화면을 멈추게 하지 않는다),
+    로그인 전에는 카탈로그가 통째로 비어 있다 — 세션 API 로 받아오기 때문이다.
+    그래서 `applyStaticStrings()` 가 index.html 의 폴백 텍스트를 키 리터럴로
+    덮어썼다.
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    body = source[source.index("function applyStaticStrings"):]
+    body = body[:body.index("\n}")]
+
+    assert "t(node.dataset.t)" not in body, "카탈로그가 비어도 폴백을 덮어쓴다"
+    assert "if (text)" in body, "빈 값을 거르지 않는다"
+
+
+def test_the_login_screen_has_real_fallback_text():
+    """폴백이 없으면 위 수정이 화면을 비워 버린다 — 둘은 한 벌이다."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    login = html[html.index('id="login"'):]
+    login = login[:login.index("</section>")] if "</section>" in login else login
+
+    labelled = re.findall(r'data-t="([^"]+)"[^>]*>([^<]*)<', login)
+    assert labelled, "로그인 화면에 data-t 요소가 없다"
+    for key, text in labelled:
+        assert text.strip(), f"{key} 에 폴백 텍스트가 없다"
+        assert text.strip() != key, f"{key} 의 폴백이 키 자체다"
+
+
+# ── 감사 M28 — 모델 화면이 서버의 `missing` 목록을 안 그린다 ────────────────
+
+
+def test_the_models_view_renders_what_is_missing():
+    """`역할이 요구하는데 어느 노드에도 없는 모델` 을 서버가 주는데 안 그렸다.
+
+    그 잡들은 레인을 막지 않고 조용히 대기하므로(§13-6), 화면에 안 보이면
+    관리자는 왜 그 역할만 안 도는지 알 방법이 없다.
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    view = source[source.index("async function renderModels"):]
+    view = view[:view.index("\nasync function ")]
+
+    assert "m.missing" in view, "missing 목록을 읽지 않는다"
+    assert "ui.missing_models" in view, "missing 을 카드로 그리지 않는다"
+
+
+def test_the_missing_list_offers_the_action_that_fixes_it():
+    """보여주기만 하고 고칠 방법을 안 주면 화면을 한 번 더 옮겨 다녀야 한다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "async function requestInstall" in source
+    assert "ui.request_install" in source
+
+
+def test_the_missing_model_endpoint_actually_returns_it(harness, client, acme):
+    """화면을 고쳤는데 서버가 안 주면 소용없다 — 양쪽을 함께 못박는다."""
+    # 노드는 살아 있고 인벤토리도 받았는데 **역할이 요구하는 모델만 없다.**
+    # 인벤토리가 비어 있으면(프로브 전) 모른다는 이유로 요청하지 않으므로,
+    # 그 상태로는 이 경로를 못 지난다.
+    for state in harness.cluster.nodes.values():
+        state.models = frozenset({"전혀-다른-모델"})
+
+    body = client.get(
+        "/v1/platform/models", headers=auth(acme["platform_admin"])
+    ).json()
+    assert body["missing"], "역할이 요구하는 모델이 없는데 missing 이 비어 있다"
+    assert {"node", "model"} <= set(body["missing"][0])

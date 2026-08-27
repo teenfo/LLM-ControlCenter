@@ -1865,6 +1865,14 @@ class SqliteStore:
         ).fetchone()
         return int(row["n"])
 
+    def oldest_rate_bucket(self, key: str, since: int) -> int | None:
+        """윈도 안에서 가장 오래된 버킷. 429 의 `retry_after` 근거다."""
+        row = self._conn.execute(
+            "SELECT MIN(bucket) AS oldest FROM rate_counters WHERE key = ? AND bucket >= ?",
+            (key, since),
+        ).fetchone()
+        return int(row["oldest"]) if row and row["oldest"] is not None else None
+
     def prune_rate_counters(self, before_bucket: int) -> int:
         cur = self._conn.execute(
             "DELETE FROM rate_counters WHERE bucket < ?", (before_bucket,)

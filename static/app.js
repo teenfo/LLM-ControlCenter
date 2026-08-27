@@ -35,7 +35,14 @@ function t(key, params) {
 
 function applyStaticStrings(root) {
   for (const node of (root || document).querySelectorAll('[data-t]')) {
-    node.textContent = t(node.dataset.t);
+    const text = state.strings[node.dataset.t];
+    // **카탈로그가 비어 있으면 손대지 않는다.**
+    //
+    // `t()` 는 없는 키를 키 자체로 돌려주는데(누락이 화면을 멈추게 하지 않는다),
+    // 로그인 전에는 카탈로그가 통째로 비어 있다 — 세션 API 로 받아오기 때문이다.
+    // 그래서 이 함수가 index.html 의 폴백 텍스트를 `"ui.sign_in"` 같은 키
+    // 리터럴로 덮어썼고, **모든 설치의 첫 화면이 깨져 보였다.**
+    if (text) node.textContent = text;
   }
 }
 
@@ -483,7 +490,21 @@ async function renderModels() {
     ]),
   ]);
 
+  // **"역할이 요구하는데 어느 노드에도 없는 모델"** — 서버가 주는데 화면이
+  // 안 그렸다. 그 잡들은 레인을 막지 않고 조용히 대기하므로(§13-6), 여기
+  // 안 보이면 관리자는 왜 그 역할만 안 도는지 알 방법이 없다.
+  const missing = (m.missing || []).map((x) => [
+    x.node, x.model,
+    el('button', {
+      class: 'primary', text: t('ui.request_install'),
+      onclick: () => requestInstall(x.node, x.model),
+    }),
+  ]);
+
   return [
+    missing.length
+      ? card(t('ui.missing_models'), table([t('ui.node'), t('ui.model'), ''], missing))
+      : null,
     card(t('ui.models'), table(
       [t('ui.node'), t('ui.model'), t('ui.status'), t('ui.install_progress'), '', ''], requests)),
     card(t('ui.catalog'), table(
@@ -491,6 +512,13 @@ async function renderModels() {
       (data.catalog ? data.catalog.catalog : []).map((c) =>
         [c.name, c.provider, c.est_size_gb + ' GB', c.purpose]))),
   ];
+}
+
+async function requestInstall(node, model) {
+  try {
+    await api('/v1/platform/models', { method: 'POST', body: { node: node, model: model } });
+    refresh();
+  } catch (err) { showError(err); }
 }
 
 async function modelDecision(requestId, reject) {
