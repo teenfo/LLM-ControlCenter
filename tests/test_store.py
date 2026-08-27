@@ -401,3 +401,79 @@ def test_reopening_same_db_is_idempotent(tmp_path):
     second = SqliteStore(path)
     assert second.get_tenant("acme") is not None
     second.close()
+
+
+def test_an_older_build_can_read_a_newer_schema(tmp_path):
+    """**전진 호환** — 롤백이 이미지 태그를 되돌리는 것으로 끝나야 한다.
+
+    스키마가 ADD COLUMN 전용이므로, 신버전이 컬럼을 더한 DB 를 구버전이 그대로
+    읽을 수 있어야 한다. 여기서는 지금 코드를 "구버전" 으로 두고, 아직 존재하지
+    않는 컬럼을 직접 붙여 "신버전이 쓴 DB" 를 흉내 낸다.
+
+    이게 깨지면 업그레이드가 편도가 된다 — 되돌릴 수 없는 업그레이드는 설치처가
+    아예 안 하게 된다.
+    """
+    path = tmp_path / "t.db"
+    store = SqliteStore(path)
+    store.create_tenant("acme", "Acme", end_user_salt=b"s")
+    scope = TenantScope("acme")
+    store.create_service(scope, "web", "web")
+    job_id = store.create_job(
+        scope, service_id="web", role="summarize", lane="interactive",
+        prompt_masked="마스킹본",
+    )
+
+    # 미래 버전이 컬럼을 더했다고 치자. ADD COLUMN 전용 규칙을 지킨 형태다.
+    store._conn.execute("ALTER TABLE jobs ADD COLUMN future_field TEXT")
+    store._conn.execute("ALTER TABLE tenants ADD COLUMN future_flag INTEGER DEFAULT 0")
+    store._conn.execute(
+        "UPDATE jobs SET future_field = ? WHERE id = ?", ("신버전만 아는 값", job_id)
+    )
+    store._conn.commit()
+    store.close()
+
+    # 구버전(지금 코드)이 그 DB 를 그대로 연다.
+    older = SqliteStore(path)
+    try:
+        job = older.get_job(scope, job_id)
+        assert job is not None and job.prompt_masked == "마스킹본"
+        assert older.get_tenant("acme") is not None
+
+        # 읽기만이 아니라 쓰기도 된다 — 모르는 컬럼이 있다고 INSERT 가 깨지면 안 된다.
+        new_id = older.create_job(
+            scope, service_id="web", role="summarize", lane="interactive",
+            prompt_masked="구버전이 쓴 행",
+        )
+        assert older.get_job(scope, new_id) is not None
+        assert older.update_job(scope, job_id, status="ok")
+        assert older.list_jobs(scope)
+    finally:
+        older.close()
+
+
+def test_unknown_config_keys_are_a_warning_not_a_rejection(tmp_path):
+    """설정도 전진 호환이다 — 신버전이 쓴 설정을 구버전이 거부하면 롤백이 막힌다."""
+    import shutil
+    from pathlib import Path
+
+    from app.config import load_config, validate_cross_references
+
+    source = Path(__file__).resolve().parent.parent / "config"
+    target = tmp_path / "config"
+    shutil.copytree(source, target)
+
+    nodes = target / "nodes.yaml"
+    nodes.write_text(
+        nodes.read_text(encoding="utf-8")
+        + "\nfuture-node:\n  provider: mock\n  data_boundary: internal\n",
+        encoding="utf-8",
+    )
+    (target / "thresholds.yaml").write_text(
+        (target / "thresholds.yaml").read_text(encoding="utf-8")
+        + "\nfuture_threshold_from_a_newer_build: 42\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(target)          # 모르는 키로 기동이 멈추지 않는다
+    validate_cross_references(config)
+    assert "future-node" in config.nodes
