@@ -31,6 +31,7 @@ from typing import Any, Callable, Mapping, Sequence
 import logging
 
 from .cluster import FAIL, WAIT, Cluster, Placement
+from .completion import CompletionSignal
 from .config import EXTERNAL, Config
 from .cost import CostAccountant
 from .crypto import response_aad
@@ -130,6 +131,7 @@ class Scheduler:
         resolver: RoleResolver | None = None,
         guard: Guard | None = None,
         vault: Any = None,
+        completion: CompletionSignal | None = None,
     ) -> None:
         self._config = config
         self._roles = resolver_for(config, store, resolver)
@@ -144,6 +146,10 @@ class Scheduler:
         # 금고는 없을 수 있다. **KEK 가 없으면 암호문 자체를 안 만든다** — 그것이
         # 원문 보관 비활성화의 정의이고, 평문 폴백 경로는 존재하지 않는다.
         self._vault = vault
+        # 완료 신호. **파이프라인과 같은 객체여야 한다** — 따로 만들면 보내는 쪽과
+        # 받는 쪽이 갈려서 신호가 아무 데도 안 닿고, 그 사실은 대기가 늘 최대치로
+        # 걸리는 것 말고는 아무 증상을 안 낸다.
+        self._completion = completion or CompletionSignal()
         self._accountant = accountant or CostAccountant(config.pricing, store, now=now)
         self._registrar = registrar
         self._now = now
@@ -514,6 +520,7 @@ class Scheduler:
             finished_at=self._now(), metrics=dict(metrics),
         )
         self._record_output_events(scope, verdict, job=job)
+        self._completion.done(job.id)
         self._accountant.settle(
             scope, job.id,
             provider=placement.provider, model=placement.model,
@@ -568,6 +575,7 @@ class Scheduler:
             model=placement.model, node=placement.node, provider=placement.provider,
             status="failed", end_user_hash=job.end_user_hash,
         )
+        self._completion.done(job_id)
 
     def _fail(self, scope: TenantScope, job: Any, code: str, reason: str) -> None:
         self._store.update_job(
@@ -575,6 +583,7 @@ class Scheduler:
             status="failed", error_code=code, error=reason, finished_at=self._now(),
         )
         self._accountant.release_reservation(scope, job.id)
+        self._completion.done(job.id)
 
     # -- 배경 루프 -------------------------------------------------------------
 

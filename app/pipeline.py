@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import re
@@ -25,6 +24,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .auth import Principal, RateLimiter, check_role_allowed, limits_for
 from .cluster import PLACED, WAIT, Cluster
+from .completion import CompletionSignal
 from .config import EXTERNAL, INTERNAL, Config, GuardRule, Role
 from .cost import CostAccountant
 from .crypto import KeyVault, prompt_aad
@@ -112,6 +112,7 @@ class Pipeline:
         evaluator: Evaluator | None = None,
         resolver: RoleResolver | None = None,
         framing: ClassifierFraming | None = None,
+        completion: CompletionSignal | None = None,
         now: Callable[[], float] = time.time,
     ) -> None:
         self._config = config
@@ -128,6 +129,9 @@ class Pipeline:
         # 분류기 울타리·카나리아의 비밀. **인스턴스마다 새로 만든다** — 상수로 박으면
         # 오픈소스 제품에서는 공격자도 그 값을 안다.
         self._framing = framing or ClassifierFraming()
+        # 완료 신호. **스케줄러와 같은 객체를 공유해야 의미가 있다** — 따로 만들면
+        # 신호를 보내는 쪽과 받는 쪽이 갈려서 조용히 폴링만 남는다.
+        self._completion = completion or CompletionSignal()
         self._now = now
 
     # -- ① 인증 이후의 권한·한도 -----------------------------------------------
@@ -451,25 +455,31 @@ class Pipeline:
         remaining_polls = int(budget / POLL_INTERVAL) + 1
         interval = POLL_INTERVAL
 
-        while True:
-            # **상태 한 칸만 읽는다.** `get_job` 은 `SELECT *` 라 마스킹본·암호문·
-            # 응답까지 끌어오는데, 폴링이 보는 것은 이 한 칸뿐이다. 대기가 수십 건
-            # 겹치면 그 전량이 초당 수백 번 오가며 이벤트 루프를 점유한다.
-            status = self._store.job_status(scope, job_id)
-            if status is None:
-                raise ApiError("job_not_found", status=404)
-            if status in _TERMINAL or self._now() >= deadline or remaining_polls <= 0:
-                job = self._store.get_job(scope, job_id)
-                if job is None:
+        # **먼저 등록하고 나서 읽는다.** 반대로 하면 읽기와 등록 사이에 끝난 잡의
+        # 신호를 놓친다. 놓쳐도 폴이 잡지만, 그 대가가 한 주기 지연이다.
+        with self._completion.waiting_on(job_id):
+            while True:
+                # **상태 한 칸만 읽는다.** `get_job` 은 `SELECT *` 라 마스킹본·암호문·
+                # 응답까지 끌어오는데, 폴링이 보는 것은 이 한 칸뿐이다. 대기가 수십 건
+                # 겹치면 그 전량이 초당 수백 번 오가며 이벤트 루프를 점유한다.
+                status = self._store.job_status(scope, job_id)
+                if status is None:
                     raise ApiError("job_not_found", status=404)
-                return self._to_submission(scope, job)
+                if status in _TERMINAL or self._now() >= deadline or remaining_polls <= 0:
+                    job = self._store.get_job(scope, job_id)
+                    if job is None:
+                        raise ApiError("job_not_found", status=404)
+                    return self._to_submission(scope, job)
 
-            remaining_polls -= 1
-            await asyncio.sleep(interval)
-            # **간격을 늘린다.** 첫 폴은 빨라야 짧은 잡이 즉시 돌아오고, 오래 걸리는
-            # 잡을 20회/초로 확인할 이유는 없다. 고정 50ms 는 그 둘을 같은 값으로
-            # 다루느라 긴 대기에 부하를 몰아준다.
-            interval = min(interval * POLL_BACKOFF, MAX_POLL_INTERVAL)
+                remaining_polls -= 1
+                # **자는 대신 신호를 기다린다.** 신호가 오면 바로 다음 폴로 가고,
+                # 안 오면 정확히 예전만큼 잔다 — 다중 워커에서는 신호가 프로세스를
+                # 넘지 못하므로 늘 후자이고, 그때의 동작이 오늘과 같아야 한다.
+                await self._completion.wait(job_id, timeout=interval)
+                # **간격을 늘린다.** 첫 폴은 빨라야 짧은 잡이 즉시 돌아오고, 오래 걸리는
+                # 잡을 20회/초로 확인할 이유는 없다. 고정 50ms 는 그 둘을 같은 값으로
+                # 다루느라 긴 대기에 부하를 몰아준다.
+                interval = min(interval * POLL_BACKOFF, MAX_POLL_INTERVAL)
 
     def cancel(self, scope: TenantScope, job_id: str, *, actor: str) -> Submission:
         """대기 중인 잡을 취소한다.
@@ -502,6 +512,9 @@ class Pipeline:
                 raise ApiError("job_running", status=409)
             return self._to_submission(scope, current)
         self._accountant.release_reservation(scope, job_id)
+        # 취소도 종결이다. 같은 잡을 `wait` 하던 다른 요청이 있으면 지금 깨워야
+        # 한다 — 안 깨우면 이미 끝난 잡을 최대 대기 시간까지 붙잡고 있는다.
+        self._completion.done(job_id)
         self._store.audit(
             actor, "cancel_job", tenant_id=scope.tenant_id, target=job_id
         )

@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 
 from app.auth import ROLE_PLATFORM_ADMIN, ROLE_SERVICE, ROLE_TENANT_ADMIN, issue_token
 from app.cluster import HEALTHY, Cluster
+from app.completion import CompletionSignal
 from app.config import (
     CatalogEntry,
     Config,
@@ -168,13 +169,16 @@ def harness(config, store, clock, vault):
     registrar = ModelRegistrar(
         config, cluster, store, now=clock, notify=notifier.as_callable()
     )
+    completion = CompletionSignal()
     pipeline = Pipeline(
         config, store, cluster, guard,
         vault=vault, accountant=accountant, evaluator=evaluator, now=clock,
+        completion=completion,
     )
     scheduler = Scheduler(
         config, store, cluster, accountant=accountant, registrar=registrar,
         now=clock, notifier=notifier, guard=guard, vault=vault,
+        completion=completion,
     )
 
     app = build_app(
@@ -201,6 +205,7 @@ def harness(config, store, clock, vault):
     h.accountant = accountant
     h.notifier = notifier
     h.channel = channel
+    h.completion = completion
     return h
 
 

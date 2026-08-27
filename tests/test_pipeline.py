@@ -539,8 +539,6 @@ async def test_waiting_reads_only_the_status_column(harness, client, acme, monke
 
 async def test_the_poll_interval_backs_off(harness, client, acme):
     """짧은 잡은 첫 폴에서 잡히고, 긴 잡을 20회/초로 확인할 이유는 없다."""
-    import asyncio
-
     from app.pipeline import MAX_POLL_INTERVAL, POLL_BACKOFF, POLL_INTERVAL
 
     assert POLL_BACKOFF > 1.0
@@ -554,20 +552,21 @@ async def test_the_poll_interval_backs_off(harness, client, acme):
     harness.store.update_job(scope, job_id, status="queued")
 
     intervals: list[float] = []
-    real_sleep = asyncio.sleep
+    signal = harness.completion
+    original = signal.wait
 
-    async def recording(seconds, *args, **kwargs):
-        intervals.append(seconds)
-        return await real_sleep(0)
+    async def recording(job, *, timeout):
+        # **간격을 완료 신호에서 잰다.** 예전에는 `asyncio.sleep` 을 전역으로
+        # 바꿔치기했는데, 그건 이벤트 루프 전체를 건드리는 방식이라 다른 태스크의
+        # 잠까지 기록에 섞인다. 신호는 이 대기 루프만 쓴다.
+        intervals.append(timeout)
+        return False
 
-    import app.pipeline as pipeline_module
-
-    original = pipeline_module.asyncio.sleep
-    pipeline_module.asyncio.sleep = recording
+    signal.wait = recording
     try:
         await harness.pipeline.wait_for(scope, job_id, seconds=2.0)
     finally:
-        pipeline_module.asyncio.sleep = original
+        signal.wait = original
 
     assert len(intervals) > 3
     assert intervals[-1] > intervals[0], "간격이 안 늘어난다"

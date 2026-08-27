@@ -39,6 +39,7 @@ from .models import ModelRegistrar
 from .notify import Notifier, channels_from_env
 from .observability import configure_logging, diagnostic_bundle
 from .pipeline import Pipeline
+from .completion import CompletionSignal
 from .scheduler import Scheduler
 from .store import SqliteStore
 
@@ -73,9 +74,14 @@ class Assembly:
         self.registrar = ModelRegistrar(
             config, self.cluster, store, notify=self.notifier.as_callable()
         )
+        # **하나의 신호를 둘이 공유한다.** 각자 만들면 보내는 쪽과 받는 쪽이
+        # 갈려서 신호가 아무 데도 안 닿고, 증상은 "대기가 늘 최대치" 뿐이라
+        # 아무도 눈치채지 못한다.
+        self.completion = CompletionSignal()
         self.pipeline = Pipeline(
             config, store, self.cluster, self.guard,
             vault=vault, accountant=self.accountant, evaluator=self.evaluator,
+            completion=self.completion,
         )
         # **스케줄러는 싱글턴이다.** 워커마다 돌면 잡이 중복 배치된다 —
         # 성능이 필요해서 워커를 늘리는 순간 조용히 깨지는 구조를 만들지 않는다.
@@ -83,7 +89,7 @@ class Assembly:
             config, store, self.cluster, accountant=self.accountant,
             registrar=self.registrar, notifier=self.notifier,
             # 출력 축 — 스케줄러가 응답을 쓰는 유일한 지점이라 가드와 금고가 여기 온다.
-            guard=self.guard, vault=vault,
+            guard=self.guard, vault=vault, completion=self.completion,
         )
 
     def build(self, *, version: str, start_scheduler: bool):
