@@ -112,12 +112,27 @@ def issue_token(
     return token_id, raw
 
 
+def require_can_issue(actor_role: str, target_role: str) -> None:
+    """`actor_role` 이 `target_role` 토큰을 만들 수 있는가.
+
+    **발급과 회전이 같은 규칙을 지나야 한다.** 발급 경로에만 검사가 있었고 회전에는
+    없어서, 테넌트 관리자가 자기 테넌트의 `platform_admin` 토큰을 회전시켜 **새
+    플랫폼 관리자 토큰을 평문으로 받아낼 수 있었다** — 회전은 "같은 역할로 다시
+    발급" 이므로 그 자체가 발급이다.
+
+    규칙을 두 곳에 적으면 한 곳만 고쳐 놓고 고쳤다고 믿게 된다.
+    """
+    if target_role == ROLE_PLATFORM_ADMIN and actor_role != ROLE_PLATFORM_ADMIN:
+        raise ApiError("forbidden_platform_admin", status=403)
+
+
 def rotate_token(
     store: SqliteStore,
     scope: TenantScope,
     token_id: str,
     *,
     actor: str = "",
+    actor_role: str = ROLE_TENANT_ADMIN,
     grace_seconds: float = 0.0,
     now: Callable[[], float] = time.time,
 ) -> tuple[str, str]:
@@ -125,11 +140,14 @@ def rotate_token(
 
     `grace_seconds` 를 주면 옛 토큰이 그만큼 더 살아 있다 — 소비자가 배포하는 동안
     끊기지 않게 하는 창이다. 0 이면 즉시 폐기다.
+
+    **회전도 발급이다.** 호출자가 만들 수 없는 역할의 토큰은 회전시킬 수 없다.
     """
     rows = [t for t in store.list_tokens(scope) if t["id"] == token_id]
     if not rows:
         raise ApiError("unauthorized", status=404)
     old = rows[0]
+    require_can_issue(actor_role, old["role"])
 
     new_id, raw = issue_token(
         store, scope, old["service_id"], role=old["role"],
@@ -156,8 +174,13 @@ def authenticate(
 ) -> Principal:
     """Bearer 토큰을 주체로 바꾼다.
 
-    해시로 찾은 뒤 **상수 시간 비교로 재확인**한다. 인덱스 조회만으로도 동작하지만,
-    타이밍으로 유효 토큰의 존재 여부를 알아내는 경로를 남기지 않기 위해서다.
+    토큰은 **해시로만 저장한다** — 원값은 발급 시 1회 표시하고 어디에도 안 남는다.
+
+    아래의 `compare_digest` 는 방어턱이 아니다. 이미 인덱스 조회로 찾은 행을 다시
+    비교하는 것이라 타이밍 경로는 그 조회에 있고 여기서 닫히지 않는다.
+    남겨 두는 이유는 **해시가 같은데 값이 다른 행을 받았을 때** 통과시키지 않기
+    위해서다(스토어 구현이 바뀌면 일어날 수 있다). 실효 없는 방어를 있는 것처럼
+    적어 두면 다음 사람이 그것을 믿고 진짜 방어를 안 만든다.
     """
     if not raw_token:
         raise ApiError("unauthorized", status=401)

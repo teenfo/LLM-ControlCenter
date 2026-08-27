@@ -812,3 +812,77 @@ def test_the_shipped_rrn_rule_covers_foreign_registration_numbers():
 
     assert re.search(rule.pattern, "900101-5234567"), "외국인등록번호가 패턴에 안 걸린다"
     assert rule.checksum_failed_action == "audit", "체크섬 실패를 통째로 버리고 있다"
+
+
+# ── 감사 LOW — 유니코드로 패턴을 빠져나간다 ─────────────────────────────────
+#
+# 전각 하이픈·NBSP·zero-width 를 끼워 넣으면 사람 눈에는 같은 번호인데 정규식은
+# 안 걸린다. 실측으로 전각 하이픈과 NBSP 가 실제 규칙을 빠져나갔다.
+
+
+@pytest.mark.parametrize("text", [
+    "900101－1234568",          # 전각 하이픈
+    "900101-123​4568",     # zero-width space
+    "900101\u00a01234568",   # NBSP 를 구분자로
+])
+def test_unicode_tricks_do_not_evade_the_pattern(text):
+    rule = GuardRule(
+        id="kr_rrn", kind="pattern", action="full", label="[주민등록번호]",
+        pattern=r"\b\d{6}[-\s]?[1-8]\d{6}\b", checksum="kr_rrn", locale_pack="ko_KR",
+    )
+    guard = Guard(make_config((rule,)))
+
+    detections = guard._scan(f"번호 {text} 입니다", None, (rule,))
+    assert detections, f"빠져나갔다: {text!r}"
+
+
+@pytest.mark.parametrize("text", [
+    "900101－1234568",
+    "900101-123​4568",
+])
+def test_the_mask_lands_on_the_original_text(text):
+    """**정규화본에 마스킹할 수는 없다.**
+
+    탐지 위치는 원문에 적용돼야 하고 NFKC 는 길이를 바꾼다. 오프셋을 되돌리지
+    않으면 마스킹이 엉뚱한 자리를 지운다.
+    """
+    rule = GuardRule(
+        id="kr_rrn", kind="pattern", action="full", label="[주민등록번호]",
+        pattern=r"\b\d{6}[-\s]?[1-8]\d{6}\b", checksum="kr_rrn", locale_pack="ko_KR",
+    )
+    guard = Guard(make_config((rule,)))
+    source = f"앞 {text} 뒤"
+
+    detections = guard._scan(source, None, (rule,))
+    from app.guard import _apply
+
+    masked = _apply(source, detections, "internal")
+    assert masked.startswith("앞 ") and masked.endswith(" 뒤"), masked
+    assert "1234568" not in masked
+    assert "900101" not in masked
+
+
+def test_normalization_is_skipped_when_nothing_changes():
+    """대부분의 프롬프트는 그대로다 — 그때는 문자 단위 순회 비용을 안 낸다."""
+    from app.guard import normalize_for_match
+
+    text, index = normalize_for_match("보통의 한국어 프롬프트 with ASCII 123")
+    assert index is None
+    assert text == "보통의 한국어 프롬프트 with ASCII 123"
+
+
+def test_the_index_map_points_back_to_the_source():
+    from app.guard import normalize_for_match
+
+    source = "a​Ｂc"
+    folded, index = normalize_for_match(source)
+
+    assert folded == "aBc"
+    assert index is not None
+    assert [source[i] for i in index] == ["a", "Ｂ", "c"]
+
+
+def test_an_empty_prompt_survives_normalization():
+    from app.guard import normalize_for_match
+
+    assert normalize_for_match("") == ("", None)

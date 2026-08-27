@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
@@ -42,6 +43,40 @@ STAGE_PATTERN = "pattern"
 #: 체크섬을 통과하지 못한 매치의 규칙 id 접미사. 확신도가 다른 탐지를 같은 id 로
 #: 뭉치면 승격 게이트의 오탐률 표본이 섞이고 관제 UI 가 둘을 구분하지 못한다.
 UNVERIFIED_SUFFIX = ":unverified"
+
+#: 검사 전에 지우는 문자. **보이지 않으면서 패턴만 깨뜨린다** — 주민번호 사이에
+#: zero-width space 하나를 넣으면 사람 눈에는 그대로인데 정규식은 안 걸린다.
+INVISIBLE_CHARS = frozenset("\u200b\u200c\u200d\u2060\ufeff\u00ad")
+
+
+def normalize_for_match(text: str) -> tuple[str, list[int] | None]:
+    """검사용으로 정규화한 텍스트와 **원문 인덱스 지도**.
+
+    전각 하이픈(`－`)·NBSP·전각 숫자로 쓴 주민번호는 눈에는 같은데 패턴에 안
+    걸린다. 실측으로 전각 하이픈과 NBSP 가 실제로 규칙을 빠져나갔다.
+
+    그런데 **정규화한 텍스트에 마스킹할 수는 없다.** 탐지 위치(오프셋)는 원문에
+    적용돼야 하고, NFKC 는 길이를 바꾼다(`㈜` → `(주)`). 그래서 문자 단위로
+    정규화하면서 각 결과 문자가 원문 어디서 왔는지를 함께 들고 온다.
+
+    반환의 지도가 `None` 이면 원문과 같다는 뜻이다 — 대부분의 프롬프트가 여기
+    해당하고, 그때는 문자 단위 순회 비용을 아예 안 낸다.
+    """
+    if not text:
+        return text, None
+    # 빠른 길: 통째로 정규화해 보고 그대로면 지도가 필요 없다(C 구현, 한 번).
+    if not INVISIBLE_CHARS & set(text) and unicodedata.normalize("NFKC", text) == text:
+        return text, None
+
+    folded: list[str] = []
+    index: list[int] = []
+    for position, char in enumerate(text):
+        if char in INVISIBLE_CHARS:
+            continue
+        for produced in unicodedata.normalize("NFKC", char):
+            folded.append(produced)
+            index.append(position)
+    return "".join(folded), index
 
 STAGE_LLM = "llm"
 
@@ -499,14 +534,28 @@ class Guard:
         """
         if not text:
             return [], []
+
+        # **정규화한 사본에서 찾고, 위치는 원문으로 되돌린다.**
+        # 정규화본에 마스킹하면 소비자가 보낸 것과 다른 텍스트가 저장·전송된다.
+        haystack, index = normalize_for_match(text)
+
+        def to_source(span: tuple[int, int]) -> tuple[int, int]:
+            if index is None:
+                return span
+            start, end = span
+            if start >= len(index):
+                return span
+            return index[start], index[min(end, len(index)) - 1] + 1
+
         validator = CHECKSUMS.get(rule.checksum) if rule.checksum else None
         if validator is None:
-            return [m.span() for m in compiled.finditer(text)], []
+            return [to_source(m.span()) for m in compiled.finditer(haystack)], []
 
         verified: list[tuple[int, int]] = []
         unverified: list[tuple[int, int]] = []
-        for match in compiled.finditer(text):
-            (verified if validator(match.group(0)) else unverified).append(match.span())
+        for match in compiled.finditer(haystack):
+            target = verified if validator(match.group(0)) else unverified
+            target.append(to_source(match.span()))
         return verified, unverified
 
     def _apply_classifier_failure(self, boundaries: frozenset[str]) -> frozenset[str]:

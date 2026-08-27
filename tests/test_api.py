@@ -1257,3 +1257,76 @@ def test_a_normal_request_is_nowhere_near_the_body_limit(client, acme):
         headers=auth(acme["service"]),
     )
     assert response.status_code == 200
+
+
+# ── 감사 LOW — 메트릭 자격증명과 계약 엔드포인트 한도 ───────────────────────
+
+
+def test_metrics_can_use_a_scrape_only_token(client, acme, monkeypatch):
+    """**Prometheus 설정에 플랫폼 관리자 토큰을 평문으로 두게 하면 안 된다.**
+
+    스크레이프에 필요한 권한은 집계 숫자 읽기뿐인데, 클러스터 전체를 지울 수
+    있는 자격증명을 거기 놓는 셈이었다.
+    """
+    from app.main import ENV_METRICS_TOKEN
+
+    monkeypatch.setenv(ENV_METRICS_TOKEN, "lcc_scrape_only_token")
+
+    response = client.get(
+        "/metrics", headers={"Authorization": "Bearer lcc_scrape_only_token"}
+    )
+    assert response.status_code == 200
+    assert "llmcc_up" in response.text
+
+
+def test_the_scrape_token_opens_nothing_else(client, acme, monkeypatch):
+    """이 토큰이 여는 범위는 운영 집계에 그쳐야 한다."""
+    from app.main import ENV_METRICS_TOKEN
+
+    monkeypatch.setenv(ENV_METRICS_TOKEN, "lcc_scrape_only_token")
+
+    response = client.get(
+        "/v1/platform/tenants", headers={"Authorization": "Bearer lcc_scrape_only_token"}
+    )
+    assert response.status_code == 401
+
+
+def test_a_wrong_scrape_token_falls_back_to_platform_admin(client, acme, monkeypatch):
+    from app.main import ENV_METRICS_TOKEN
+
+    monkeypatch.setenv(ENV_METRICS_TOKEN, "lcc_real_scrape")
+
+    assert client.get("/metrics", headers={"Authorization": "Bearer lcc_wrong_scrape"}).status_code == 401
+    assert client.get("/metrics", headers=auth(acme["platform_admin"])).status_code == 200
+
+
+def test_metrics_without_a_scrape_token_still_needs_platform_admin(client, acme):
+    """전용 토큰을 안 쓰는 설치처의 동작은 그대로여야 한다."""
+    assert client.get("/metrics", headers=auth(acme["tenant_admin"])).status_code == 403
+    assert client.get("/metrics", headers=auth(acme["platform_admin"])).status_code == 200
+
+
+def test_the_contract_endpoints_have_a_limit(client, acme):
+    """**매번 생성되는 응답이라 공짜가 아니다** — 인증된 토큰 하나로 CPU 를 태울 수 있다."""
+    from app.main import CONTRACT_LIMIT_PER_MIN
+
+    codes = set()
+    for _ in range(CONTRACT_LIMIT_PER_MIN + 5):
+        codes.add(client.get("/v1/meta", headers=auth(acme["service"])).status_code)
+
+    assert 429 in codes, "계약 엔드포인트에 상한이 없다"
+
+
+def test_the_contract_limit_is_separate_from_the_submit_limit(harness, client):
+    """계약을 많이 읽었다고 제출이 막히면 안 된다 — 다른 성격의 부하다."""
+    from app.main import CONTRACT_LIMIT_PER_MIN
+
+    tokens = seed_tenant(harness, "sep")
+    for _ in range(CONTRACT_LIMIT_PER_MIN + 5):
+        client.get("/v1/meta", headers=auth(tokens["service"]))
+
+    response = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(tokens["service"]),
+    )
+    assert response.status_code == 200

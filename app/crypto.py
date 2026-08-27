@@ -35,6 +35,11 @@ class CryptoError(RuntimeError):
     pass
 
 
+def _aad_bytes(aad: str | None) -> bytes | None:
+    """AAD 를 바이트로. `None` 은 바인딩 없음(옛 암호문 호환)."""
+    return aad.encode("utf-8") if aad else None
+
+
 class KeyDestroyed(CryptoError):
     """DEK 가 폐기됐다. 이 테넌트의 암호문은 영구히 열 수 없다 — 의도된 동작이다."""
 
@@ -118,17 +123,45 @@ class KeyVault:
 
     # -- 봉인·해제 ------------------------------------------------------------
 
-    def seal(self, wrapped_dek: bytes | None, plaintext: str) -> Sealed | None:
-        """원문을 봉인한다. 금고가 꺼져 있으면 `None` — 호출자는 저장하지 않는다."""
+    def seal(
+        self, wrapped_dek: bytes | None, plaintext: str, *, aad: str | None = None
+    ) -> Sealed | None:
+        """원문을 봉인한다. 금고가 꺼져 있으면 `None` — 호출자는 저장하지 않는다.
+
+        `aad` 는 이 암호문이 **어느 레코드의 것인지**를 태그에 묶는다(AES-GCM 의
+        추가 인증 데이터). 묶어 두면 DB 에 쓸 수 있는 공격자가 잡 A 의 암호문을
+        잡 B 의 행에 옮겨 넣어도 복호화가 실패한다 — 안 묶으면 그 이식이 성공하고,
+        **감사가 남는 정상 열람 경로를 통해** 남의 프롬프트가 화면에 뜬다.
+
+        키만으로는 막히지 않는다. 같은 테넌트 안에서는 DEK 가 하나라서 A 의
+        암호문이 B 의 키로 열린다 — 그것이 이 바인딩이 필요한 이유다.
+        """
         if not self.enabled:
             return None
         dek = self._unwrap(wrapped_dek)
         nonce = secrets.token_bytes(NONCE_BYTES)   # 레코드마다 새 논스
-        return Sealed(nonce, dek.encrypt(nonce, plaintext.encode("utf-8"), None))
+        return Sealed(
+            nonce, dek.encrypt(nonce, plaintext.encode("utf-8"), _aad_bytes(aad))
+        )
 
-    def open(self, wrapped_dek: bytes | None, sealed: Sealed) -> str:
+    def open(
+        self, wrapped_dek: bytes | None, sealed: Sealed, *, aad: str | None = None
+    ) -> str:
         """봉인을 푼다. 열람은 감사에 남겨야 한다 — 그 책임은 호출자에게 있다."""
         dek = self._unwrap(wrapped_dek)
+        try:
+            return dek.decrypt(
+                sealed.nonce, sealed.ciphertext, _aad_bytes(aad)
+            ).decode("utf-8")
+        except InvalidTag:
+            pass
+
+        if aad is None:
+            raise CryptoError("암호문이 손상됐거나 키가 맞지 않는다")
+
+        # **바인딩 도입 이전에 봉인된 암호문**은 AAD 가 없다. 그것까지 못 열게 되면
+        # 업그레이드가 곧 원문 손실이므로 한 번 더 시도한다. 새 암호문은 전부
+        # 묶여 있고, 이 경로는 보존 기간이 지나 옛 암호문이 사라지면 자연히 죽는다.
         try:
             return dek.decrypt(sealed.nonce, sealed.ciphertext, None).decode("utf-8")
         except InvalidTag as exc:

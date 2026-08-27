@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from app.pipeline import prompt_aad
 from app.crypto import KeyDestroyed, Sealed
 from app.store import TenantScope
 from tests.conftest import auth
@@ -130,7 +131,8 @@ def test_destroying_the_dek_makes_existing_ciphertext_unreadable(harness, client
     # 백업에 이 암호문이 그대로 있다고 치자.
     backup = Sealed(nonce=row.prompt_nonce, ciphertext=row.prompt_cipher)
     wrapped = harness.store.get_tenant("acme")["dek_wrapped"]
-    assert harness.vault.open(wrapped, backup) == "복원되면 안 되는 원문"
+    aad = prompt_aad("acme", job["job_id"])
+    assert harness.vault.open(wrapped, backup, aad=aad) == "복원되면 안 되는 원문"
 
     response = client.delete(
         "/v1/platform/tenants/acme?confirm=acme&reason=계약 종료",
@@ -347,3 +349,65 @@ def test_export_is_audited(harness, client, acme):
     client.get("/v1/admin/export", headers=auth(acme["tenant_admin"]))
     actions = {a["action"] for a in harness.store.list_audit(TenantScope("acme"))}
     assert "export_tenant" in actions
+
+
+# ── 감사 LOW — 암호문이 자기 행에 묶여 있지 않았다 ──────────────────────────
+
+
+def test_ciphertext_cannot_be_transplanted_into_another_job(harness, client, acme):
+    """**같은 테넌트 안에서는 DEK 가 하나라 키만으로는 안 막힌다.**
+
+    DB 에 쓸 수 있는 공격자가 잡 A 의 암호문을 잡 B 의 행에 옮겨 넣으면,
+    감사가 남는 정상 열람 경로를 통해 남의 프롬프트가 화면에 뜬다.
+    """
+    victim = submit(client, acme, prompt="남의 비밀 원문")
+    mine = submit(client, acme, prompt="내 것")
+    scope = TenantScope("acme")
+
+    stolen = harness.store.get_job(scope, victim["job_id"])
+    harness.store.update_job(
+        scope, mine["job_id"],
+        prompt_cipher=stolen.prompt_cipher, prompt_nonce=stolen.prompt_nonce,
+    )
+
+    response = client.get(
+        f"/v1/admin/jobs/{mine['job_id']}/raw", headers=auth(acme["tenant_admin"])
+    )
+    assert response.status_code != 200 or "남의 비밀 원문" not in response.text
+
+
+def test_the_normal_reveal_still_works(harness, client, acme):
+    """묶는 것이 정상 경로를 막으면 안 된다."""
+    job = submit(client, acme, prompt="내 원문")
+    response = client.get(
+        f"/v1/admin/jobs/{job['job_id']}/raw", headers=auth(acme["tenant_admin"])
+    )
+    assert response.status_code == 200
+    assert response.json()["prompt"] == "내 원문"
+
+
+def test_ciphertext_sealed_before_the_binding_still_opens(harness):
+    """업그레이드가 곧 원문 손실이 되면 안 된다 — 옛 암호문은 AAD 가 없다."""
+    wrapped = harness.store.get_tenant("acme")["dek_wrapped"] if harness.store.get_tenant("acme") else None
+    if wrapped is None:
+        harness.store.create_tenant(
+            "legacy", "Legacy", end_user_salt=b"s", dek_wrapped=harness.vault.create_dek()
+        )
+        wrapped = harness.store.get_tenant("legacy")["dek_wrapped"]
+
+    legacy = harness.vault.seal(wrapped, "바인딩 이전 원문")     # aad 없이 봉인
+    assert harness.vault.open(wrapped, legacy, aad="job:acme:whatever") == "바인딩 이전 원문"
+
+
+def test_an_unbound_caller_cannot_open_a_bound_ciphertext(harness, client, acme):
+    """폴백은 **옛 암호문에만** 열려 있다. 바인딩을 안 주면 새 암호문은 안 열린다."""
+    from app.crypto import CryptoError
+
+    job = submit(client, acme, prompt="묶인 원문")
+    row = harness.store.get_job(TenantScope("acme"), job["job_id"])
+    wrapped = harness.store.get_tenant("acme")["dek_wrapped"]
+
+    with pytest.raises(CryptoError):
+        harness.vault.open(
+            wrapped, Sealed(nonce=row.prompt_nonce, ciphertext=row.prompt_cipher)
+        )

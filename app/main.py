@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import contextlib
+import hmac
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +29,6 @@ from starlette.staticfiles import StaticFiles
 from . import meta as meta_mod
 from .bootstrap import GRACE_KEY
 from .auth import (
-    ROLE_PLATFORM_ADMIN,
     ROLE_SERVICE,
     Principal,
     RateLimiter,
@@ -35,6 +36,7 @@ from .auth import (
     bearer_from_header,
     issue_token,
     limits_for,
+    require_can_issue,
     require_platform_admin,
     require_tenant_admin,
     rotate_token,
@@ -49,7 +51,7 @@ from .config import (
     validate_role_fields,
 )
 from .cost import CostAccountant
-from .crypto import KeyDestroyed, KeyVault, Sealed
+from .crypto import CryptoError, KeyDestroyed, KeyVault, Sealed
 from .evals import Evaluator
 from .guard import Guard
 from .i18n import ApiError, Translator, guard_pack_for, negotiate_locale
@@ -63,6 +65,7 @@ from .pipeline import (
     Pipeline,
     Submission,
     is_public_role,
+    prompt_aad,
 )
 from .scheduler import Scheduler
 from .store import PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
@@ -80,6 +83,22 @@ MAX_BODY_BYTES = 2 * 1024 * 1024
 #: 제출 한도로 막으면 안 되고, 그렇다고 무제한이면 큐가 길어질 때 컨트롤 플레인이
 #: **클러스터 포화의 증상으로** 죽는다.
 POLL_LIMIT_PER_MIN = 600
+
+#: 계약·세션 엔드포인트의 분당 상한.
+#:
+#: 이 응답들은 **매번 생성된다**(역할은 런타임에 바뀌고, 허용 역할은 토큰마다
+#: 다르다 — 정적 파일이면 그 둘이 어긋난다). 생성 비용이 있는데 상한이 없으면
+#: 인증된 토큰 하나로 컨트롤 플레인 CPU 를 태울 수 있다. 폴링보다 훨씬 낮게
+#: 잡는다 — 계약은 배포 때 한 번 읽는 것이지 루프에서 읽는 것이 아니다.
+CONTRACT_LIMIT_PER_MIN = 60
+
+#: 메트릭 스크레이프 전용 토큰(환경 변수). 없으면 플랫폼 관리자 토큰만 통한다.
+#:
+#: 이것이 없으면 Prometheus 설정 파일에 **플랫폼 관리자 토큰을 평문으로** 두게
+#: 된다 — 스크레이프에 필요한 권한은 집계 숫자 읽기뿐인데 클러스터 전체를
+#: 지울 수 있는 자격증명을 거기 놓는 셈이다. 메트릭에는 테넌트 이름이 없으므로
+#: (그 자체가 별도로 강제된다) 이 토큰이 여는 범위는 운영 집계에 그친다.
+ENV_METRICS_TOKEN = "LCC_METRICS_TOKEN"
 
 CLIENT_DIR = Path(__file__).resolve().parent.parent / "clients"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -288,6 +307,17 @@ def _principal(request: Request) -> Principal:
     request.state.tenant_locale = tenant["locale"] if tenant else None
     request.state.tenant = tenant
     return principal
+
+
+def _contract_limit(request: Request, label: str) -> None:
+    """계약·세션 응답의 분당 상한. **매번 생성되는 응답이라 공짜가 아니다.**"""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    ctx.limiter.check_named(
+        f"contract:{principal.tenant_id}:{principal.service_id}",
+        CONTRACT_LIMIT_PER_MIN,
+        scope_label="contract",
+    )
 
 
 async def _body(request: Request) -> dict[str, Any]:
@@ -588,6 +618,7 @@ async def session(request: Request) -> Response:
     문자열은 협상된 로케일 하나만 보낸다 — 전체 카탈로그를 보내면 쓰지도 않을
     번역이 매 요청마다 따라다닌다.
     """
+    _contract_limit(request, "session")
     ctx: AppContext = request.app.state.ctx
     principal = _principal(request)
     tenant = request.state.tenant
@@ -623,6 +654,7 @@ async def session(request: Request) -> Response:
 
 
 async def meta_endpoint(request: Request) -> Response:
+    _contract_limit(request, "meta")
     ctx: AppContext = request.app.state.ctx
     principal = _principal(request)
     service = _service_or_401(ctx, principal)
@@ -644,6 +676,7 @@ async def meta_endpoint(request: Request) -> Response:
 
 
 async def integration(request: Request) -> Response:
+    _contract_limit(request, "integration")
     ctx: AppContext = request.app.state.ctx
     principal = _principal(request)
     service = _service_or_401(ctx, principal)
@@ -678,10 +711,12 @@ def _openapi_for(request: Request) -> dict[str, Any]:
 
 
 async def openapi_json(request: Request) -> Response:
+    _contract_limit(request, "openapi")
     return _ok(request, _openapi_for(request))
 
 
 async def openapi_yaml(request: Request) -> Response:
+    _contract_limit(request, "openapi")
     import yaml
 
     return PlainTextResponse(
@@ -706,6 +741,7 @@ async def client_index(request: Request) -> Response:
 
 
 async def client_file(request: Request) -> Response:
+    _contract_limit(request, "client")
     ctx: AppContext = request.app.state.ctx
     name = request.path_params["name"]
     target = (ctx.client_dir / name).resolve()
@@ -790,9 +826,9 @@ async def tenant_tokens(request: Request) -> Response:
         raise ApiError("not_found", status=404)
 
     role = str(body.get("role") or ROLE_SERVICE)
-    if role == ROLE_PLATFORM_ADMIN:
-        # 테넌트 관리자가 플랫폼 권한을 스스로 발급할 수 있으면 RBAC 가 사라진다.
-        raise ApiError("forbidden_platform_admin", status=403)
+    # 테넌트 관리자가 플랫폼 권한을 스스로 발급할 수 있으면 RBAC 가 사라진다.
+    # **회전 경로도 같은 헬퍼를 지난다** — 규칙이 한 곳에만 있어야 한다.
+    require_can_issue(principal.role, role)
 
     token_id, raw = issue_token(
         ctx.store, scope, service_id, role=role,
@@ -811,6 +847,7 @@ async def tenant_token_rotate(request: Request) -> Response:
     body = await _body(request)
     new_id, raw = rotate_token(
         ctx.store, scope, request.path_params["token_id"],
+        actor_role=principal.role,
         actor=principal.token_id,
         grace_seconds=_float(body.get("grace_seconds"), "grace_seconds", minimum=0.0),
         now=ctx.now,
@@ -1132,10 +1169,21 @@ async def tenant_job_raw(request: Request) -> Response:
     tenant = request.state.tenant
     try:
         plaintext = ctx.vault.open(
-            tenant["dek_wrapped"], Sealed(nonce=job.prompt_nonce, ciphertext=job.prompt_cipher)
+            tenant["dek_wrapped"],
+            Sealed(nonce=job.prompt_nonce, ciphertext=job.prompt_cipher),
+            aad=prompt_aad(scope.tenant_id, job_id),
         )
     except KeyDestroyed:
         # DEK 가 폐기됐다 — crypto-shredding 이후에는 백업의 암호문도 못 연다.
+        raise ApiError("raw_prompt_unavailable", status=404)
+    except CryptoError:
+        # 이 행의 암호문이 아니거나 손상됐다. 암호문은 `job_id` 에 묶여 있으므로
+        # **다른 잡의 암호문을 이 행에 심어도 여기서 걸린다.** 500 으로 흘리면
+        # 소비자는 서버 고장으로 읽고, 관리자는 그것이 이식 시도인지 모른다.
+        ctx.store.audit(
+            principal.token_id, "raw_prompt_undecryptable", tenant_id=scope.tenant_id,
+            target=job_id, outcome="error",
+        )
         raise ApiError("raw_prompt_unavailable", status=404)
 
     ctx.store.audit(
@@ -1495,7 +1543,13 @@ async def metrics(request: Request) -> Response:
     **테넌트 이름은 라벨에 없다.** 메트릭은 설치처 전체가 보는 대시보드로
     흘러가고, 거기에 테넌트별 소비량이 뜨면 그것도 정보 유출이다.
     """
-    ctx, _ = _platform_admin(request)
+    ctx: AppContext = request.app.state.ctx
+    scrape_token = os.environ.get(ENV_METRICS_TOKEN)
+    presented = bearer_from_header(request.headers.get("authorization"))
+    if not (scrape_token and presented and hmac.compare_digest(scrape_token, presented)):
+        # 전용 토큰이 없거나 안 맞으면 예전대로 플랫폼 관리자를 요구한다.
+        _platform_admin(request)
+
     body = render_metrics(collect(
         store=ctx.store, cluster=ctx.cluster, scheduler=ctx.scheduler,
         registrar=ctx.registrar, notifier=ctx.notifier, vault=ctx.vault,

@@ -32,6 +32,15 @@ from .identity import hash_end_user, hash_prompt, hash_system, looks_like_pii
 from .roles import RoleResolver, resolver_for
 from .store import TERMINAL_STATUSES, SqliteStore, TenantScope
 
+
+def prompt_aad(tenant_id: str, job_id: str) -> str:
+    """원문 암호문을 묶을 레코드 식별자. **봉인과 해제가 같은 값을 써야 한다.**
+
+    한 곳에서 만든다 — 두 곳에서 조립하면 한쪽이 바뀌는 순간 그 테넌트의
+    원문이 통째로 안 열린다.
+    """
+    return f"job:{tenant_id}:{job_id}"
+
 DEFAULT_WAIT_SECONDS = 30.0
 MAX_WAIT_SECONDS = 300.0
 POLL_INTERVAL = 0.05
@@ -262,7 +271,9 @@ class Pipeline:
 
     # -- ③ 저장 ---------------------------------------------------------------
 
-    def _seal(self, scope: TenantScope, tenant: Any, plaintext: str) -> Any:
+    def _seal(
+        self, scope: TenantScope, tenant: Any, plaintext: str, *, job_id: str
+    ) -> Any:
         """원문 암호화. **KEK 가 없으면 암호문 자체를 안 만든다.**
 
         평문 폴백 경로를 두면 키 설정을 깜빡한 설치처에 원문이 평문으로 쌓인다.
@@ -279,7 +290,10 @@ class Pipeline:
             wrapped = self._store.adopt_tenant_dek(scope, self._vault.create_dek())
             if not wrapped:
                 return None
-        return self._vault.seal(wrapped, plaintext)
+        # **암호문을 그 행에 묶는다.** DB 에 쓸 수 있는 공격자가 잡 A 의 암호문을
+        # 잡 B 의 행에 옮겨 넣어도 열리지 않게 — 같은 테넌트 안에서는 DEK 가
+        # 하나라서 키만으로는 안 막힌다.
+        return self._vault.seal(wrapped, plaintext, aad=prompt_aad(scope.tenant_id, job_id))
 
     def _create_job(
         self,
@@ -296,7 +310,10 @@ class Pipeline:
         metadata: Mapping[str, Any] | None,
         status: str = "queued",
     ) -> str:
-        sealed = self._seal(scope, tenant, raw_prompt)
+        # **잡 id 를 먼저 만든다.** 봉인이 그 id 를 태그에 묶어야 하므로 저장
+        # 시점에 받아서는 늦다.
+        job_id = uuid.uuid4().hex[:16]
+        sealed = self._seal(scope, tenant, raw_prompt, job_id=job_id)
         masked = verdict.storable_prompt
         external = verdict.prompt_for(EXTERNAL)
         system_internal = verdict.system_for(INTERNAL)
@@ -304,6 +321,7 @@ class Pipeline:
 
         return self._store.create_job(
             scope,
+            id=job_id,
             service_id=principal.service_id,
             end_user_hash=end_user_hash,
             role=role_config.name,

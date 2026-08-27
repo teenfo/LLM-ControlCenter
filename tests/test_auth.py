@@ -407,3 +407,74 @@ def test_counter_lives_in_the_store_not_process_memory(limiter, store):
         other_worker.check_and_consume(p, RateLimits(service=10))
     with pytest.raises(ApiError):
         other_worker.check_and_consume(p, RateLimits(service=10))
+
+
+# ── 감사 LOW — 회전이 발급 권한 검사를 지나지 않았다 ────────────────────────
+
+
+def test_rotating_a_platform_token_is_not_a_way_to_mint_one(store, clock):
+    """**회전은 "같은 역할로 다시 발급" 이므로 그 자체가 발급이다.**
+
+    발급 경로에만 검사가 있어서, 테넌트 관리자가 자기 테넌트의 platform_admin
+    토큰을 회전시켜 새 플랫폼 관리자 토큰을 평문으로 받아낼 수 있었다.
+    """
+    from app.auth import ROLE_PLATFORM_ADMIN, ROLE_TENANT_ADMIN, issue_token, rotate_token
+
+    scope = TenantScope("acme")
+    token_id, _ = issue_token(store, scope, "acme-web", role=ROLE_PLATFORM_ADMIN)
+
+    with pytest.raises(ApiError) as exc:
+        rotate_token(store, scope, token_id, actor="t", actor_role=ROLE_TENANT_ADMIN)
+    assert exc.value.status == 403
+
+
+def test_a_platform_admin_can_still_rotate_its_own(store, clock):
+    """막는 것은 권한 상승이지 정상 운영이 아니다."""
+    from app.auth import ROLE_PLATFORM_ADMIN, issue_token, rotate_token
+
+    scope = TenantScope("acme")
+    token_id, _ = issue_token(store, scope, "acme-web", role=ROLE_PLATFORM_ADMIN)
+
+    new_id, raw = rotate_token(
+        store, scope, token_id, actor="p", actor_role=ROLE_PLATFORM_ADMIN
+    )
+    assert new_id and raw
+
+
+def test_a_tenant_admin_can_rotate_a_service_token(store, clock):
+    from app.auth import ROLE_SERVICE, ROLE_TENANT_ADMIN, issue_token, rotate_token
+
+    scope = TenantScope("acme")
+    token_id, _ = issue_token(store, scope, "acme-web", role=ROLE_SERVICE)
+
+    new_id, _ = rotate_token(
+        store, scope, token_id, actor="t", actor_role=ROLE_TENANT_ADMIN
+    )
+    assert new_id
+
+
+def test_the_issue_rule_lives_in_one_place():
+    """규칙을 두 곳에 적으면 한 곳만 고쳐 놓고 고쳤다고 믿게 된다."""
+    import inspect
+
+    from app import main
+    from app.auth import rotate_token
+
+    assert "require_can_issue" in inspect.getsource(rotate_token)
+    assert "require_can_issue" in inspect.getsource(main.tenant_tokens)
+
+
+def test_a_rate_limited_reply_says_when_to_come_back(store, clock):
+    """이 값이 없으면 소비자의 재시도 판단은 대개 "바로 다시" 다."""
+    from app.auth import Principal, RateLimiter, RateLimits
+
+    limiter = RateLimiter(store, now=clock)
+    principal = Principal(token_id="t", tenant_id="acme", service_id="acme-web", role="service")
+    limits = RateLimits(tenant=1)
+
+    limiter.check_and_consume(principal, limits)
+    with pytest.raises(ApiError) as exc:
+        limiter.check_and_consume(principal, limits)
+
+    retry_after = exc.value.params["retry_after"]
+    assert 1 <= retry_after <= 60
