@@ -282,6 +282,18 @@ CREATE TABLE IF NOT EXISTS admin_audit (
     outcome     TEXT NOT NULL DEFAULT 'ok'
 );
 CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts ON admin_audit(tenant_id, ts);
+
+-- 레이트리밋 카운터. 1초 버킷을 합산해 슬라이딩 윈도를 만든다.
+--
+-- 프로세스 메모리에 두지 않는 이유: API 워커를 N개 띄우면 각자 자기 카운터를 갖게 되어
+-- 실효 한도가 N배가 된다. 한도가 조용히 곱해지는 것은 제품에서 버그다.
+CREATE TABLE IF NOT EXISTS rate_counters (
+    key    TEXT NOT NULL,
+    bucket INTEGER NOT NULL,
+    count  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (key, bucket)
+);
+CREATE INDEX IF NOT EXISTS idx_rate_bucket ON rate_counters(bucket);
 """
 
 #: ADD COLUMN 전용 마이그레이션. 추가·NULL 기본값만 허용하고 재작성·삭제는 금지한다.
@@ -519,6 +531,18 @@ class SqliteStore:
         self._conn.execute(
             "UPDATE tokens SET last_used_at = ? WHERE id = ?", (self._now(), token_id)
         )
+
+    def set_token_expiry(
+        self, scope: TenantScope, token_id: str, expires_at: float | None
+    ) -> bool:
+        """토큰 만료 시각을 세운다. 회전 시 유예 창을 주는 데 쓴다."""
+        where, params = self._scoped_where(scope, "id = ?")
+        params.append(token_id)
+        cur = self._conn.execute(
+            f"UPDATE tokens SET expires_at = ? WHERE {where}", [expires_at, *params]
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def revoke_token(self, scope: TenantScope, token_id: str) -> bool:
         where, params = self._scoped_where(scope, "id = ? AND revoked_at IS NULL")
@@ -905,6 +929,31 @@ class SqliteStore:
 
     def all_node_health(self) -> list[sqlite3.Row]:
         return list(self._conn.execute("SELECT * FROM node_health ORDER BY node"))
+
+    # -- 레이트리밋 카운터 -----------------------------------------------------
+
+    def bump_rate_counter(self, key: str, bucket: int) -> None:
+        self._conn.execute(
+            "INSERT INTO rate_counters(key, bucket, count) VALUES(?,?,1) "
+            "ON CONFLICT(key, bucket) DO UPDATE SET count = count + 1",
+            (key, bucket),
+        )
+        self._conn.commit()
+
+    def rate_count(self, key: str, since_bucket: int) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(count), 0) AS n FROM rate_counters "
+            "WHERE key = ? AND bucket >= ?",
+            (key, since_bucket),
+        ).fetchone()
+        return int(row["n"])
+
+    def prune_rate_counters(self, before_bucket: int) -> int:
+        cur = self._conn.execute(
+            "DELETE FROM rate_counters WHERE bucket < ?", (before_bucket,)
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     # -- 보존 정리 ------------------------------------------------------------
 
