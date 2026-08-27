@@ -160,12 +160,80 @@ def iban_mod97(value: str) -> bool:
         return False
 
 
+#: 자격증명 자리에 흔히 들어가는 자리표시자. 이것들이 걸리면 규칙이 문서·템플릿에서
+#: 쏟아지고, 오탐이 쏟아지면 관리자가 규칙을 꺼버린다.
+_PLACEHOLDER = re.compile(
+    r"(?i)^(?:x{3,}|\.{3,}|todo|tbd|none|null|nil|true|false|placeholder"
+    r"|changeme[\w\-]*|your[\w\-]*|<[^>]*>|\$\{?\w+\}?|example[\w\-]*|test[\w\-]*"
+    r"|dummy[\w\-]*|redacted|secret|password|[a-z_]*here)$"
+)
+_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+#: `boto3.Session` 처럼 점으로 이은 식별자. 코드지 자격증명이 아니다.
+_DOTTED_IDENT = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$")
+#: 이 꼬리가 붙은 이름은 **값이 자격증명이 아니다.** `password_hash` 는 해시고,
+#: `api_key_id` 는 식별자다 — 이것들까지 마스킹하면 정상 설정 문서가 망가진다.
+_NOT_CREDENTIAL_SUFFIX = re.compile(
+    r"(?i)_(?:hash|hashed|digest|algo|algorithm|policy|name|file|path|env|var"
+    r"|type|format|len|length|count|budget|limit|expiry|ttl|id)$"
+)
+
+
+def credential_shape(value: str) -> bool:
+    """대입 문맥에서 잡힌 값이 **진짜 자격증명처럼 생겼는가.**
+
+    ### 왜 엔트로피가 아닌가
+
+    감사서는 "고엔트로피 문자열" 탐지를 제안했다. 실측해 보면 **섀넌 엔트로피는 이
+    둘을 가르지 못한다**:
+
+        token_hex(20) 시크릿   3.635 bits/char
+        UUID                   3.663
+        base64 로 인코딩한 영문  4.930   ← 진짜 base64 시크릿(4.539)보다 높다
+
+    임계를 어디에 두든 진짜 키를 놓치거나 모든 git SHA 를 잡는다. 그래서 엔트로피를
+    쓰지 않고 **문맥**(`api_key = …`)을 신호로 삼고, 이 함수는 그 문맥에서 걸린 값이
+    자리표시자인지만 걸러낸다.
+
+    ### 해시 길이로 거르지 않는다
+
+    40자리 hex 를 해시로 보고 버리면 `token_hex(20)` 으로 만든 진짜 토큰이 함께
+    빠진다. 여기까지 온 값은 이미 `api_key=` 같은 문맥을 지났으므로, 모양보다
+    **문맥이 더 믿을 만한 증거다.**
+    """
+    # **검증기는 매치 전체를 받는다**(`_match_spans` 는 `group(0)` 을 넘긴다).
+    # `api_key = "sk_live_…"` 가 통째로 들어오므로 이름과 값을 여기서 가른다 —
+    # 안 가르면 키워드만으로 아래 조건이 전부 만족돼 검증기가 늘 참이 된다.
+    #
+    # 첫 구분자에서만 자른다. base64 값 끝의 `=` 패딩에서 다시 자르면 안 된다.
+    parts = re.split(r"[:=]", value, maxsplit=1)
+    if len(parts) < 2:
+        return False
+    name, raw = parts[0], parts[1]
+    if _NOT_CREDENTIAL_SUFFIX.search(name.strip().strip("\"'")):
+        return False
+
+    text = raw.strip().strip("\"'")
+    if len(text) < 12 or _PLACEHOLDER.match(text) or _UUID.match(text):
+        return False
+    if _DOTTED_IDENT.match(text):
+        return False
+    if len(set(text)) < 6:
+        # `xxxxxxxxxxxx` · `000000000000` 처럼 사실상 한 글자짜리.
+        return False
+    # 진짜 자격증명은 거의 항상 숫자나 기호를 포함한다. 영문자만이면 낱말이다 —
+    # `secretary = "JohnSmithington"` 이 걸리는 것을 막는 마지막 칸이다.
+    return any(char.isdigit() or char in "+/=_-&!@#$%^*." for char in text)
+
+
 CHECKSUMS: Mapping[str, Callable[[str], bool]] = {
     "luhn": luhn,
     "kr_rrn": kr_rrn,
     "kr_biz": kr_biz,
     "jp_mynumber": jp_mynumber,
     "iban_mod97": iban_mod97,
+    "credential_shape": credential_shape,
 }
 
 

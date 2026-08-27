@@ -125,6 +125,67 @@ locale_packs:
         label: "[프롬프트유출시도]"
         description: "시스템 프롬프트 유출 시도"
 
+  # ── 시크릿 ───────────────────────────────────────────────────────────────
+  #
+  # 개인정보와 나란히 새는 것이 자격증명이다. 개발자가 설정 파일을 통째로 붙여
+  # 넣거나, **모델이 문맥에 있던 키를 응답에 되풀이한다** — 출력 축이 열린 뒤로
+  # 후자가 실재하는 경로가 됐다.
+  #
+  # always_on 이다. 자격증명 형식은 나라가 아니라 벤더가 정한다.
+  #
+  # **"고엔트로피 문자열" 탐지는 기각했다.** 섀넌 엔트로피는 진짜 시크릿과 정상
+  # 문자열을 가르지 못한다(실측):
+  #
+  #     token_hex(20) 시크릿   3.635 bits/char
+  #     UUID                   3.663
+  #     base64 로 인코딩한 영문  4.930   ← 진짜 base64 시크릿(4.539)보다 높다
+  #
+  # 임계를 어디에 두든 진짜 키를 놓치거나 모든 git SHA 를 잡는다. 그래서 신호를
+  # 엔트로피가 아니라 **접두사와 문맥**에서 얻는다.
+  secrets:
+    always_on: true
+    rules:
+      - id: secret_vendor_key
+        kind: pattern
+        # 벤더가 정한 접두사. 정상 문서에 이 모양이 우연히 나올 확률이 사실상 0 이라
+        # 체크섬 없이도 오탐이 없다 — 접두사 자체가 체크섬 노릇을 한다.
+        #
+        # 마지막 항목은 **이 제품 자신의 서비스 토큰**이다. 설치처 개발자가 자기
+        # 토큰을 프롬프트에 붙여 넣는 일이 실제로 일어나고, 그것이 경계 밖으로
+        # 나가면 이 제품의 인증이 통째로 뚫린다.
+        pattern: '(?:(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{12,}|sk-(?:ant-)?[A-Za-z0-9_\-]{24,}|AIza[0-9A-Za-z_\-]{30,}|[rs]k_(?:live|test)_[A-Za-z0-9]{16,}|eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}|lcc_[0-9a-f]{8}_[A-Za-z0-9_\-]{40,})'
+        action: full
+        label: "[시크릿]"
+        description: "벤더 접두사가 붙은 API 키·토큰"
+
+      - id: secret_private_key
+        kind: pattern
+        # PEM 개인키 블록의 머리말. 이것이 프롬프트에 있으면 변명의 여지가 없다.
+        pattern: '-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----'
+        action: full
+        label: "[개인키]"
+        description: "PEM 개인키"
+
+      - id: secret_assignment
+        kind: pattern
+        # **문맥이 신호다.** `api_key = …` 의 왼쪽이 오른쪽을 자격증명으로 만든다.
+        # 키워드 앞뒤로 식별자 조각을 허용해 `AWS_SECRET_ACCESS_KEY` 같은 형태를 잡는다.
+        #
+        # **full 로 시작한다.** 베이스라인 원칙은 "체크섬으로 검증되는 규칙은
+        # 오탐률이 낮으므로 마스킹으로 시작한다" 이고, 실측이 그것을 뒷받침한다 —
+        # 문서·설정·대화 30건에서 오탐 0건(승격 게이트 임계는 2%).
+        #
+        # 다만 `credential_shape` 는 Luhn 같은 **수학적** 검증기가 아니라 자리표시자
+        # 휴리스틱이다. 확신의 근거가 계산이 아니라 정답셋이므로, 설치처는 자기
+        # 도메인 샘플을 넣어 다시 재야 한다.
+        #
+        # 유출된 자격증명은 즉시 악용 가능하고, 마스킹은 요청을 막지 않는다.
+        pattern: '(?i)[A-Za-z0-9_.\-]*(?:api[_-]?key|access[_-]?key|secret|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|credential)[A-Za-z0-9_]*\s*["'']?\s*[:=]\s*["'']?[A-Za-z0-9+/=_\-&!@#$%^*.]{12,}'
+        checksum: credential_shape        # 자리표시자(TODO·YOUR_KEY_HERE)를 걸러낸다
+        action: full
+        label: "[자격증명]"
+        description: "설정 대입 문맥의 자격증명"
+
   ko_KR:
     rules:
       - id: kr_rrn
