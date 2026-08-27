@@ -758,6 +758,26 @@ class SqliteStore:
         ).fetchone()
         return float(row["total"])
 
+    def reserved_cost(self, scope: TenantScope, *, service_id: str | None = None) -> float:
+        """아직 정산되지 않은 예약 비용의 합.
+
+        예약을 잡 행에 두는 이유는 내구성이다 — 프로세스 메모리에 두면 재기동 시
+        예약이 사라져 예산 확인이 이미 디스패치된 잡을 못 본다.
+        """
+        extra = "cost_reserved_usd > 0 AND status IN ('queued','running')"
+        params_extra: list[Any] = []
+        if service_id:
+            extra += " AND service_id = ?"
+            params_extra.append(service_id)
+
+        where, params = self._scoped_where(scope, extra)
+        params.extend(params_extra)
+        row = self._conn.execute(
+            f"SELECT COALESCE(SUM(cost_reserved_usd), 0.0) AS total FROM jobs WHERE {where}",
+            params,
+        ).fetchone()
+        return float(row["total"])
+
     def record_filter_event(
         self,
         scope: TenantScope,
