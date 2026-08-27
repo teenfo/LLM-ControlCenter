@@ -24,22 +24,14 @@ from .auth import Principal, RateLimiter, check_role_allowed, limits_for
 from .cluster import PLACED, WAIT, Cluster
 from .config import EXTERNAL, INTERNAL, Config, GuardRule, Role
 from .cost import CostAccountant
-from .crypto import KeyVault
+from .crypto import KeyVault, prompt_aad
 from .evals import Evaluator
-from .guard import Guard, GuardResult
+from .guard import Guard, GuardResult, rules_from_rows
 from .i18n import ApiError, guard_pack_for
 from .identity import hash_end_user, hash_prompt, hash_system, looks_like_pii
 from .roles import RoleResolver, resolver_for
 from .store import TERMINAL_STATUSES, SqliteStore, TenantScope
 
-
-def prompt_aad(tenant_id: str, job_id: str) -> str:
-    """원문 암호문을 묶을 레코드 식별자. **봉인과 해제가 같은 값을 써야 한다.**
-
-    한 곳에서 만든다 — 두 곳에서 조립하면 한쪽이 바뀌는 순간 그 테넌트의
-    원문이 통째로 안 열린다.
-    """
-    return f"job:{tenant_id}:{job_id}"
 
 DEFAULT_WAIT_SECONDS = 30.0
 MAX_WAIT_SECONDS = 300.0
@@ -167,25 +159,10 @@ class Pipeline:
     def tenant_guard_rules(self, scope: TenantScope) -> tuple[GuardRule, ...]:
         """테넌트가 추가한 규칙.
 
-        **완화는 여기서 막지 않는다** — `guard.rules_for()` 가 베이스라인과 병합하며
-        강한 쪽을 채택한다. 판정이 두 곳에 있으면 언젠가 갈린다.
+        조립은 `guard.rules_from_rows()` 가 한다 — 출력 축(스케줄러)이 같은 테이블을
+        읽으므로, 조립을 각자 하면 한쪽이 컬럼을 빠뜨려 입력과 출력의 규칙이 갈린다.
         """
-        rules = []
-        for raw in self._store.list_tenant_guard_rules(scope):
-            rules.append(
-                GuardRule(
-                    id=raw["id"],
-                    kind=raw["kind"],
-                    action=raw["action"],
-                    label=raw["label"],
-                    pattern=raw["pattern"],
-                    checksum=raw["checksum"],
-                    keep_tail=raw["keep_tail"],
-                    description=raw["description"],
-                    locale_pack=raw["locale_pack"],
-                )
-            )
-        return tuple(rules)
+        return rules_from_rows(self._store.list_tenant_guard_rules(scope))
 
     def _candidate_boundaries(self, role: Role) -> tuple[str, ...]:
         """가드가 등급을 매길 경계.

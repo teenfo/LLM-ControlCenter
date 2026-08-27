@@ -80,6 +80,13 @@ def normalize_for_match(text: str) -> tuple[str, list[int] | None]:
 
 STAGE_LLM = "llm"
 
+#: 출력(응답)에서 걸린 1단 히트. **입력과 뭉치지 않는다.**
+#:
+#: 두 사건은 관리자에게 전혀 다른 뜻이다. 입력 히트는 소비자가 보낸 것이고,
+#: 출력 히트는 **모델이 만들어 낸 것**이다. 후자가 늘면 고칠 곳은 규칙이 아니라
+#: 프롬프트다. 한 통계로 뭉치면 그 구분이 사라져 아무도 원인을 못 찾는다.
+STAGE_OUTPUT = "output"
+
 
 # ── 체크섬 검증기 ────────────────────────────────────────────────────────────
 #
@@ -221,6 +228,81 @@ class GuardResult:
             if boundary in self.prompts:
                 return self.prompts[boundary]
         return ""
+
+
+#: 출력 축이 쓰는 경계. **응답은 컨트롤 플레인을 떠나 소비자에게 간다** — 소비자는
+#: 설치처의 애플리케이션이고, 경계 기준으로는 밖이다.
+#:
+#: 규칙을 `{internal: audit, external: full}` 로 둔 관리자의 뜻은 "안에서는 보되
+#: 밖으로는 가려라" 이다. 응답에 `internal` 등급을 적용하면 그 값이 가려지지 않은
+#: 채 소비자에게 나가고, 관리자의 뜻과 정반대가 된다.
+OUTPUT_BOUNDARY = EXTERNAL
+
+
+@dataclass(frozen=True)
+class OutputResult:
+    """응답 검사 결과. 입력과 달리 **한 벌만** 만든다.
+
+    입력은 어느 노드로 가느냐에 따라 경계가 갈려서 두 벌이 필요했다. 응답은 갈 곳이
+    소비자 하나뿐이라 갈릴 것이 없다 — 저장된 것이 곧 소비자가 받은 것이고, 그 등식이
+    "소비자가 실제로 무엇을 봤는가" 를 디버깅할 때 가장 쓸모 있는 불변식이다.
+    """
+
+    masked: str
+    detections: tuple[Detection, ...] = ()
+
+    @property
+    def redacted(self) -> bool:
+        """실제로 무언가를 가렸는가. `audit` 만 걸린 경우는 False 다."""
+        return any(
+            d.actions.get(OUTPUT_BOUNDARY) not in (None, "off", "audit")
+            for d in self.detections
+        )
+
+
+def _output_action(action: str) -> str:
+    """출력에서의 등급. **`block` 은 `full` 로 강등한다.**
+
+    입력의 `block` 은 "이 요청을 아예 처리하지 않는다" 이고 아무것도 낭비되지 않는다.
+    출력의 `block` 은 이미 추론이 끝난 뒤다 — 응답을 통째로 버리면 소비자는 비용만
+    내고 아무것도 못 받는다. `full` 이면 위반 값은 나가지 않고 나머지는 쓸 수 있으며,
+    원문은 봉인돼 있어 관리자가 감사 남기고 열어 볼 수 있다.
+
+    유예 모드의 `block → full` 강등과 같은 발상이다. 1단 패턴만으로는 "이 응답이
+    통째로 위험하다" 를 판정할 수 없다는 점도 근거다 — 그것은 2단의 영역이고,
+    출력 2단은 지연·비용을 재고 나서 붙인다.
+
+    설치처가 "출력에 주민번호가 있으면 아예 안 준다" 를 요구하면 여기에 설정 축을
+    하나 더 두면 된다. 적용 지점이 이 함수 하나라 그때의 변경 범위가 작다.
+    """
+    return "full" if action == "block" else action
+
+
+def rules_from_rows(rows: Iterable[Mapping[str, Any]]) -> tuple[GuardRule, ...]:
+    """테넌트가 추가한 규칙 행 → `GuardRule`.
+
+    **읽는 곳이 둘이면 해석도 둘이 된다.** 입력은 파이프라인이, 출력은 스케줄러가
+    같은 테이블을 읽는데 조립을 각자 하면 한쪽이 컬럼 하나를 빠뜨린다 — 그러면 그
+    테넌트의 규칙이 입력에서는 강하고 출력에서는 약해지고, 그 비대칭은 아무 데도
+    안 드러난다. `roles.py` 가 역할 해석에 대해 하는 일과 같은 발상이다.
+
+    **완화는 여기서 막지 않는다** — `rules_for()` 가 베이스라인과 병합하며 강한
+    쪽을 채택한다. 판정이 두 곳에 있으면 언젠가 갈린다.
+    """
+    return tuple(
+        GuardRule(
+            id=raw["id"],
+            kind=raw["kind"],
+            action=raw["action"],
+            label=raw["label"],
+            pattern=raw["pattern"],
+            checksum=raw["checksum"],
+            keep_tail=raw["keep_tail"],
+            description=raw["description"],
+            locale_pack=raw["locale_pack"],
+        )
+        for raw in rows
+    )
 
 
 #: 2단 분류기. 프롬프트와 맥락 규칙을 받아 매칭된 규칙 id 집합을 돌려준다.
@@ -438,6 +520,51 @@ class Guard:
             blocked_rules=blocked_rules,
             classifier_attempted=classifier_attempted,
             classifier_failed=classifier_failed,
+        )
+
+    async def inspect_output(
+        self,
+        text: str,
+        *,
+        locales: Iterable[str] = (),
+        tenant_rules: Sequence[GuardRule] = (),
+    ) -> OutputResult:
+        """**응답을 검사한다.** 입력 1단과 같은 규칙, 같은 스레드 풀 오프로드.
+
+        입력만 거르고 출력을 안 거르면 제품의 한 문장이 절반만 참이다. 응답에
+        민감정보가 실리는 경로는 가정이 아니다 — 요약·추출 작업의 산출물 자체가
+        개인정보이거나, 모델이 마스킹되지 않은 문맥을 재구성하거나, 인젝션이
+        시스템 프롬프트를 응답으로 끌어낸다.
+
+        **1단만 돈다.** 2단(LLM 분류)을 출력에 걸면 응답마다 추론이 한 번 더
+        늘어난다 — 지연과 비용을 실측한 뒤에 붙일 일이지, 켜 놓고 나중에 재는
+        것은 순서가 거꾸로다. `_run_stage1` 이 패턴 규칙만 고르므로 맥락 규칙은
+        여기서 자동으로 빠진다.
+        """
+        if not text:
+            return OutputResult(masked=text or "")
+
+        rules = self.rules_for(locales, tenant_rules)
+        hits = await self._run_stage1(text, None, rules)
+
+        # 등급을 출력용으로 다시 매긴다. `_apply` 는 `block` 을 "애초에 전송되지
+        # 않는다" 로 보고 건너뛰므로, 강등을 여기서 안 하면 **차단 규칙에 걸린 값이
+        # 마스킹도 안 된 채 그대로 나간다.** 가장 강한 등급이 가장 약하게 동작하는
+        # 뒤집힘이라, 이 한 줄이 빠지면 출력 축 전체가 거꾸로 선다.
+        detections = tuple(
+            replace(
+                hit,
+                actions={
+                    OUTPUT_BOUNDARY: _output_action(
+                        hit.actions.get(OUTPUT_BOUNDARY, "audit")
+                    )
+                },
+            )
+            for hit in hits
+        )
+        return OutputResult(
+            masked=_apply(text, detections, OUTPUT_BOUNDARY),
+            detections=detections,
         )
 
     async def _run_stage1(

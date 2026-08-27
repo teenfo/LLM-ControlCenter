@@ -68,6 +68,41 @@ def test_only_the_pipeline_creates_jobs(path):
     assert "create_job" not in calls_in(path), f"{path.name} 이 잡을 직접 만든다"
 
 
+def test_only_the_scheduler_writes_the_response():
+    """**응답을 쓰는 경로는 스케줄러 하나다** — 출력 축의 초크포인트다.
+
+    입력에서 `pipeline.py` 가 잡 생성의 유일한 경로인 것과 같은 구조다. 다른
+    모듈이 `response=` 를 직접 쓸 수 있으면 그 경로는 출력 가드를 지나지 않고,
+    응답 필터는 "대부분의 경우에는 도는" 것이 된다 — 그건 필터가 아니다.
+
+    `_succeed` 안에서 검사 → 봉인 → 저장이 한 덩어리라, 이 불변식이 지켜지는 한
+    마스킹되지 않은 응답이 DB 에 들어가는 경로는 존재하지 않는다.
+    """
+    # **저장 호출만 본다.** `Submission(response=job.response)` 처럼 이미 마스킹된
+    # 값을 읽어 응답 객체를 만드는 것은 대상이 아니다 — 문자열이나 인자 이름만으로
+    # 훑으면 그것까지 걸려서, 장치가 시끄러워지고 시끄러운 장치는 결국 꺼진다.
+    mutations = {"create_job", "update_job", "settle_job"}
+    fields = {"response", "response_cipher", "response_nonce"}
+
+    writers = []
+    for path in SOURCES:
+        if path.name in ("store.py", "scheduler.py"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr not in mutations:
+                continue
+            for keyword in node.keywords:
+                if keyword.arg in fields:
+                    writers.append(
+                        f"{path.name}:{node.lineno} {node.func.attr}({keyword.arg}=)"
+                    )
+
+    assert not writers, f"스케줄러 밖에서 응답을 쓴다: {writers}"
+
+
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
 def test_nothing_serializes_with_ascii_escapes(path):
     """`json.dumps` 를 직접 부르지 않는다 — 스토어의 `_json()` 을 쓴다.

@@ -82,6 +82,8 @@ class Assembly:
         self.scheduler = Scheduler(
             config, store, self.cluster, accountant=self.accountant,
             registrar=self.registrar, notifier=self.notifier,
+            # 출력 축 — 스케줄러가 응답을 쓰는 유일한 지점이라 가드와 금고가 여기 온다.
+            guard=self.guard, vault=vault,
         )
 
     def build(self, *, version: str, start_scheduler: bool):

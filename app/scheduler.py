@@ -33,6 +33,15 @@ import logging
 from .cluster import FAIL, WAIT, Cluster, Placement
 from .config import EXTERNAL, Config
 from .cost import CostAccountant
+from .crypto import response_aad
+from .guard import (
+    OUTPUT_BOUNDARY,
+    STAGE_OUTPUT,
+    Guard,
+    OutputResult,
+    rules_from_rows,
+)
+from .i18n import guard_pack_for
 from .models import ModelRegistrar
 from .observability import log_event
 from .roles import RoleResolver, resolver_for
@@ -119,11 +128,22 @@ class Scheduler:
         notify: Callable[[str, dict[str, Any]], None] | None = None,
         notifier: Any = None,
         resolver: RoleResolver | None = None,
+        guard: Guard | None = None,
+        vault: Any = None,
     ) -> None:
         self._config = config
         self._roles = resolver_for(config, store, resolver)
         self._store = store
         self._cluster = cluster
+        # **출력 축은 끌 수 있는 스위치가 아니다.** 가드를 안 넘겨받아도 설정으로
+        # 하나 만든다 — `None` 이면 검사를 건너뛰는 경로를 두면, 배선 하나를
+        # 빠뜨린 조립이 응답 필터가 통째로 꺼진 채로 조용히 돈다.
+        #
+        # 분류기 없이 만들어도 된다. 출력은 1단만 쓴다.
+        self._guard = guard or Guard(config)
+        # 금고는 없을 수 있다. **KEK 가 없으면 암호문 자체를 안 만든다** — 그것이
+        # 원문 보관 비활성화의 정의이고, 평문 폴백 경로는 존재하지 않는다.
+        self._vault = vault
         self._accountant = accountant or CostAccountant(config.pricing, store, now=now)
         self._registrar = registrar
         self._now = now
@@ -412,6 +432,66 @@ class Scheduler:
             self._stats[lane].running = self._lane_running[lane]
             self._cluster.release(placement)
 
+    def _record_output_events(
+        self, scope: TenantScope, verdict: OutputResult, *, job: Any
+    ) -> None:
+        """탐지 사실만 남긴다. **매칭된 값은 어디에도 남기지 않는다.**
+
+        `stage` 를 입력과 구분한다 — 뭉치면 "규칙이 입력에서 걸렸는가 출력에서
+        걸렸는가" 가 사라지고, 그 둘은 관리자에게 전혀 다른 사건이다. 입력 히트는
+        소비자가 보낸 것이고, **출력 히트는 모델이 만들어 낸 것**이다. 후자가 늘면
+        고칠 곳은 규칙이 아니라 프롬프트다.
+        """
+        for detection in verdict.detections:
+            self._store.record_filter_event(
+                scope,
+                rule_id=detection.rule_id,
+                stage=STAGE_OUTPUT,
+                action=detection.actions.get(OUTPUT_BOUNDARY, "audit"),
+                match_count=detection.match_count,
+                offsets=detection.spans,
+                job_id=job.id,
+                service_id=job.service_id,
+                boundary=OUTPUT_BOUNDARY,
+            )
+
+    async def _inspect_output(self, scope: TenantScope, text: str) -> OutputResult:
+        """응답에 입력과 같은 1단 규칙을 적용한다.
+
+        테넌트의 로케일 팩과 추가 규칙을 함께 읽는다. 안 읽으면 그 테넌트의 규칙이
+        **입력에서는 강하고 출력에서는 약해지고**, 그 비대칭은 어디에도 안 드러난다.
+        규칙을 조인다고 믿는 관리자가 실제로는 절반만 조이고 있는 셈이다.
+        """
+        tenant = self._store.get_tenant(scope.tenant_id)
+        pack = guard_pack_for(tenant["locale"]) if tenant else None
+        return await self._guard.inspect_output(
+            text,
+            locales=[pack] if pack else [],
+            tenant_rules=rules_from_rows(self._store.list_tenant_guard_rules(scope)),
+        )
+
+    def _seal_response(self, scope: TenantScope, job_id: str, text: str) -> Any:
+        """응답 원문 봉인. **KEK 가 없으면 암호문 자체를 안 만든다.**
+
+        AAD 가 프롬프트와 **다르다**(`response_aad` vs `prompt_aad`). 같은 값으로
+        묶으면 응답 암호문을 프롬프트 컬럼에 옮겨 심어도 열린다 — 관리자가 원문
+        열람을 눌렀을 때 감사에는 "프롬프트를 봤다" 고 남고 화면에는 응답이 뜬다.
+        """
+        if self._vault is None or not getattr(self._vault, "enabled", False):
+            return None
+        tenant = self._store.get_tenant(scope.tenant_id)
+        wrapped = tenant["dek_wrapped"] if tenant else None
+        if not wrapped:
+            return None
+        try:
+            return self._vault.seal(
+                wrapped, text, aad=response_aad(scope.tenant_id, job_id)
+            )
+        except Exception:
+            # 봉인 실패가 잡을 죽이지 않는다. 마스킹본은 이미 만들어졌고, 원문을
+            # 못 남기는 것이 응답을 통째로 잃는 것보다 낫다.
+            return None
+
     async def _succeed(
         self, scope: TenantScope, job: Any, placement: Placement, lane: str,
         started: float, *, text: str, input_tokens: int, output_tokens: int,
@@ -420,10 +500,20 @@ class Scheduler:
         self._cluster.record_success(placement.node)
         duration_ms = int((self._now() - started) * 1000)
 
+        # **출력 축의 초크포인트다.** `jobs.response` 를 쓰는 곳은 여기 하나뿐이고,
+        # 그래서 응답 필터는 새 배관이 아니라 이 함수 안의 한 단계다. 입력에서
+        # `pipeline.py` 가 잡 생성의 유일한 경로인 것과 같은 구조다.
+        verdict = await self._inspect_output(scope, text)
+        sealed = self._seal_response(scope, job.id, text) if text else None
+
         self._store.update_job(
             scope, job.id,
-            status="ok", response=text, finished_at=self._now(), metrics=dict(metrics),
+            status="ok", response=verdict.masked,
+            response_cipher=sealed.ciphertext if sealed else None,
+            response_nonce=sealed.nonce if sealed else None,
+            finished_at=self._now(), metrics=dict(metrics),
         )
+        self._record_output_events(scope, verdict, job=job)
         self._accountant.settle(
             scope, job.id,
             provider=placement.provider, model=placement.model,

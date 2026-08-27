@@ -21,6 +21,8 @@ import sys
 from contextlib import suppress
 from pathlib import Path
 
+from .store import CIPHER_COLUMNS
+
 #: 이 테이블들이 비어 있으면 스냅샷이 잘못됐다고 본다. 정상 설치라면 최소한
 #: 테넌트 하나와 스키마 버전은 있다.
 REQUIRED_TABLES = ("meta", "tenants", "jobs", "usage")
@@ -54,10 +56,21 @@ def snapshot(source: str | Path, target: str | Path) -> dict[str, int]:
         # **암호문을 검증보다 먼저 지운다.** 검증 뒤에 지우면, 검증에 실패했을 때
         # 원문 암호문이 든 파일이 디스크에 남는다 — 백업에서 빼기로 한 바로 그것이
         # 실패 경로에서만 남는 셈이다.
-        counts["prompt_cipher_removed"] = target_conn.execute(
-            "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
-            "WHERE prompt_cipher IS NOT NULL"
-        ).rowcount
+        #
+        # 지울 컬럼을 손으로 적지 않는다. 여기와 `store.export_tenant` 가 같은
+        # 목록을 각자 들고 있으면 새 암호문 컬럼이 늘 때 한쪽이 빠지고, 빠진 쪽이
+        # 원문을 파일로 내보내는 쪽이면 보관 기간이 그 파일 밖에서 무력화된다.
+        # 스키마에 실제로 있는 것만 고르므로 **구버전 DB 백업도 그대로 돈다.**
+        present = {row[1] for row in target_conn.execute("PRAGMA table_info(jobs)")}
+        ciphers = sorted(CIPHER_COLUMNS & present)
+        if ciphers:
+            assignments = ", ".join(f"{c} = NULL" for c in ciphers)
+            condition = " OR ".join(f"{c} IS NOT NULL" for c in ciphers)
+            counts["prompt_cipher_removed"] = target_conn.execute(
+                f"UPDATE jobs SET {assignments} WHERE {condition}"
+            ).rowcount
+        else:
+            counts["prompt_cipher_removed"] = 0
         target_conn.commit()
         target_conn.execute("VACUUM")
         target_conn.commit()

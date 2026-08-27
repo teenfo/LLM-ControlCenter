@@ -174,7 +174,7 @@ def harness(config, store, clock, vault):
     )
     scheduler = Scheduler(
         config, store, cluster, accountant=accountant, registrar=registrar,
-        now=clock, notifier=notifier,
+        now=clock, notifier=notifier, guard=guard, vault=vault,
     )
 
     app = build_app(

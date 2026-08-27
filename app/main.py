@@ -57,7 +57,14 @@ from .config import (
     validate_role_fields,
 )
 from .cost import CostAccountant
-from .crypto import CryptoError, KeyDestroyed, KeyVault, Sealed
+from .crypto import (
+    CryptoError,
+    KeyDestroyed,
+    KeyVault,
+    Sealed,
+    prompt_aad,
+    response_aad,
+)
 from .evals import Evaluator
 from .guard import Guard
 from .i18n import ApiError, Translator, guard_pack_for, negotiate_locale
@@ -71,7 +78,6 @@ from .pipeline import (
     Pipeline,
     Submission,
     is_public_role,
-    prompt_aad,
 )
 from .scheduler import Scheduler
 from .store import PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
@@ -1172,44 +1178,66 @@ async def tenant_job_review(request: Request) -> Response:
 
 
 async def tenant_job_raw(request: Request) -> Response:
-    """원문 단건 복호화.
+    """원문 단건 복호화 — 프롬프트와 **응답**.
 
     **열람 자체가 감사에 남는다.** 원문을 볼 수 있는 경로가 있다는 것과 아무도 모르게
     볼 수 있다는 것은 전혀 다른 이야기다.
+
+    둘을 한 엔드포인트에 둔 이유: 권한과 감사 사건이 같고, 프롬프트만 보고 응답을
+    못 보면 디버깅이 성립하지 않는다. 대신 **무엇을 열었는지 감사에 적는다** —
+    "원문을 봤다" 만 남으면 어느 필드였는지 나중에 아무도 모른다.
     """
     ctx, principal, scope = _tenant_admin(request)
     job_id = request.path_params["job_id"]
     job = ctx.store.get_job(scope, job_id)
     if job is None:
         raise ApiError("job_not_found", status=404)
-    if not job.prompt_cipher or not job.prompt_nonce or not ctx.vault.enabled:
-        raise ApiError("raw_prompt_unavailable", status=404)
 
     tenant = request.state.tenant
-    try:
-        plaintext = ctx.vault.open(
-            tenant["dek_wrapped"],
-            Sealed(nonce=job.prompt_nonce, ciphertext=job.prompt_cipher),
-            aad=prompt_aad(scope.tenant_id, job_id),
-        )
-    except KeyDestroyed:
-        # DEK 가 폐기됐다 — crypto-shredding 이후에는 백업의 암호문도 못 연다.
-        raise ApiError("raw_prompt_unavailable", status=404)
-    except CryptoError:
-        # 이 행의 암호문이 아니거나 손상됐다. 암호문은 `job_id` 에 묶여 있으므로
-        # **다른 잡의 암호문을 이 행에 심어도 여기서 걸린다.** 500 으로 흘리면
-        # 소비자는 서버 고장으로 읽고, 관리자는 그것이 이식 시도인지 모른다.
-        ctx.store.audit(
-            principal.token_id, "raw_prompt_undecryptable", tenant_id=scope.tenant_id,
-            target=job_id, outcome="error",
-        )
+    opened: dict[str, str] = {}
+    destroyed = False
+
+    for field, cipher, nonce, aad in (
+        ("prompt", job.prompt_cipher, job.prompt_nonce,
+         prompt_aad(scope.tenant_id, job_id)),
+        ("response", job.response_cipher, job.response_nonce,
+         response_aad(scope.tenant_id, job_id)),
+    ):
+        if not cipher or not nonce or not ctx.vault.enabled:
+            continue
+        try:
+            opened[field] = ctx.vault.open(
+                tenant["dek_wrapped"], Sealed(nonce=nonce, ciphertext=cipher), aad=aad
+            )
+        except KeyDestroyed:
+            # DEK 가 폐기됐다 — crypto-shredding 이후에는 백업의 암호문도 못 연다.
+            destroyed = True
+        except CryptoError:
+            # 이 행의 암호문이 아니거나 손상됐다. 암호문은 `job_id` 와 **필드**에
+            # 묶여 있으므로 다른 잡의 것도, 같은 잡의 다른 필드의 것도 여기서
+            # 걸린다. 500 으로 흘리면 소비자는 서버 고장으로 읽고, 관리자는 그것이
+            # 이식 시도인지 모른다.
+            ctx.store.audit(
+                principal.token_id, "raw_prompt_undecryptable",
+                tenant_id=scope.tenant_id, target=job_id, outcome="error",
+                detail={"field": field},
+            )
+
+    if not opened:
+        # 한 필드도 못 열었다. 폐기든 부재든 소비자에게는 같은 404 다 —
+        # 어느 쪽인지 알려 주면 그것도 정보다.
+        _ = destroyed
         raise ApiError("raw_prompt_unavailable", status=404)
 
     ctx.store.audit(
         principal.token_id, "read_raw_prompt", tenant_id=scope.tenant_id, target=job_id,
-        detail={"role": job.role, "service_id": job.service_id},
+        detail={
+            "role": job.role, "service_id": job.service_id,
+            # **무엇을 열었는지.** 프롬프트와 응답은 다른 사건이다.
+            "fields": sorted(opened),
+        },
     )
-    return _ok(request, {"job_id": job_id, "prompt": plaintext})
+    return _ok(request, {"job_id": job_id, **opened})
 
 
 async def tenant_usage(request: Request) -> Response:

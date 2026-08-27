@@ -35,6 +35,8 @@ import ssl
 import threading
 import time
 from concurrent import futures
+
+from .store import CIPHER_COLUMNS
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -92,6 +94,10 @@ REDACTED_KEYS = frozenset(
         "api_key", "password", "secret", "key", "dek", "kek",
         "end_user", "value", "match", "matched",
     }
+    # 암호문도 나가면 안 된다. 지금 못 여는 바이트라도 웹훅 수신처에 쌓여 있으면
+    # 훗날 KEK 가 새는 순간 그 이력이 통째로 열린다 — 암호화는 유출을 **미루는**
+    # 것이지 없애는 것이 아니다. 목록은 `CIPHER_COLUMNS` 에서 온다.
+    | CIPHER_COLUMNS
 )
 
 #: 이 이벤트들만 보낸다. 목록에 없는 이벤트는 조용히 버린다 — 새 알림을 추가할 때

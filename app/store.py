@@ -203,7 +203,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     prompt_hash       TEXT,
     system_hash       TEXT,
 
+    -- 응답: 프롬프트와 **같은 모양**이다. 마스킹본은 평문, 원문은 암호문.
+    --
+    -- 입력만 거르고 출력을 안 거르면 제품의 한 문장("나가는 프롬프트에서 개인정보를
+    -- 걸러낸다")이 절반만 참이다. 요약·추출 작업의 산출물 자체가 개인정보이거나,
+    -- 모델이 마스킹되지 않은 문맥을 재구성하는 경로가 실재한다.
     response          TEXT,
+    response_cipher   BLOB,
+    response_nonce    BLOB,
     error             TEXT,
     error_code        TEXT,
 
@@ -439,7 +446,26 @@ CREATE INDEX IF NOT EXISTS idx_rate_bucket ON rate_counters(bucket);
 #: SQLite 의 ADD COLUMN 은 메타데이터 연산이라 WAL 라이브 DB 에서 안전하다.
 _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # (테이블, 컬럼, 타입+기본값)  — 예: ("jobs", "foo", "TEXT")
+    #
+    # 출력 축. 기존 DB 에는 응답이 평문 그대로 들어 있고, 그것을 소급해 마스킹하지
+    # 않는다 — 마스킹은 원문을 지우는 연산이라 되돌릴 수 없고, 봉인할 원문도 이미
+    # 없다. 새 응답부터 적용되고 옛 응답은 잡 보존 기간이 지나면 사라진다.
+    ("jobs", "response_cipher", "BLOB"),
+    ("jobs", "response_nonce", "BLOB"),
 )
+
+#: 원문을 담은 컬럼. **내보내기와 백업에서 함께 빠진다.**
+#:
+#: 손으로 두 곳에 적으면 새 암호문 컬럼을 추가할 때 한쪽을 빠뜨린다 — 그리고
+#: 빠뜨린 쪽이 원문을 파일로 내보내는 쪽이면, 보관 기간과 접근 감사가 그 파일
+#: 밖에서 통째로 무력화된다. 실제로 출력 축을 넣으면서 두 컬럼이 늘었다.
+CIPHER_COLUMNS: frozenset[str] = frozenset(
+    {"prompt_cipher", "prompt_nonce", "response_cipher", "response_nonce"}
+)
+
+#: "원문이 아직 남아 있는 행" 조건. 보존 정리가 프롬프트만 보고 있으면 응답 원문이
+#: 보관 기간을 넘겨 살아남는다 — 지워진 줄 알았던 원문이 남는 것이 가장 나쁜 실패다.
+_HAS_CIPHER = "(prompt_cipher IS NOT NULL OR response_cipher IS NOT NULL)"
 
 
 # ── 값 객체 ─────────────────────────────────────────────────────────────────
@@ -468,6 +494,8 @@ class JobRow:
     prompt_hash: str | None = None
     system_hash: str | None = None
     response: str | None = None
+    response_cipher: bytes | None = None
+    response_nonce: bytes | None = None
     error: str | None = None
     error_code: str | None = None
     placement: tuple[str, ...] = ()
@@ -1219,8 +1247,9 @@ class SqliteStore:
     def export_tenant(self, scope: TenantScope) -> dict[str, Any]:
         """내보내기 — **마스킹본 기준.**
 
-        `prompt_cipher` · `prompt_nonce` 는 담지 않는다. 내보내기 파일이 원문을 나르면
-        보관 기간과 접근 감사가 그 파일 밖에서 모두 무력화된다.
+        `CIPHER_COLUMNS` 는 담지 않는다 — 프롬프트 원문도 응답 원문도. 내보내기
+        파일이 원문을 나르면 보관 기간과 접근 감사가 그 파일 밖에서 모두 무력화된다.
+        제외 목록을 여기 손으로 적지 않는 이유는 백업도 같은 목록을 쓰기 때문이다.
         """
         # **상한을 둔다.** 잡 수십만 건인 테넌트를 내보내면 전량이 메모리에 올라오고
         # JSON 직렬화가 그것을 한 번 더 복제한다 — 컨트롤 플레인 512MB 프로파일에서
@@ -1233,7 +1262,7 @@ class SqliteStore:
             {
                 k: row[k]
                 for k in row.keys()
-                if k not in ("prompt_cipher", "prompt_nonce")
+                if k not in CIPHER_COLUMNS
             }
             for row in self._conn.execute(
                 f"SELECT * FROM jobs WHERE {where} ORDER BY created_at DESC LIMIT ?",
@@ -2047,16 +2076,18 @@ class SqliteStore:
                 for chunk in _chunks(tenant_ids, SQL_VARIABLE_LIMIT):
                     placeholders = ",".join("?" * len(chunk))
                     cipher += self._conn.execute(
-                        "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
-                        f"WHERE prompt_cipher IS NOT NULL AND tenant_id IN ({placeholders}) "
+                        "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL, "
+                        "response_cipher = NULL, response_nonce = NULL "
+                        f"WHERE {_HAS_CIPHER} AND tenant_id IN ({placeholders}) "
                         "AND created_at < ?",
                         (*chunk, now - days * 86400),
                     ).rowcount
 
             # 테넌트 행이 이미 지워진 고아 암호문은 플랫폼 상한으로 정리한다.
             cipher += self._conn.execute(
-                "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL "
-                "WHERE prompt_cipher IS NOT NULL AND created_at < ? "
+                "UPDATE jobs SET prompt_cipher = NULL, prompt_nonce = NULL, "
+                "response_cipher = NULL, response_nonce = NULL "
+                f"WHERE {_HAS_CIPHER} AND created_at < ? "
                 "AND tenant_id NOT IN (SELECT id FROM tenants)",
                 (now - raw_prompt_retention_days * 86400,),
             ).rowcount
@@ -2211,7 +2242,8 @@ _JOB_DIRECT_FIELDS = frozenset(
     {
         "status", "priority", "prompt_masked", "prompt_cipher", "prompt_nonce",
         "system_masked", "prompt_external", "system_external",
-        "prompt_hash", "system_hash", "response", "error", "error_code",
+        "prompt_hash", "system_hash",
+        "response", "response_cipher", "response_nonce", "error", "error_code",
         "timeout_s", "max_prompt_chars", "node", "model", "tier", "last_failed_node",
         "attempts", "wait_reason", "wait_since", "cost_reserved_usd", "cost_usd",
         "input_tokens", "output_tokens", "started_at", "finished_at", "lane", "end_user_hash",
@@ -2264,6 +2296,8 @@ def _row_to_job(row: sqlite3.Row) -> JobRow:
         prompt_hash=get("prompt_hash"),
         system_hash=get("system_hash"),
         response=get("response"),
+        response_cipher=get("response_cipher"),
+        response_nonce=get("response_nonce"),
         error=get("error"),
         error_code=get("error_code"),
         placement=tuple(loads("placement_json", [])),

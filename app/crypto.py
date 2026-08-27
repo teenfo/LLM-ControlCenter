@@ -40,6 +40,28 @@ def _aad_bytes(aad: str | None) -> bytes | None:
     return aad.encode("utf-8") if aad else None
 
 
+def prompt_aad(tenant_id: str, job_id: str) -> str:
+    """프롬프트 원문을 묶을 레코드 식별자. **봉인과 해제가 같은 값을 써야 한다.**
+
+    한 곳에서 만든다 — 두 곳에서 조립하면 한쪽이 바뀌는 순간 그 테넌트의 원문이
+    통째로 안 열린다. AAD 를 쓰는 모듈이 늘어날수록(파이프라인은 봉인, 라우터는
+    해제, 스케줄러는 응답 봉인) 그 위험이 커지므로 `seal`/`open` 옆에 둔다.
+    """
+    return f"job:{tenant_id}:{job_id}"
+
+
+def response_aad(tenant_id: str, job_id: str) -> str:
+    """응답 원문을 묶을 레코드 식별자. **프롬프트와 달라야 한다.**
+
+    같은 값으로 묶으면 응답 암호문을 프롬프트 컬럼에 옮겨 심어도 열린다 —
+    관리자가 원문 열람을 눌렀을 때 감사에는 "프롬프트를 봤다" 고 남고 화면에는
+    응답이 뜬다. 감사와 실제가 어긋나는 것이 열람 경로에서 가장 나쁜 실패다.
+
+    같은 잡 안에서도 필드가 갈린다는 뜻이고, 그것이 AAD 를 쓰는 이유 그 자체다.
+    """
+    return f"resp:{tenant_id}:{job_id}"
+
+
 class KeyDestroyed(CryptoError):
     """DEK 가 폐기됐다. 이 테넌트의 암호문은 영구히 열 수 없다 — 의도된 동작이다."""
 

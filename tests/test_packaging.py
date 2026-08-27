@@ -1074,7 +1074,10 @@ def test_the_ciphertext_is_gone_even_when_verification_fails(tmp_path, vault_wit
     from app import backup as backup_module
 
     body = inspect.getsource(backup_module.snapshot)
-    strip = body.index("prompt_cipher = NULL")
+    # 지울 컬럼 목록이 `CIPHER_COLUMNS` 한 곳에서 오므로 SQL 문자열을 앵커로 쓰지
+    # 않는다 — 출력 축을 넣으면서 SET 절이 생성식으로 바뀌자 옛 앵커가 사라졌다.
+    # 이 이름은 제거를 어떻게 쓰든 남는다.
+    strip = body.index("CIPHER_COLUMNS")
     verify = body.index("백업의 테넌트가 원본보다")
     assert strip < verify, "암호문 제거가 검증보다 뒤에 있다"
 

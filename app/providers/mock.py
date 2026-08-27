@@ -67,6 +67,13 @@ class MockProvider:
         self.online = "offline" not in tuple(getattr(node, "tags", ()) or ())
         self.fail_next = 0            # 다음 N회 호출을 실패시킨다
         self.fail_retryable = True
+        #: 이 텍스트로 답한다. `None` 이면 결정론적 기본 응답.
+        #:
+        #: **출력 축을 시연·검증하려면 모델이 개인정보를 뱉을 수 있어야 한다.**
+        #: 기본 응답은 해시라 PII 가 절대 안 나오고, 그러면 응답 마스킹이 도는지
+        #: 데모에서도 테스트에서도 확인할 방법이 없다 — 켜지지 않은 필터와
+        #: 확인할 수 없는 필터는 실무에서 같은 것이다.
+        self.reply: str | None = None
         self.installed: set[str] = set(self._models)
         #: 데모·테스트용 호출 기록. **Demo 프로파일은 상시 구동 대상이라**
         #: 상한이 없으면 며칠 켜 둔 시연 노트북에서 그냥 메모리 누수다.
@@ -118,7 +125,8 @@ class MockProvider:
         output_tokens = max(1, len(digest) // 2)
 
         return GenerationResult(
-            text=f"[mock:{self.node_name}/{model}] {digest}",
+            text=self.reply if self.reply is not None
+            else f"[mock:{self.node_name}/{model}] {digest}",
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
