@@ -221,6 +221,8 @@ LCC_AIRGAP=1 docker compose up -d
 | [docs/capacity.md](docs/capacity.md) | 규모 산정 · 증설 트리거 |
 | [docs/deployment.md](docs/deployment.md) | 배포 프로파일 · 업그레이드 |
 | [docs/reference/llm-platform-overview.md](docs/reference/llm-platform-overview.md) | 설계의 출발점이 된 레퍼런스 시스템 |
+| [docs/audit.md](docs/audit.md) | 구현 감사 (2026-08) — 결함 목록과 수정 우선순위 |
+| [docs/design-audit.md](docs/design-audit.md) | 설계 감사 (2026-08) — 설계 결함 · 상용 대비 격차 · 오케스트레이션 타당성 |
 
 ---
 
