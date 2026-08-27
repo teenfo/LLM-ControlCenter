@@ -181,3 +181,32 @@ def test_the_doc_does_not_name_modules_that_no_longer_exist():
 
     ghosts = sorted(n for n in named if not (APP / f"{n}.py").exists())
     assert not ghosts, f"문서에만 있고 코드에 없는 모듈: {ghosts}"
+
+
+def test_the_plan_is_marked_as_history_not_as_the_current_spec():
+    """계획서는 **착수 시점의 기록**이지 현재 동작의 설명서가 아니다.
+
+    계획서를 조용히 고쳐 놓으면 왜 달라졌는지가 사라진다 — 그래서 본문은 그대로
+    두고 머리말에 차이를 모은다. 그 머리말이 사라지면 이 문서는 코드와 어긋나는
+    또 하나의 손으로 관리하는 표가 되므로, 있는지 확인한다.
+    """
+    plan = (APP.parent / "docs" / "plan.md").read_text(encoding="utf-8")
+    assert "착수 시점의 계획서다" in plan
+    assert "구현하면서 계획과 달라진 것" in plan
+    assert "계획했으나 하지 않은 것" in plan
+    # 현재 동작의 권위가 어디인지 가리킨다.
+    assert "architecture.md" in plan
+
+
+def test_the_plan_body_is_the_original():
+    """차이는 머리말에만 적고 본문은 손대지 않는다 — 본문이 곧 기록이다."""
+    plan = (APP.parent / "docs" / "plan.md").read_text(encoding="utf-8")
+    header, _, body = plan.partition("\n\n# LLM-ControlCenter")
+
+    # 머리말은 전부 인용 블록이다. 인용을 벗어난 줄이 있으면 본문을 고친 것이다.
+    stray = [
+        line for line in header.splitlines()
+        if line.strip() and not line.startswith(">")
+    ]
+    assert not stray, f"머리말이 인용 블록을 벗어났다: {stray[:3]}"
+    assert body, "계획서 본문이 없다"

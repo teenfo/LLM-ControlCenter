@@ -586,3 +586,13 @@ def test_doctor_bundle_masks_secrets(tmp_path):
     text = bundle.read_text(encoding="utf-8")
     assert "SECRET123" not in text
     assert "LCC_NOTIFY_WEBHOOK" in json.loads(text)["environment"]
+
+
+def test_the_readme_describes_the_grace_mode_that_was_actually_built():
+    """README 가 `audit` 라고 적고 코드는 `full` 이면 둘 중 하나는 거짓말이다."""
+    from app.guard import GRACE_FALLBACK
+
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"`{GRACE_FALLBACK}`" in text
+    # 왜 audit 이 아닌지도 적혀 있어야 한다 — 결정만 적고 근거를 빼면 다음 사람이 되돌린다.
+    assert "마스킹 없이" in text
