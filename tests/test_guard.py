@@ -30,7 +30,9 @@ from app.crypto import (
 )
 from app.guard import (
     CHECKSUMS,
+    Detection,
     Guard,
+    _apply,
     iban_mod97,
     jp_mynumber,
     kr_biz,
@@ -179,8 +181,13 @@ async def test_multiple_matches_are_all_masked():
     assert result.detections[0].match_count == 2
 
 
-async def test_overlapping_offsets_do_not_corrupt_the_text():
-    """뒤에서 앞으로 치환하지 않으면 오프셋이 밀려 다음 스팬이 어긋난다."""
+async def test_sequential_matches_do_not_corrupt_the_text():
+    """뒤에서 앞으로 치환하지 않으면 오프셋이 밀려 다음 스팬이 어긋난다.
+
+    **이건 겹치지 않는 매치다.** 진짜 겹침은 아래 `_coalesce` 테스트들이 본다 —
+    예전 이름이 `overlapping` 이었는데 실제로는 이 경우만 검증하고 있었고,
+    그래서 겹침 결함이 753개 테스트를 전부 통과한 채 살아 있었다.
+    """
     guard = Guard(make_config((RRN_RULE, PHONE_RULE)))
     result = await guard.inspect(
         "번호 900101-1234568 이고 폰은 010-1234-5678 이다", locales=["ko_KR"]
@@ -544,3 +551,140 @@ async def test_both_fields_are_masked_independently():
     assert "900101" not in result.system_for(INTERNAL)
     detection = result.detections[0]
     assert len(detection.spans) == 1 and len(detection.system_spans) == 1
+
+
+# ── 겹치는 탐지 (H1) ─────────────────────────────────────────────────────────
+#
+# 역순 치환이 오프셋을 지킨다는 것은 **스팬이 안 겹칠 때만** 참이다.
+# 겹치면 안쪽을 먼저 치환한 뒤 바깥 스팬이 이미 바뀐 텍스트를 가리킨다.
+
+
+def _det(rule_id, action, spans, label, keep_tail=0):
+    return Detection(
+        rule_id=rule_id, stage="pattern", actions={INTERNAL: action, EXTERNAL: action},
+        spans=tuple(spans), label=label, keep_tail=keep_tail,
+    )
+
+
+def test_overlapping_spans_do_not_leak_the_covered_text():
+    """겹친 두 규칙 중 하나가 감춘 구간이 다른 쪽 치환으로 되살아나면 안 된다."""
+    text = "AAAA 1234-5678-9012-3456 BBBB"
+    out = _apply(
+        text,
+        (_det("card", "full", [(5, 24)], "[CARD]"),
+         _det("inner", "full", [(10, 19)], "[INNER]")),
+        INTERNAL,
+    )
+    assert out == "AAAA [CARD] BBBB"
+    assert "3456" not in out
+    assert "1234" not in out
+
+
+def test_the_stronger_grade_wins_on_the_same_span():
+    """**같은 스팬에 full 과 partial 이 걸리면 full 이 이겨야 한다.**
+
+    역순 치환에서는 full 이 통째로 사라지고 partial 이 남긴 뒷자리가 노출됐다 —
+    카드 뒷 4자리가 실제로 그렇게 살아남았다. 약한 쪽을 고르면 규칙을 켠 의미가 없다.
+    """
+    text = "AAAA 1234-5678-9012-3456 BBBB"
+    out = _apply(
+        text,
+        (_det("weak", "partial", [(5, 24)], "[P]", keep_tail=4),
+         _det("strong", "full", [(5, 24)], "[FULL]")),
+        INTERNAL,
+    )
+    assert out == "AAAA [FULL] BBBB"
+    assert "3456" not in out
+
+
+def test_partial_keep_tail_does_not_survive_a_stronger_overlap():
+    """full 이 이겼는데 partial 의 keep_tail 이 남으면 뒷자리가 샌다."""
+    out = _apply(
+        "카드 4111111111111111 끝",
+        (_det("a", "partial", [(3, 19)], "[P]", keep_tail=6),
+         _det("b", "full", [(3, 19)], "[F]")),
+        INTERNAL,
+    )
+    assert out == "카드 [F] 끝"
+
+
+def test_partial_still_keeps_its_tail_when_nothing_overlaps():
+    """겹침 처리가 정상 partial 동작을 망가뜨리지 않는다."""
+    out = _apply("폰 010-1234-5678 끝", (_det("p", "partial", [(2, 15)], "[P]", 4),), INTERNAL)
+    assert out == "폰 [P]5678 끝"
+
+
+def test_adjacent_but_not_overlapping_spans_are_kept_separate():
+    """맞닿기만 한 스팬은 합치지 않는다 — 합치면 라벨 하나로 뭉개진다."""
+    out = _apply("AAABBB", (_det("a", "full", [(0, 3)], "[A]"),
+                            _det("b", "full", [(3, 6)], "[B]")), INTERNAL)
+    assert out == "[A][B]"
+
+
+def test_three_way_overlap_collapses_to_one_replacement():
+    out = _apply(
+        "0123456789",
+        (_det("a", "full", [(1, 5)], "[A]"),
+         _det("b", "full", [(3, 8)], "[B]"),
+         _det("c", "full", [(6, 9)], "[C]")),
+        INTERNAL,
+    )
+    assert out.count("[") == 1
+    assert out == "0[A]9"
+
+
+async def test_two_real_rules_overlapping_in_one_prompt():
+    """합성 스팬이 아니라 실제 규칙 두 개가 겹치는 경우."""
+    wide = GuardRule(id="wide", kind="pattern", action="full",
+                     pattern=r"고객 \d{6}-\d{7} 님", label="[고객]")
+    guard = Guard(make_config((RRN_RULE, wide)))
+    result = await guard.inspect("고객 900101-1234568 님 안녕", locales=["ko_KR"])
+
+    assert "900101" not in result.storable_prompt
+    assert "1234568" not in result.storable_prompt
+
+
+# ── 정규식 캐시 (H2) ─────────────────────────────────────────────────────────
+
+
+async def test_editing_a_rule_pattern_takes_effect_immediately():
+    """**관리자가 고쳤다고 믿는 규칙이 옛 규칙으로 돌면 안 된다.**
+
+    캐시 키가 rule.id 이던 시절에는 재기동 전까지 옛 패턴이 적용됐다.
+    """
+    guard = Guard(make_config(()))
+    before = GuardRule(id="mine", kind="pattern", action="full",
+                       pattern=r"AAA\d+", label="[A]")
+    after = GuardRule(id="mine", kind="pattern", action="full",
+                      pattern=r"BBB\d+", label="[B]")
+
+    first = await guard.inspect("AAA123 BBB456", tenant_rules=(before,))
+    assert first.storable_prompt == "[A] BBB456"
+
+    second = await guard.inspect("AAA123 BBB456", tenant_rules=(after,))
+    assert second.storable_prompt == "AAA123 [B]", "패턴 수정이 반영되지 않았다"
+
+
+async def test_two_tenants_can_use_the_same_rule_id_with_different_patterns():
+    """같은 id 를 다른 패턴으로 쓰는 두 테넌트가 서로 간섭하면 안 된다."""
+    guard = Guard(make_config(()))
+    acme = GuardRule(id="secret", kind="pattern", action="full",
+                     pattern=r"ACME-\d+", label="[ACME]")
+    globex = GuardRule(id="secret", kind="pattern", action="full",
+                       pattern=r"GLBX-\d+", label="[GLBX]")
+
+    a = await guard.inspect("ACME-1 GLBX-2", tenant_rules=(acme,))
+    b = await guard.inspect("ACME-1 GLBX-2", tenant_rules=(globex,))
+
+    assert a.storable_prompt == "[ACME] GLBX-2"
+    assert b.storable_prompt == "ACME-1 [GLBX]", "다른 테넌트의 패턴이 적용됐다"
+
+
+def test_the_compile_cache_is_bounded():
+    """상한 없는 캐시는 멀티테넌트에서 그대로 메모리 누수다."""
+    from app.guard import MAX_COMPILED_PATTERNS
+
+    guard = Guard(make_config(()))
+    for n in range(MAX_COMPILED_PATTERNS + 20):
+        guard._compile(rf"unique-pattern-{n}-\d+")
+    assert len(guard._compiled) <= MAX_COMPILED_PATTERNS

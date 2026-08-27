@@ -33,6 +33,10 @@ from .i18n import ApiError
 #: 등급 강도. 테넌트는 이 순서에서 **올릴 수만** 있다.
 ACTION_STRENGTH = {"off": 0, "audit": 1, "partial": 2, "full": 3, "block": 4}
 
+#: 컴파일 캐시 상한. 넘으면 통째로 비운다 — LRU 를 만들 만큼 값비싼 연산이 아니고,
+#: 상한 없는 캐시는 멀티테넌트에서 그대로 메모리 누수다.
+MAX_COMPILED_PATTERNS = 512
+
 STAGE_PATTERN = "pattern"
 STAGE_LLM = "llm"
 
@@ -203,11 +207,29 @@ class Guard:
         # 도입 첫날 프로덕션이 서고, 그러면 설치처는 규칙을 통째로 꺼버린다.
         # **켜져 있다는 사실을 화면과 API 가 계속 알려야 한다**(조용한 유예가 더 나쁘다).
         self._grace_mode = grace_mode
-        self._compiled: dict[str, re.Pattern[str]] = {
-            rule.id: re.compile(rule.pattern)
-            for rule in config.guard_rules
-            if rule.kind == "pattern" and rule.pattern
-        }
+        # **캐시 키는 패턴 문자열이지 규칙 id 가 아니다.**
+        #
+        # id 로 캐싱하면 두 가지가 조용히 깨진다. ① 테넌트가 패턴을 고쳐도 재기동
+        # 전까지 옛 패턴이 돈다 — 관리자는 고쳤다고 믿는데 아니다. ② 테넌트 A 와 B
+        # 가 같은 id 를 다른 패턴으로 등록하면 먼저 컴파일된 쪽이 둘 다에 적용된다.
+        # 둘 다 "필터가 켜져 있는데 안 잡는" 상태이고, 그건 안 켜진 필터와 같다.
+        self._compiled: dict[str, re.Pattern[str]] = {}
+        for rule in config.guard_rules:
+            if rule.kind == "pattern" and rule.pattern:
+                self._compile(rule.pattern)
+
+    def _compile(self, pattern: str) -> re.Pattern[str]:
+        """패턴을 컴파일해 캐시한다. **키가 패턴이라 수정이 즉시 반영된다.**
+
+        캐시가 무한히 자라지 않도록 상한을 둔다. 테넌트마다 규칙을 몇 개씩 넣는
+        멀티테넌트에서는 상한 없는 캐시가 그대로 메모리 누수다.
+        """
+        compiled = self._compiled.get(pattern)
+        if compiled is None:
+            if len(self._compiled) >= MAX_COMPILED_PATTERNS:
+                self._compiled.clear()
+            compiled = self._compiled[pattern] = re.compile(pattern)
+        return compiled
 
     @property
     def grace_mode(self) -> bool:
@@ -257,8 +279,8 @@ class Guard:
             merged[rule.id] = _stronger_of(baseline, rule)
 
         for rule in merged.values():
-            if rule.kind == "pattern" and rule.id not in self._compiled and rule.pattern:
-                self._compiled[rule.id] = re.compile(rule.pattern)
+            if rule.kind == "pattern" and rule.pattern:
+                self._compile(rule.pattern)
 
         rules = tuple(merged.values())
         return tuple(_downgraded(r) for r in rules) if self._grace_mode else rules
@@ -407,9 +429,9 @@ class Guard:
         detections: list[Detection] = []
 
         for rule in rules:
-            compiled = self._compiled.get(rule.id)
-            if compiled is None:
+            if rule.kind != "pattern" or not rule.pattern:
                 continue
+            compiled = self._compile(rule.pattern)
 
             spans = self._match_spans(compiled, rule, prompt)
             system_spans = self._match_spans(compiled, rule, system or "")
@@ -438,10 +460,7 @@ class Guard:
         """
         if rule.kind != "pattern" or not rule.pattern:
             return 0
-        compiled = self._compiled.get(rule.id)
-        if compiled is None:
-            compiled = self._compiled[rule.id] = re.compile(rule.pattern)
-        return len(self._match_spans(compiled, rule, text))
+        return len(self._match_spans(self._compile(rule.pattern), rule, text))
 
     @staticmethod
     def _match_spans(
@@ -484,23 +503,60 @@ def _apply(
     if not text:
         return text or ""
 
-    replacements: list[tuple[int, int, str]] = []
+    # (시작, 끝, 등급, 라벨, keep_tail) — 겹침을 풀기 전이라 아직 치환하지 않는다.
+    hits: list[tuple[int, int, str, str, int]] = []
     for detection in detections:
         action = detection.actions.get(boundary, "audit")
         if action in ("off", "audit", "block"):
             # audit 은 통과시키되 기록만 한다. block 은 애초에 전송되지 않는다.
             continue
         for start, end in getattr(detection, field):
-            original = text[start:end]
-            if action == "partial" and detection.keep_tail:
-                masked = f"{detection.label}{original[-detection.keep_tail:]}"
-            else:
-                masked = detection.label
-            replacements.append((start, end, masked))
+            hits.append(
+                (start, end, action, detection.label, detection.keep_tail)
+            )
 
-    for start, end, masked in sorted(replacements, key=lambda r: r[0], reverse=True):
+    for start, end, action, label, keep_tail in reversed(_coalesce(hits)):
+        original = text[start:end]
+        if action == "partial" and keep_tail:
+            masked = f"{label}{original[-keep_tail:]}"
+        else:
+            masked = label
         text = text[:start] + masked + text[end:]
     return text
+
+
+def _coalesce(
+    hits: Sequence[tuple[int, int, str, str, int]],
+) -> list[tuple[int, int, str, str, int]]:
+    """겹치는 탐지를 하나로 합친다. **합치지 않으면 마스킹이 깨진다.**
+
+    치환을 역순으로 하면 오프셋이 안 밀린다는 것은 스팬이 서로 안 겹칠 때만
+    참이다. 겹치면 안쪽을 먼저 치환한 뒤 바깥 스팬이 **이미 바뀐 텍스트**를
+    가리켜, 엉뚱한 구간이 잘리거나 개인정보 일부가 그대로 남는다.
+
+    같은 구간에 `full` 과 `partial` 이 함께 걸리는 경우가 특히 나쁘다 —
+    역순 치환에서 `full` 이 통째로 사라지고 `partial` 이 남긴 뒷자리가 노출된다.
+    실제로 카드번호 뒷 4자리가 그렇게 살아남았다.
+
+    합칠 때는 **더 강한 등급을 채택한다.** 겹친 두 규칙 중 하나가 전체 치환을
+    요구했다면 그 요구가 이겨야 한다 — 약한 쪽을 고르면 규칙을 켠 의미가 없다.
+    """
+    if not hits:
+        return []
+
+    merged: list[list] = []
+    for start, end, action, label, keep_tail in sorted(hits):
+        if merged and start < merged[-1][1]:
+            group = merged[-1]
+            group[1] = max(group[1], end)
+            if ACTION_STRENGTH.get(action, 0) > ACTION_STRENGTH.get(group[2], 0):
+                # 더 강한 등급이 이긴다. 라벨과 keep_tail 도 그 등급을 따라간다 —
+                # `full` 이 이겼는데 `partial` 의 keep_tail 이 남으면 뒷자리가 샌다.
+                group[2], group[3], group[4] = action, label, keep_tail
+        else:
+            merged.append([start, end, action, label, keep_tail])
+
+    return [tuple(group) for group in merged]
 
 
 #: 유예 모드에서 `block` 이 내려앉는 등급. **`audit` 이 아니라 `full` 이다.**
