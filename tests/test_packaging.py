@@ -880,3 +880,85 @@ def test_preflight_creates_the_key_directory_before_docker_does():
     text = (ROOT / "preflight.sh").read_text(encoding="utf-8")
     assert "10001" in text
     assert "chown" in text
+
+
+# ── 감사 H11 — 번들이 정확히 필요할 때 안 만들어졌다 ─────────────────────────
+#
+# `doctor` 는 고장을 찾으면 0 이 아닌 코드로 끝난다. `set -eu` 아래에서 그것을
+# 그냥 부르면 스크립트가 거기서 죽고 **아래 번들 복사에 도달하지 못한다.**
+# 지원 요청용 산출물인데, 지원이 필요한 상황에서만 안 만들어지는 구조였다.
+
+
+def _run_doctor_sh(tmp_path: Path, *args: str, exit_code: int = 1):
+    """`docker compose` 를 가짜로 세우고 doctor.sh 를 그대로 돌린다.
+
+    쉘의 제어 흐름을 검사하는 유일한 정직한 방법이다 — grep 은 `set -e` 가
+    어디서 끊기는지 알려주지 못한다.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    marker = tmp_path / "copied"
+    marker.unlink(missing_ok=True)
+
+    (bin_dir / "docker").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        # `docker compose ps` — 컨테이너가 돌고 있는 척한다.
+        '  *"ps "*|*ps) echo controlcenter; exit 0 ;;\n'
+        # `docker compose exec ... doctor` — 고장을 찾은 척한다.
+        f'  *doctor*) echo "진단 출력"; exit {exit_code} ;;\n'
+        f'  *cp*) echo copied > "{marker}"; exit 0 ;;\n'
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    os.chmod(bin_dir / "docker", 0o755)
+
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    proc = subprocess.run(
+        ["sh", str(ROOT / "doctor.sh"), *args],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60, env=env,
+    )
+    return proc, marker
+
+
+def test_the_bundle_is_produced_even_when_doctor_finds_a_problem(tmp_path):
+    """**지원 요청용 번들이 지원이 필요할 때만 안 만들어졌다.**"""
+    proc, marker = _run_doctor_sh(tmp_path, "--bundle", exit_code=1)
+
+    assert marker.exists(), f"번들 복사에 도달하지 못했다\n{proc.stdout}\n{proc.stderr}"
+
+
+def test_the_doctor_exit_code_survives_the_bundle_copy(tmp_path):
+    """번들을 만들었다고 고장이 사라지는 것은 아니다 — 종료 코드는 그대로여야 한다."""
+    proc, _ = _run_doctor_sh(tmp_path, "--bundle", exit_code=1)
+    assert proc.returncode == 1
+
+    healthy, _ = _run_doctor_sh(tmp_path, "--bundle", exit_code=0)
+    assert healthy.returncode == 0
+
+
+def test_a_failed_bundle_copy_is_reported(tmp_path):
+    """조용히 넘어가면 사용자는 번들이 있다고 믿고 지원 요청을 보낸다."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *"ps "*|*ps) echo controlcenter; exit 0 ;;\n'
+        '  *doctor*) exit 0 ;;\n'
+        '  *cp*) exit 3 ;;\n'          # 복사 실패
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    os.chmod(bin_dir / "docker", 0o755)
+
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    proc = subprocess.run(
+        ["sh", str(ROOT / "doctor.sh"), "--bundle"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60, env=env,
+    )
+
+    assert proc.returncode != 0, "번들을 못 가져왔는데 0 으로 끝났다"
+    assert "가져오지 못했습니다" in proc.stderr

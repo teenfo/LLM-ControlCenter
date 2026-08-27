@@ -423,6 +423,18 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
             "test_diagnostic_bundle_carries_no_prompts_or_tenant_names",
             "test_doctor_bundle_masks_secrets",
             "test_mask_secret_reveals_length_not_value",
+            # `config` 절만 마스킹하고 `cluster` 절이 스냅샷을 통째로 실으면서
+            # 같은 값을 원문 테넌트 ID 로 다시 넣고 있었다(감사 H13).
+            "test_the_bundle_never_names_a_tenant",
+            "test_the_bundle_still_says_how_many_tenants_are_pinned",
+            "test_a_budget_alert_does_not_carry_the_tenant_into_the_bundle",
+            "test_the_tenant_count_survives_the_strip",
+            "test_the_strip_walks_the_whole_structure",
+            "test_the_admin_view_still_shows_who_is_pinned",
+            # 마스킹돼 있어도 **만들어지지 않으면** 소용이 없다(감사 H11).
+            "test_the_bundle_is_produced_even_when_doctor_finds_a_problem",
+            "test_the_doctor_exit_code_survives_the_bundle_copy",
+            "test_a_failed_bundle_copy_is_reported",
         ),
     ),
 

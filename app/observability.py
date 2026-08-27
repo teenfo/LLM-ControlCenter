@@ -265,6 +265,43 @@ def mask_secret(value: str) -> str:
     return f"<설정됨 · {len(value)}자>"
 
 
+#: 테넌트 신원을 나르는 키. **번들에서만** 지운다 — 관제 UI 와 알림 채널에서는
+#: 이 값이 있어야 한다. 플랫폼 관리자는 자기 테넌트를 다 알고, 예산 알림은
+#: "어느 테넌트가 80% 를 썼는가" 가 곧 내용이다.
+#:
+#: 경계는 **누가 그 파일을 받는가**에 있다. 번들은 설치처가 벤더에게 보낸다.
+TENANT_BEARING_KEYS = frozenset({"tenant", "tenant_id", "tenant_affinity"})
+
+
+def strip_tenant_identity(value: Any) -> Any:
+    """번들에서 테넌트 신원을 지운다. **구조를 훑어서 지운다.**
+
+    필드를 손으로 골라 담으면 그 목록이 표가 되고, 표는 반드시 어긋난다 —
+    실제로 어긋났다. 번들의 `config` 절은 의식적으로 `tenant_affinity_count`
+    만 담았는데, 같은 번들의 `cluster` 절이 `cluster.snapshot()` 을 통째로
+    실으면서 **같은 값을 원문 테넌트 ID 로 다시 넣고 있었다.**
+
+    수를 남기는 것이 중요하다. "전용 노드에 테넌트 2곳" 은 진단에 필요한 사실이고,
+    그게 누구인지는 벤더가 알 일이 아니다.
+    """
+    if isinstance(value, Mapping):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in TENANT_BEARING_KEYS:
+                if isinstance(item, str):
+                    clean[key] = "(마스킹됨)" if item else item
+                    continue
+                if isinstance(item, (list, tuple)):
+                    # 목록은 수만 남긴다 — 있다는 사실은 진단에 필요하다.
+                    clean[f"{key}_count"] = len(item)
+                    continue
+            clean[key] = strip_tenant_identity(item)
+        return clean
+    if isinstance(value, (list, tuple)):
+        return [strip_tenant_identity(item) for item in value]
+    return value
+
+
 def diagnostic_bundle(
     *,
     store: Any,
@@ -284,6 +321,11 @@ def diagnostic_bundle(
     **설치처가 이 파일을 그대로 보낸다는 전제로 만든다.** 그래서 비밀은 마스킹하고,
     프롬프트·응답 본문과 테넌트 이름은 아예 담지 않는다 — 담으면 설치처가
     지원 채널로 자기 고객 데이터를 보내게 된다.
+
+    테넌트 신원 제거는 **마지막에 구조 전체를 훑어서** 한다(`strip_tenant_identity`).
+    절마다 손으로 고르면 그 목록이 표가 되고, 표는 어긋난다 — 실제로 아래 `config`
+    절은 `tenant_affinity_count` 만 담는데 `cluster` 절이 스냅샷을 통째로 실으면서
+    같은 값을 원문 ID 로 다시 넣고 있었다.
     """
     env = env if env is not None else {}
     secrets_present = {
@@ -292,7 +334,7 @@ def diagnostic_bundle(
         if key.startswith(DIAGNOSTIC_ENV_PREFIXES)
     }
 
-    return {
+    bundle = {
         "generated_at": now(),
         "product": {
             "version": version,
@@ -354,3 +396,4 @@ def diagnostic_bundle(
             "jobs": sum(store.job_counts().values()),
         },
     }
+    return strip_tenant_identity(bundle)

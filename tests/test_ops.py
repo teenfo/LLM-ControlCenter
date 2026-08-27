@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import logging
@@ -527,3 +528,99 @@ def test_a_channel_is_assumed_to_block_unless_it_says_otherwise():
     assert getattr(Bare(), "blocking", True) is True
     # 인메모리 채널만 인라인으로 돈다 — 안 그러면 테스트가 발송을 기다려야 한다.
     assert RecordingChannel().blocking is False
+
+
+# ── 감사 H13 — 진단 번들이 테넌트 신원을 흘린다 ──────────────────────────────
+#
+# 번들은 **설치처가 벤더에게 보내는 파일**이다. `config` 절은 의식적으로
+# `tenant_affinity_count` 만 담았는데, 같은 번들의 `cluster` 절이
+# `cluster.snapshot()` 을 통째로 실으면서 같은 값을 원문 ID 로 다시 넣었다.
+# 절마다 손으로 고르면 그 목록이 표가 되고, 표는 반드시 어긋난다.
+
+
+def _bundle_with_a_dedicated_node(harness):
+    from app.observability import diagnostic_bundle
+
+    node = harness.cluster.nodes["in-1"].node
+    harness.cluster.nodes["in-1"].node = dataclasses.replace(
+        node, tenant_affinity=("acme", "globex")
+    )
+    return diagnostic_bundle(
+        store=harness.store, cluster=harness.cluster, config=harness.config,
+        scheduler=harness.scheduler, registrar=harness.registrar,
+        notifier=harness.notifier, vault=harness.vault, now=harness.clock,
+    )
+
+
+def test_the_bundle_never_names_a_tenant(harness, acme, globex):
+    """설치처가 지원 채널로 자기 고객 이름을 보내게 두지 않는다."""
+    bundle = _bundle_with_a_dedicated_node(harness)
+    text = json.dumps(bundle, ensure_ascii=False)
+
+    assert "acme" not in text, "전용 노드 설정으로 테넌트 이름이 샜다"
+    assert "globex" not in text
+
+
+def test_the_bundle_still_says_how_many_tenants_are_pinned(harness, acme):
+    """**수는 남긴다.** "전용 노드에 테넌트 2곳" 은 진단에 필요한 사실이다.
+
+    누구인지가 벤더가 알 일이 아닐 뿐이다.
+    """
+    bundle = _bundle_with_a_dedicated_node(harness)
+    node = next(n for n in bundle["cluster"] if n["node"] == "in-1")
+
+    assert node["tenant_affinity_count"] == 2
+    assert "tenant_affinity" not in node
+
+
+def test_a_budget_alert_does_not_carry_the_tenant_into_the_bundle(harness, acme):
+    """예산 알림은 "어느 테넌트가 80%를 썼는가" 가 곧 내용이다 — 채널에는 남는다.
+
+    그 이력이 번들에 실려 벤더에게 가는 것이 문제다. **경계는 누가 받는가에 있다.**
+    """
+    from app.observability import diagnostic_bundle
+
+    harness.notifier.send("budget_warn", tenant="acme", percent=80)
+    assert any(
+        h["detail"].get("tenant") == "acme" for h in harness.notifier.history
+    ), "알림 이력에서 테넌트가 사라졌다 — 채널에는 있어야 한다"
+
+    bundle = diagnostic_bundle(
+        store=harness.store, cluster=harness.cluster, config=harness.config,
+        notifier=harness.notifier, vault=harness.vault, now=harness.clock,
+    )
+    assert "acme" not in json.dumps(bundle, ensure_ascii=False)
+
+
+def test_the_tenant_count_survives_the_strip(harness, acme, globex):
+    """`counts.tenants` 는 수다 — 지우면 안 된다. 문자열만 지운다."""
+    from app.observability import diagnostic_bundle
+
+    bundle = diagnostic_bundle(
+        store=harness.store, cluster=harness.cluster, config=harness.config,
+        vault=harness.vault, now=harness.clock,
+    )
+    assert bundle["counts"]["tenants"] == 2
+
+
+def test_the_strip_walks_the_whole_structure():
+    """절마다 손으로 고르면 그 목록이 표가 되고, 표는 어긋난다 — 실제로 어긋났다."""
+    from app.observability import strip_tenant_identity
+
+    nested = {"a": [{"b": {"tenant_id": "acme", "keep": 1}}], "tenant": "globex"}
+    clean = strip_tenant_identity(nested)
+
+    assert clean["a"][0]["b"]["tenant_id"] == "(마스킹됨)"
+    assert clean["a"][0]["b"]["keep"] == 1
+    assert clean["tenant"] == "(마스킹됨)"
+
+
+def test_the_admin_view_still_shows_who_is_pinned(harness, acme):
+    """관제 UI 에서는 지우지 않는다 — 플랫폼 관리자는 자기 테넌트를 다 안다."""
+    node = harness.cluster.nodes["in-1"].node
+    harness.cluster.nodes["in-1"].node = dataclasses.replace(
+        node, tenant_affinity=("acme",)
+    )
+    snapshot = next(n for n in harness.cluster.snapshot() if n["node"] == "in-1")
+
+    assert snapshot["tenant_affinity"] == ["acme"]
