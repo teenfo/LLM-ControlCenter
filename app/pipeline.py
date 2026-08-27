@@ -255,14 +255,24 @@ class Pipeline:
 
     # -- ③ 저장 ---------------------------------------------------------------
 
-    def _seal(self, tenant: Any, plaintext: str) -> Any:
+    def _seal(self, scope: TenantScope, tenant: Any, plaintext: str) -> Any:
         """원문 암호화. **KEK 가 없으면 암호문 자체를 안 만든다.**
 
         평문 폴백 경로를 두면 키 설정을 깜빡한 설치처에 원문이 평문으로 쌓인다.
+
+        반대 순서도 실제로 일어난다 — KEK 없이 시작해 테넌트를 만들고 나중에 키를
+        넣는 설치처다. 그때 이 테넌트만 DEK 가 없어서 **모든 요청이 여기서 죽었다.**
+        키가 생긴 시점에 붙여 준다(`adopt_tenant_dek`). 그래도 못 붙으면(파기된
+        테넌트) 원문 없이 간다 — 요청을 죽이는 쪽이 아니라 안 남기는 쪽이 안전하다.
         """
         if not self._vault.enabled:
             return None
-        return self._vault.seal(tenant["dek_wrapped"], plaintext)
+        wrapped = tenant["dek_wrapped"]
+        if not wrapped:
+            wrapped = self._store.adopt_tenant_dek(scope, self._vault.create_dek())
+            if not wrapped:
+                return None
+        return self._vault.seal(wrapped, plaintext)
 
     def _create_job(
         self,
@@ -279,7 +289,7 @@ class Pipeline:
         metadata: Mapping[str, Any] | None,
         status: str = "queued",
     ) -> str:
-        sealed = self._seal(tenant, raw_prompt)
+        sealed = self._seal(scope, tenant, raw_prompt)
         masked = verdict.storable_prompt
         external = verdict.prompt_for(EXTERNAL)
         system_internal = verdict.system_for(INTERNAL)

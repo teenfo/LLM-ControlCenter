@@ -72,8 +72,37 @@ else
   warn "메모리 점검을 건너뜁니다(/proc/meminfo 없음)."
 fi
 
-# -- 키 --
+# -- 키 디렉터리 소유권 --
+#
+# **컴포즈가 대신 만들게 두면 root 소유가 된다.** 컨테이너는 uid 10001 로 돌기
+# 때문에 거기에 마스터 KEK 를 쓰지 못하고, `restart: unless-stopped` 아래에서
+# 그것은 조용한 크래시 루프가 된다 — 설치처는 로그가 흐르는 화면만 본다.
+# 그래서 도커가 만들기 **전에** 여기서 올바른 소유권으로 만들어 둔다.
 KEYS_DIR="${LCC_KEYS_PATH:-./keys}"
+CONTAINER_UID=10001
+if [ ! -d "$KEYS_DIR" ]; then
+  if mkdir -p "$KEYS_DIR" 2>/dev/null; then
+    chmod 700 "$KEYS_DIR" 2>/dev/null || true
+    ok "키 디렉터리 생성 (${KEYS_DIR})"
+  else
+    fail "키 디렉터리를 만들 수 없습니다: ${KEYS_DIR}"
+  fi
+fi
+if [ -d "$KEYS_DIR" ]; then
+  keys_uid=$(stat -c '%u' "$KEYS_DIR" 2>/dev/null || echo '')
+  if [ -n "$keys_uid" ] && [ "$keys_uid" != "$CONTAINER_UID" ]; then
+    # 네이티브 실행이면 문제가 아니다 — 도커로 띄울 때만 걸린다.
+    if command -v docker >/dev/null 2>&1; then
+      warn "키 디렉터리 ${KEYS_DIR} 가 uid ${keys_uid} 소유입니다. 컨테이너는 uid ${CONTAINER_UID} 로 돕니다.
+      마스터 KEK 를 쓰지 못해 기동이 실패합니다. 다음을 실행하세요:
+        sudo chown -R ${CONTAINER_UID}:${CONTAINER_UID} ${KEYS_DIR}"
+    fi
+  else
+    ok "키 디렉터리 소유권 OK (${KEYS_DIR})"
+  fi
+fi
+
+# -- 키 --
 if [ -f "${KEYS_DIR}/master.key" ]; then
   ok "마스터 KEK 있음 (${KEYS_DIR}/master.key)"
   perms=$(stat -c '%a' "${KEYS_DIR}/master.key" 2>/dev/null || echo '')

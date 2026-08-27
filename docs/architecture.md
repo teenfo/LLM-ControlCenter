@@ -273,7 +273,8 @@ HTTP (Starlette)                                              main.py · meta.py
 
 배경        레인 루프 · 헬스 · 모델 설치 · 보존 · 감시         scheduler.py · models.py
 운영        알림 · 메트릭 · 구조화 로그 · 진단 번들            notify.py · observability.py
-설치        부트스트랩 · CLI · 백업 스냅샷                     bootstrap.py · cli.py · backup.py
+설치        부트스트랩 · CLI · 백업 스냅샷 · 복원              bootstrap.py · cli.py ·
+                                                              backup.py · restore.py
 설정                                                          config.py · i18n.py
 ```
 
@@ -296,6 +297,23 @@ HTTP (Starlette)                                              main.py · meta.py
 
 캐시는 두지 않는다. 무효화를 빠뜨린 캐시가 이 저장소에서 이미 한 번 사고를 냈다
 (가드 정규식 캐시 — 관리자가 고친 규칙이 재기동 전까지 옛 규칙으로 돌았다).
+
+### `restore.py` — 위험한 부분을 쉘에 두지 않는다
+
+`restore.sh` 는 사람과 대화하고 컨테이너를 세웠다 켠다. **틀리면 조용히 데이터를
+깨뜨리는 부분은 전부 `restore.py` 에 있다** — 쉘에 두면 테스트가 닿지 않고, 닿지
+않는 코드는 검증되지 않는다. 실제로 세 가지가 각각 사고를 냈다:
+
+| 쉘에 있을 때 | 옮긴 뒤 |
+|---|---|
+| 본체만 갈아 끼우고 낡은 `-wal`·`-shm` 을 남겼다 | `install()` 이 셋을 한 벌로 다룬다 |
+| 스키마 버전을 **찍기만 하고 비교하지 않았다** | `check_compatible()` 이 막는다 |
+| 백업에 담긴 `config/` 를 안 되돌렸다 | `install_config()` 이 되돌린다 |
+
+소유권도 여기서 갈린다. 호스트에서 `docker compose cp` 로 DB 를 밀어 넣으면 파일이
+root 소유로 들어가고, 컨테이너는 uid 10001 로 돌기 때문에 복원 직후 읽기 전용 DB 로
+죽는다. 그래서 백업을 읽기 전용으로 마운트하고 **대상 파일을 앱 사용자가 직접 만든다**
+— 소유권을 나중에 고치는 대신 처음부터 맞게 만든다.
 
 ### `meta.py` 는 계약을 손으로 적지 않는다
 

@@ -23,6 +23,7 @@ from .bootstrap import (
     GRACE_KEY,
     bootstrap,
     demo_seed,
+    KeyDirectoryUnwritable,
     ensure_master_key,
     is_bootstrapped,
     load_master_key_from,
@@ -356,7 +357,14 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "func", None):
         parser.print_help()
         return 0
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyDirectoryUnwritable as exc:
+        # **트레이스백으로 끝내지 않는다.** `restart: unless-stopped` 아래에서는
+        # 이것이 크래시 루프가 되고, 설치처는 흐르는 로그만 보게 된다.
+        # 무엇이 잘못됐고 무엇을 하면 되는지가 마지막 줄에 있어야 한다.
+        print(f"\n기동할 수 없습니다.\n  {exc}\n", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover

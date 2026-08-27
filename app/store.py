@@ -1408,6 +1408,40 @@ class SqliteStore:
         )
         self._conn.commit()
 
+    def adopt_tenant_dek(self, scope: TenantScope, wrapped: bytes) -> bytes | None:
+        """DEK 가 없는 테넌트에 하나 붙이고 **실제로 저장된 것**을 돌려준다.
+
+        KEK 없이 기동한 설치처(원문 보관 비활성)에서 만들어진 테넌트는 `dek_wrapped`
+        가 NULL 이다. 나중에 관리자가 KEK 를 넣으면 금고는 켜지는데 그 테넌트의 키만
+        없어서, **그 테넌트의 모든 요청이 봉인 단계에서 죽는다.** 설치 순서 하나로
+        멀쩡하던 테넌트가 통째로 멈추면 안 된다.
+
+        돌려준 값으로 봉인해야 한다 — 두 요청이 동시에 들어오면 UPDATE 는 하나만
+        이긴다. 진 쪽이 자기가 만든 DEK 로 봉인하면 **그 암호문은 아무도 못 연다.**
+
+        파기된 테넌트에는 붙이지 않는다. 붙이면 crypto-shredding 이후에 새 암호문이
+        다시 쌓이기 시작한다 — 지웠다고 믿은 것이 되살아나는 셈이다.
+        """
+        self._scoped_where(scope)
+        cursor = self._conn.execute(
+            "UPDATE tenants SET dek_wrapped = ? "
+            "WHERE id = ? AND dek_wrapped IS NULL AND purged_at IS NULL",
+            (wrapped, scope.tenant_id),
+        )
+        adopted = cursor.rowcount == 1
+        self._conn.commit()
+        if adopted:
+            # 테넌트가 키를 갖게 된 시점은 남긴다 — 이 앞뒤로 원문 보관 여부가 갈린다.
+            self.audit(
+                "system", "adopt_tenant_dek", tenant_id=scope.tenant_id,
+                detail={"reason": "kek_enabled_after_tenant_creation"},
+            )
+        row = self._conn.execute(
+            "SELECT dek_wrapped FROM tenants WHERE id = ? AND purged_at IS NULL",
+            (scope.tenant_id,),
+        ).fetchone()
+        return row["dek_wrapped"] if row else None
+
     # -- 테넌트 가드 규칙 ------------------------------------------------------
 
     def set_tenant_guard_rule(

@@ -863,3 +863,96 @@ def test_clearing_an_override_restores_the_configured_value(harness, client, acm
         headers=auth(acme["service"]),
     )
     assert response.status_code == 200
+
+
+# ── 감사 H7 — KEK 를 나중에 넣은 설치처 ──────────────────────────────────────
+#
+# 부트스트랩이 KEK 없이 돌 수 있고(원문 보관 비활성), 그 상태에서 만든 테넌트는
+# `dek_wrapped` 가 NULL 이다. 나중에 KEK 를 넣으면 금고만 켜지고 그 테넌트의 키는
+# 없어서 **모든 요청이 봉인 단계에서 죽었다.** 설치 순서 하나로 테넌트가 멈춘다.
+
+
+def _strip_dek(store, tenant_id: str) -> None:
+    """KEK 없이 만들어진 테넌트를 흉내 낸다."""
+    store.adopt_tenant_dek  # 존재 확인 — 이름이 바뀌면 이 테스트가 먼저 깨져야 한다
+    store._conn.execute("UPDATE tenants SET dek_wrapped = NULL WHERE id = ?", (tenant_id,))
+    store._conn.commit()
+
+
+def test_a_tenant_created_before_the_kek_still_works_after_it_is_set(harness, client, acme):
+    """**DEK 가 없다고 요청 전체가 죽으면 안 된다.**"""
+    _strip_dek(harness.store, "acme")
+
+    response = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_the_backfilled_dek_actually_opens_the_ciphertext(harness, client, acme):
+    """붙이기만 하고 봉인에 다른 키를 쓰면 아무도 못 여는 암호문이 쌓인다."""
+    _strip_dek(harness.store, "acme")
+
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "비밀 원문", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+
+    revealed = client.get(f"/v1/admin/jobs/{job_id}/raw", headers=auth(acme["tenant_admin"]))
+    assert revealed.status_code == 200, revealed.text
+    assert revealed.json()["prompt"] == "비밀 원문"
+
+
+def test_backfill_never_replaces_an_existing_dek(harness, acme):
+    """이미 있는 DEK 를 덮으면 그 테넌트의 **기존 암호문이 통째로 열리지 않는다.**"""
+    store = harness.store
+    scope = TenantScope("acme")
+    before = store.get_tenant("acme")["dek_wrapped"]
+    assert before
+
+    returned = store.adopt_tenant_dek(scope, harness.vault.create_dek())
+    assert returned == before
+    assert store.get_tenant("acme")["dek_wrapped"] == before
+
+
+def test_concurrent_backfill_agrees_on_one_key(harness, acme):
+    """경쟁에서 진 쪽이 자기 키로 봉인하면 그 암호문은 아무도 못 연다."""
+    store = harness.store
+    scope = TenantScope("acme")
+    _strip_dek(store, "acme")
+
+    first = store.adopt_tenant_dek(scope, harness.vault.create_dek())
+    second = store.adopt_tenant_dek(scope, harness.vault.create_dek())
+    assert first == second, "두 번째 호출이 다른 키를 돌려줬다"
+
+    sealed = harness.vault.seal(second, "원문")
+    assert harness.vault.open(first, sealed) == "원문"
+
+
+def test_backfill_does_not_resurrect_a_purged_tenants_key(harness, acme):
+    """파기 이후 새 암호문이 다시 쌓이면 crypto-shredding 이 무의미해진다."""
+    from app.store import PlatformScope
+
+    store = harness.store
+    store.purge_tenant(PlatformScope(actor="platform_admin", reason="테스트"), "acme")
+
+    assert store.adopt_tenant_dek(TenantScope("acme"), harness.vault.create_dek()) is None
+    row = store._conn.execute(
+        "SELECT dek_wrapped FROM tenants WHERE id = 'acme'"
+    ).fetchone()
+    assert row["dek_wrapped"] is None
+
+
+def test_a_backfill_is_audited(harness, client, acme):
+    """테넌트가 키를 갖게 된 시점 앞뒤로 원문 보관 여부가 갈린다 — 남겨야 한다."""
+    _strip_dek(harness.store, "acme")
+    client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    actions = [
+        row["action"]
+        for row in harness.store.list_audit(TenantScope("acme"), limit=50)
+    ]
+    assert "adopt_tenant_dek" in actions

@@ -365,7 +365,20 @@ COVERAGE: dict[int, tuple[str, tuple[str, ...]]] = {
     ),
     42: (
         "복원이 스키마 버전을 검사하고, 역할 오버라이드가 되돌아간다는 경고를 띄운다",
-        ("test_the_restore_script_warns_about_role_overrides",),
+        (
+            "test_the_restore_warns_about_role_overrides",
+            # 감사가 짚은 것: 찍기만 하고 **비교하지 않았다**. 경고는 검사가 아니다.
+            "test_restore_refuses_a_newer_schema",
+            "test_restore_allows_an_older_schema",
+            "test_the_install_path_actually_gates_on_schema",
+            "test_the_restore_script_gates_before_asking_for_confirmation",
+            # 그리고 복원이 되돌리는 대상은 DB 만이 아니다.
+            "test_restore_removes_the_stale_wal",
+            "test_restore_leaves_a_way_back",
+            "test_the_rollback_copy_includes_unflushed_wal_content",
+            "test_restore_puts_the_config_back",
+            "test_the_restore_script_does_not_cp_the_database_in_as_root",
+        ),
     ),
     43: (
         "data_boundary: external 노드는 TLS·인증 없이 등록되지 않는다",

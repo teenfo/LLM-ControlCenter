@@ -483,12 +483,24 @@ def test_the_backup_script_says_the_key_is_not_included():
     assert "다른 곳에" in text
 
 
-def test_the_restore_script_warns_about_role_overrides():
-    """오버라이드는 코드가 아니라 데이터라서 백업 시점의 모델 선택이 되살아난다."""
-    text = (ROOT / "restore.sh").read_text(encoding="utf-8")
-    assert "role_overrides" in text
-    assert "되돌아갑니다" in text
-    assert "schema_version" in text
+def test_the_restore_warns_about_role_overrides(tmp_path, capsys):
+    """오버라이드는 코드가 아니라 데이터라서 백업 시점의 모델 선택이 되살아난다.
+
+    문구가 스크립트에 **있는지**가 아니라 복원 전 안내에 **찍히는지**를 본다 —
+    쉘을 뒤지는 검사는 설명 주석에도 걸려서 무엇을 지키는지가 흐려진다.
+    """
+    from app.restore import main
+
+    backup = tmp_path / "backup.db"
+    store = SqliteStore(backup)
+    store.create_tenant("t1", "T1", end_user_salt=b"s" * 16)
+    store.set_role_override(TenantScope("t1"), "summarize", {"model": "옛-모델"}, updated_by="t")
+    store.close()
+
+    assert main(["inspect", str(backup)]) == 0
+    out = capsys.readouterr().out
+    assert "되돌아갑니다" in out
+    assert "스키마 버전" in out
 
 
 def test_preflight_states_the_trust_assumption():
@@ -596,3 +608,275 @@ def test_the_readme_describes_the_grace_mode_that_was_actually_built():
     assert f"`{GRACE_FALLBACK}`" in text
     # 왜 audit 이 아닌지도 적혀 있어야 한다 — 결정만 적고 근거를 빼면 다음 사람이 되돌린다.
     assert "마스킹 없이" in text
+
+
+# ── 감사 H9 — 복원이 조용히 데이터를 깨뜨린다 ────────────────────────────────
+#
+# 복원은 **사고 난 뒤에** 하는 일이다. 그때 조용히 틀리면 사고가 두 겹이 된다.
+# 위험한 부분을 `app/restore.py` 로 옮긴 이유가 이것이다 — 쉘에 두면 테스트가 닿지
+# 않고, 닿지 않는 코드는 검증되지 않는다.
+
+
+def _live_wal_db(path: Path, tenant: str = "t1") -> None:
+    """WAL 이 살아 있는 DB. 곁다리 파일이 실제로 생긴다."""
+    store = SqliteStore(path)
+    store.create_tenant(tenant, tenant.title(), end_user_salt=b"s" * 16)
+    # close 하지 않는다 — `-wal` 이 남아 있어야 한다.
+    return store
+
+
+def test_restore_removes_the_stale_wal(tmp_path):
+    """**본체만 갈아 끼우면 이전 DB 의 WAL 이 새 본체 위에 얹힌다.**
+
+    WAL 모드 DB 는 파일 세 개가 한 벌이다. SQLite 문서가 본체 교체 시 셋을 함께
+    다루라고 못박는 이유이고, 백업이 원본에서 온 것이라 헤더가 맞아떨어질 수 있어서
+    운이 나쁘면 깨진 것을 깨진 줄 모르고 쓰게 된다.
+    """
+    from app import restore
+
+    data = tmp_path / "data"
+    data.mkdir()
+    live = _live_wal_db(data / "controlcenter.db", "old")
+    assert (data / "controlcenter.db-wal").exists(), "WAL 이 안 생겼다 — 전제가 틀렸다"
+
+    backup = tmp_path / "backup.db"
+    source = SqliteStore(backup)
+    source.create_tenant("new", "New", end_user_salt=b"s" * 16)
+    source.close()
+    live.close()
+
+    result = restore.install(backup, data)
+
+    assert "controlcenter.db-wal" in result["sidecars_removed"], "낡은 WAL 을 안 지웠다"
+    assert not (data / "controlcenter.db-wal").exists()
+    assert not (data / "controlcenter.db-shm").exists()
+
+
+def test_restore_leaves_a_way_back(tmp_path):
+    """복원이 잘못됐을 때 되돌아갈 방법이 없으면 그것대로 막다른 길이다."""
+    from app import restore
+
+    data = tmp_path / "data"
+    data.mkdir()
+    live = _live_wal_db(data / "controlcenter.db", "before")
+    live.close()
+
+    backup = tmp_path / "backup.db"
+    source = SqliteStore(backup)
+    source.create_tenant("after", "After", end_user_salt=b"s" * 16)
+    source.close()
+
+    result = restore.install(backup, data)
+
+    rollback = SqliteStore(Path(result["rollback"]))
+    try:
+        assert rollback.get_tenant("before") is not None, "되돌림 사본에 이전 데이터가 없다"
+    finally:
+        rollback.close()
+
+
+def test_the_rollback_copy_includes_unflushed_wal_content(tmp_path):
+    """`cp` 로 뜨면 `-wal` 내용이 빠진다 — 되돌림 사본이 처음부터 비어 있게 된다."""
+    from app import restore
+
+    data = tmp_path / "data"
+    data.mkdir()
+    live = _live_wal_db(data / "controlcenter.db", "in-wal")   # 열어 둔 채로
+
+    backup = tmp_path / "backup.db"
+    source = SqliteStore(backup)
+    source.create_tenant("after", "After", end_user_salt=b"s" * 16)
+    source.close()
+
+    result = restore.install(backup, data)
+    live.close()
+
+    rollback = SqliteStore(Path(result["rollback"]))
+    try:
+        assert rollback.get_tenant("in-wal") is not None, "WAL 에만 있던 행이 사본에서 빠졌다"
+    finally:
+        rollback.close()
+
+
+def test_restore_refuses_a_newer_schema(tmp_path):
+    """**찍기만 하고 비교하지 않으면 검사가 아니다.**
+
+    신버전에서 뜬 백업에는 구버전이 모르는 컬럼이 있고, 구버전 코드는 그것을 읽지
+    않으므로 조용히 값이 사라진다.
+    """
+    from app.restore import RestoreRefused, check_compatible
+
+    with pytest.raises(RestoreRefused) as exc:
+        check_compatible(backup_version=9, current_version=1)
+    # 무엇을 하면 되는지가 메시지에 있어야 한다.
+    assert "9" in str(exc.value) and "스키마" in str(exc.value)
+
+
+def test_restore_allows_an_older_schema(tmp_path):
+    """마이그레이션이 ADD COLUMN 전용이라 구버전 백업은 전진 호환된다."""
+    from app.restore import check_compatible
+
+    check_compatible(backup_version=1, current_version=9)   # 예외가 없어야 한다
+
+
+def test_the_install_path_actually_gates_on_schema(tmp_path):
+    """게이트가 `install()` 안에 있어야 한다 — 호출자가 빠뜨릴 수 있으면 규율이다."""
+    import sqlite3
+
+    from app.restore import RestoreRefused, install
+
+    backup = tmp_path / "backup.db"
+    store = SqliteStore(backup)
+    store.close()
+    conn = sqlite3.connect(backup)
+    conn.execute("UPDATE meta SET value='999' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RestoreRefused):
+        install(backup, tmp_path / "data")
+
+
+def test_restore_puts_the_config_back(tmp_path):
+    """백업은 `config/` 를 담는데 복원이 DB 만 넣으면 반쪽만 되돌아간다.
+
+    어느 시점의 구성인지 아무도 말할 수 없는 상태가 가장 나쁘다.
+    """
+    from app.restore import install_config
+
+    source = tmp_path / "backup-config"
+    source.mkdir()
+    (source / "roles.yaml").write_text("백업 시점", encoding="utf-8")
+
+    target = tmp_path / "config"
+    target.mkdir()
+    (target / "roles.yaml").write_text("현재", encoding="utf-8")
+
+    names = install_config(source, target)
+
+    assert "roles.yaml" in names
+    assert (target / "roles.yaml").read_text(encoding="utf-8") == "백업 시점"
+    # 되돌림 자리도 남긴다.
+    assert (target / "roles.yaml.before-restore").read_text(encoding="utf-8") == "현재"
+
+
+def test_the_restore_script_does_not_cp_the_database_in_as_root():
+    """`docker compose cp` 로 넣으면 root 소유가 되고, uid 10001 은 거기 못 쓴다.
+
+    복원 직후 "attempt to write a readonly database" 로 죽는 경로다.
+    """
+    # 주석은 뺀다 — 결함을 설명하는 주석에 걸리면 무엇을 지키는지가 흐려진다.
+    lines = [
+        line for line in (ROOT / "restore.sh").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    offenders = [line for line in lines if "docker compose cp" in line]
+    assert not offenders, f"복원 DB 를 컨테이너로 cp 하고 있다: {offenders}"
+    assert any("app.restore install" in line for line in lines), \
+        "복원을 파이썬 쪽에 위임하지 않았다"
+
+
+def test_the_restore_script_gates_before_asking_for_confirmation():
+    """스키마가 안 맞으면 "restore" 를 입력받기 **전에** 끝나야 한다."""
+    text = (ROOT / "restore.sh").read_text(encoding="utf-8")
+    gate = text.index("app.restore inspect")
+    prompt = text.index('"restore" 를 입력')
+    assert gate < prompt, "확인을 받은 뒤에 호환성을 검사한다"
+
+
+# ── 감사 H12 — root 소유 키 디렉터리 = 크래시 루프 ───────────────────────────
+
+
+def _undoable_keys_dir(tmp_path: Path) -> Path:
+    """어떤 uid 로 돌아도 쓸 수 없는 경로.
+
+    권한 비트로 흉내 내면 **root 로 도는 환경에서 검사가 통째로 무력해진다** —
+    root 는 비트를 무시한다. 부모가 파일이면 uid 와 무관하게 `mkdir` 이 실패한다.
+    """
+    blocker = tmp_path / "blocker"
+    blocker.write_text("나는 디렉터리가 아니다", encoding="utf-8")
+    return blocker / "keys"
+
+
+def test_an_unwritable_key_directory_fails_with_a_human_message(tmp_path):
+    """`PermissionError` 트레이스백 + `restart: unless-stopped` = 조용한 크래시 루프.
+
+    설치처는 로그가 흐르는 화면만 보게 된다. 무엇이 잘못됐고 무엇을 하면 되는지가
+    마지막 줄에 있어야 한다.
+    """
+    from app.bootstrap import KeyDirectoryUnwritable, ensure_master_key
+
+    with pytest.raises(KeyDirectoryUnwritable) as exc:
+        ensure_master_key(_undoable_keys_dir(tmp_path), env={})
+
+    message = str(exc.value)
+    assert "10001" in message, "어떤 uid 로 도는지 안 알려준다"
+    assert "chown" in message, "무엇을 하면 되는지 안 알려준다"
+    assert "LCC_PROMPT_KEY" in message, "대안(환경 변수)을 안 알려준다"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root 는 권한 비트를 무시한다")
+def test_a_root_owned_key_directory_is_refused(tmp_path):
+    """실제 시나리오 그대로 — 도커가 대신 만든 남의 소유 디렉터리."""
+    from app.bootstrap import KeyDirectoryUnwritable, ensure_master_key
+
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    os.chmod(keys, 0o500)
+    try:
+        with pytest.raises(KeyDirectoryUnwritable):
+            ensure_master_key(keys, env={})
+    finally:
+        os.chmod(keys, 0o700)
+
+
+def test_a_failed_key_write_does_not_leave_a_lost_key(tmp_path, monkeypatch):
+    """키를 만들고 저장에 실패하면 그 키는 **어디에도 없이** 사라진다.
+
+    다음 기동이 다른 키를 만들고, 그 사이 암호문은 영구히 열리지 않는다.
+    """
+    from app.bootstrap import KeyDirectoryUnwritable, ensure_master_key
+
+    keys = tmp_path / "keys"
+
+    def refuse(self, *args, **kwargs):
+        # 디스크가 찼거나 마운트가 읽기 전용인 경우. 검사를 통과한 뒤에도 일어난다.
+        self.write_bytes(b"half")     # 반쯤 쓰인 파일이 남는 상황까지 재현한다
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "write_text", refuse)
+    with pytest.raises(KeyDirectoryUnwritable):
+        ensure_master_key(keys, env={})
+
+    assert not (keys / "master.key").exists(), "반쯤 쓰인 키 파일이 남았다"
+
+
+def test_the_key_directory_is_checked_before_a_key_is_generated(tmp_path):
+    """검사가 생성보다 뒤면 못 쓸 디렉터리에도 키를 한 번 만들어 버린다."""
+    import inspect
+
+    from app.bootstrap import ensure_master_key
+
+    body = inspect.getsource(ensure_master_key)
+    assert body.index("os.access") < body.index("generate_master_key()"), \
+        "쓰기 가능 여부를 키를 만든 뒤에 본다"
+
+
+def test_the_cli_turns_an_unwritable_key_directory_into_an_exit_code(tmp_path, capsys):
+    """진입점이 트레이스백을 내면 크래시 루프의 로그가 그것으로 채워진다."""
+    from app.cli import main
+
+    code = main([
+        "--data", str(tmp_path / "data"), "--keys", str(_undoable_keys_dir(tmp_path)),
+        "bootstrap",
+    ])
+
+    assert code == 1
+    assert "chown" in capsys.readouterr().err
+
+
+def test_preflight_creates_the_key_directory_before_docker_does():
+    """도커가 대신 만들면 root 소유가 된다 — 그 전에 만들어 둔다."""
+    text = (ROOT / "preflight.sh").read_text(encoding="utf-8")
+    assert "10001" in text
+    assert "chown" in text

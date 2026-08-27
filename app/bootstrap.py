@@ -96,6 +96,28 @@ def is_bootstrapped(store: SqliteStore) -> bool:
     return store.platform_setting(BOOTSTRAP_MARK) is not None
 
 
+class KeyDirectoryUnwritable(RuntimeError):
+    """키 디렉터리에 쓸 수 없다. **사람이 읽고 조치할 수 있는 메시지를 나른다.**"""
+
+
+def _keys_dir_complaint(directory: Path) -> str:
+    """왜 못 쓰는지와 무엇을 하면 되는지. 스택트레이스로는 아무도 못 고친다."""
+    owner = ""
+    try:
+        stat = directory.stat()
+        owner = f" (현재 소유 uid={stat.st_uid}, 권한 {stat.st_mode & 0o777:03o})"
+    except OSError:
+        pass
+    return (
+        f"키 디렉터리에 쓸 수 없습니다: {directory}{owner}\n"
+        "  컨테이너는 uid 10001 로 돕니다. 도커가 없는 경로를 대신 만들면 root 소유가\n"
+        "  되어 이 프로세스가 마스터 KEK 를 쓰지 못합니다.\n"
+        "  호스트에서 다음을 실행한 뒤 다시 기동하세요:\n"
+        f"    mkdir -p {directory} && sudo chown -R 10001:10001 {directory}\n"
+        "  키를 파일로 두지 않을 거라면 LCC_PROMPT_KEY 환경 변수로 넣으세요."
+    )
+
+
 def ensure_master_key(
     keys_dir: Path | str | None,
     *,
@@ -106,6 +128,14 @@ def ensure_master_key(
     환경 변수가 우선이다 — 시크릿 매니저를 쓰는 설치처가 파일을 안 만들 수 있어야 한다.
     디렉터리를 안 주면 만들지 않는다: **키 없이 도는 것은 유효한 구성**이고
     (마스킹본만 저장), 아무 데나 키를 흘려 놓는 것보다 낫다.
+
+    **못 쓰는 디렉터리는 여기서 사람 말로 끝낸다.** 컴포즈가 `./keys` 를 대신 만들면
+    root 소유가 되고, uid 10001 로 도는 컨테이너는 거기 쓰지 못한다. 그대로 두면
+    `PermissionError` 트레이스백을 남기고 죽는데, `restart: unless-stopped` 가
+    그것을 **크래시 루프**로 만든다 — 설치처는 로그가 계속 흐르는 화면만 본다.
+
+    키를 만들기 **전에** 검사한다. 만들고 나서 저장에 실패하면 그 키는 어디에도
+    없이 사라지고, 다음 기동이 다른 키를 만든다.
     """
     env = env if env is not None else os.environ
     if env.get(ENV_MASTER_KEY):
@@ -113,15 +143,26 @@ def ensure_master_key(
     if keys_dir is None:
         return None, None
 
-    path = Path(keys_dir) / "master.key"
+    directory = Path(keys_dir)
+    path = directory / "master.key"
     if path.exists():
         return None, path
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise KeyDirectoryUnwritable(_keys_dir_complaint(directory)) from exc
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise KeyDirectoryUnwritable(_keys_dir_complaint(directory))
+
     key = generate_master_key()
-    path.write_text(key + "\n", encoding="utf-8")
-    # 같은 호스트의 다른 사용자가 읽지 못하게. 컨테이너에서도 의미가 있다.
-    os.chmod(path, 0o600)
+    try:
+        path.write_text(key + "\n", encoding="utf-8")
+        # 같은 호스트의 다른 사용자가 읽지 못하게. 컨테이너에서도 의미가 있다.
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        path.unlink(missing_ok=True)   # 반쯤 쓰인 키 파일을 남기지 않는다
+        raise KeyDirectoryUnwritable(_keys_dir_complaint(directory)) from exc
     return key, path
 
 
