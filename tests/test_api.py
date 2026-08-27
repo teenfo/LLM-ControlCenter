@@ -730,3 +730,136 @@ def test_wrong_method_is_a_structured_error(client, acme):
     response = client.put("/v1/generate", json={}, headers=auth(acme["service"]))
     assert response.status_code == 405
     assert response.json()["code"] == "method_not_allowed"
+
+
+# ── 감사 H3·H4 — 성공 경로 · 적용 여부 ───────────────────────────────────────
+#
+# 감사가 짚은 두 패턴: **핸들러 성공 경로 미호출**(403 만 테스트) 과
+# **저장만 검증하고 적용 미검증**. 둘 다 여기서 막는다.
+
+
+def test_platform_tenant_list_actually_returns(harness, client, acme, globex):
+    """403 만 테스트하면 성공 경로의 500 이 안 드러난다 — 실제로 안 드러났다."""
+    response = client.get("/v1/platform/tenants", headers=auth(acme["platform_admin"]))
+    assert response.status_code == 200
+
+    tenants = {t["id"]: t for t in response.json()["tenants"]}
+    assert {"acme", "globex"} <= set(tenants)
+    # 핸들러가 읽는 컬럼이 전부 실려 있어야 한다. 하나만 빠져도 500 이다.
+    for tenant in tenants.values():
+        assert set(tenant) >= {
+            "id", "name", "locale", "status", "budget_usd_per_month",
+            "rate_limit_per_min", "has_dek", "created_at",
+        }
+
+
+def test_platform_tenant_list_reports_dek_presence(harness, client, acme):
+    body = client.get("/v1/platform/tenants", headers=auth(acme["platform_admin"])).json()
+    acme_row = next(t for t in body["tenants"] if t["id"] == "acme")
+    assert acme_row["has_dek"] is True
+
+
+def test_a_role_override_actually_changes_request_handling(harness, client, acme):
+    """**저장됐는가가 아니라 다음 요청에 반영되는가를 본다.**
+
+    오버라이드는 저장·감사·조회·내보내기까지 전부 동작하면서 요청 처리에는
+    배선되지 않은 죽은 기능이었다. 문서가 있는 죽은 기능이 제일 나쁘다.
+    """
+    long_prompt = "가" * 100
+    ok = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": long_prompt, "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert ok.status_code == 200      # 오버라이드 전에는 통과
+
+    client.put(
+        "/v1/admin/overrides",
+        json={"role": "summarize", "fields": {"max_prompt_chars": 5}},
+        headers=auth(acme["tenant_admin"]),
+    )
+
+    blocked = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": long_prompt, "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert blocked.status_code == 413, "오버라이드가 요청 처리에 반영되지 않았다"
+    assert blocked.json()["limit"] == 5
+
+
+def test_a_role_override_reaches_the_stored_job_snapshot(harness, client, acme):
+    """제출 시점 스냅샷도 오버라이드 값을 담아야 한다 — 재현성의 기준이다."""
+    client.put(
+        "/v1/admin/overrides",
+        json={"role": "summarize", "fields": {"timeout": 7, "options": {"temperature": 0.9}}},
+        headers=auth(acme["tenant_admin"]),
+    )
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+
+    job = harness.store.get_job(TenantScope("acme"), job_id)
+    assert job.timeout_s == 7
+    assert job.options["temperature"] == 0.9
+
+
+def test_an_override_narrowing_placement_is_honored_at_dispatch(harness, client, acme):
+    """배치 티어는 스냅샷 ∩ **현재 설정**이고, 그 현재에는 오버라이드가 포함된다."""
+    client.put(
+        "/v1/admin/overrides",
+        json={"role": "summarize", "fields": {"placement": ["internal"]}},
+        headers=auth(acme["tenant_admin"]),
+    )
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    ).json()["job_id"]
+
+    harness.cluster.drain("in-1")
+    harness.cluster.drain("in-2")
+    drive(harness)
+
+    job = harness.store.get_job(TenantScope("acme"), job_id)
+    assert job.node is None, "내부 티어로 좁혔는데 external 로 나갔다"
+
+
+def test_one_tenants_override_does_not_leak_to_another(harness, client, acme, globex):
+    client.put(
+        "/v1/admin/overrides",
+        json={"role": "summarize", "fields": {"max_prompt_chars": 5}},
+        headers=auth(acme["tenant_admin"]),
+    )
+    theirs = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "가" * 100, "wait": 0},
+        headers=auth(globex["service"]),
+    )
+    assert theirs.status_code == 200, "남의 테넌트 오버라이드가 적용됐다"
+
+
+def test_a_broken_override_row_does_not_kill_the_tenant(harness, client, acme):
+    """**데이터 한 줄 때문에 그 테넌트의 요청이 전부 죽으면 롤백이 더 어려워진다.**"""
+    harness.store.set_role_override(
+        TenantScope("acme"), "summarize", {"kind": "embed"}, updated_by="tester"
+    )
+    response = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code == 200
+
+
+def test_clearing_an_override_restores_the_configured_value(harness, client, acme):
+    client.put(
+        "/v1/admin/overrides",
+        json={"role": "summarize", "fields": {"max_prompt_chars": 5}},
+        headers=auth(acme["tenant_admin"]),
+    )
+    client.request(
+        "DELETE", "/v1/admin/overrides", json={"role": "summarize"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    response = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "가" * 100, "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code == 200

@@ -278,6 +278,31 @@ CREATE TABLE IF NOT EXISTS role_overrides (
     PRIMARY KEY (tenant_id, role)
 );
 
+-- 등록된 노드 선언. **YAML 은 시드이고 여기가 권위다.**
+--
+-- 관제 UI 로 등록한 노드가 여기 없으면 컨테이너 재시작 한 번에 사라진다 —
+-- 그 노드에서 돌던 잡은 복구 후 배치 불가가 되고, 관리자는 증설한 노드가
+-- 왜 없어졌는지 알 수 없다. `node_health` 는 상태 전용이라 선언을 못 담는다.
+--
+-- 테넌트 스코프가 없다. 노드는 **플랫폼 자원**이고 등록도 플랫폼 권한이다.
+CREATE TABLE IF NOT EXISTS nodes (
+    name             TEXT PRIMARY KEY,
+    provider         TEXT NOT NULL,
+    base_url         TEXT,
+    api_key_env      TEXT,
+    auth_header_env  TEXT,
+    data_boundary    TEXT NOT NULL DEFAULT 'external',
+    mem_budget_gb    REAL,
+    max_concurrent   INTEGER NOT NULL DEFAULT 1,
+    tags_json        TEXT NOT NULL DEFAULT '[]',
+    models_json      TEXT NOT NULL DEFAULT '[]',
+    tenant_affinity_json TEXT NOT NULL DEFAULT '[]',
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    metered_override INTEGER,
+    registered_by    TEXT,
+    created_at       REAL NOT NULL
+);
+
 -- 테넌트 관리자가 바꿀 수 있는 설정. 컬럼을 늘리는 대신 키·값으로 둔 이유는,
 -- 설정 항목이 늘 때마다 ADD COLUMN 마이그레이션을 찍는 것이 과하기 때문이다.
 -- **정책의 하한은 여기 없다** — 그건 플랫폼 소유라 YAML 에 있다.
@@ -1273,6 +1298,65 @@ class SqliteStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    # -- 노드 선언 -------------------------------------------------------------
+
+    def save_node(self, declaration: Mapping[str, Any], *, actor: str = "") -> None:
+        """노드 선언을 영속화한다. **재기동해도 살아남아야 한다.**"""
+        self._conn.execute(
+            "INSERT INTO nodes(name, provider, base_url, api_key_env, auth_header_env, "
+            "data_boundary, mem_budget_gb, max_concurrent, tags_json, models_json, "
+            "tenant_affinity_json, enabled, metered_override, registered_by, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "provider=excluded.provider, base_url=excluded.base_url, "
+            "api_key_env=excluded.api_key_env, auth_header_env=excluded.auth_header_env, "
+            "data_boundary=excluded.data_boundary, mem_budget_gb=excluded.mem_budget_gb, "
+            "max_concurrent=excluded.max_concurrent, tags_json=excluded.tags_json, "
+            "models_json=excluded.models_json, "
+            "tenant_affinity_json=excluded.tenant_affinity_json, "
+            "enabled=excluded.enabled, metered_override=excluded.metered_override",
+            (
+                declaration["name"], declaration["provider"], declaration.get("base_url"),
+                declaration.get("api_key_env"), declaration.get("auth_header_env"),
+                declaration.get("data_boundary", "external"),
+                declaration.get("mem_budget_gb"),
+                int(declaration.get("max_concurrent", 1)),
+                _json(list(declaration.get("tags") or ())),
+                _json(list(declaration.get("models") or ())),
+                _json(list(declaration.get("tenant_affinity") or ())),
+                int(bool(declaration.get("enabled", True))),
+                declaration.get("metered_override"),
+                actor, self._now(),
+            ),
+        )
+        self._conn.commit()
+
+    def list_nodes(self) -> list[dict[str, Any]]:
+        """등록된 노드 선언 전부. 기동 시 클러스터가 이것으로 자기를 채운다."""
+        return [
+            {
+                "name": row["name"],
+                "provider": row["provider"],
+                "base_url": row["base_url"],
+                "api_key_env": row["api_key_env"],
+                "auth_header_env": row["auth_header_env"],
+                "data_boundary": row["data_boundary"],
+                "mem_budget_gb": row["mem_budget_gb"],
+                "max_concurrent": row["max_concurrent"],
+                "tags": json.loads(row["tags_json"]),
+                "models": json.loads(row["models_json"]),
+                "tenant_affinity": json.loads(row["tenant_affinity_json"]),
+                "enabled": bool(row["enabled"]),
+                "metered_override": row["metered_override"],
+            }
+            for row in self._conn.execute("SELECT * FROM nodes ORDER BY name")
+        ]
+
+    def delete_node(self, name: str) -> bool:
+        cur = self._conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
     # -- 테넌트 설정 -----------------------------------------------------------
 
     def set_tenant_setting(self, scope: TenantScope, key: str, value: Any) -> None:
@@ -1438,7 +1522,10 @@ class SqliteStore:
         self.audit(scope.actor, "list_tenants", detail={"reason": scope.reason})
         return list(
             self._conn.execute(
-                "SELECT id, name, locale, status, budget_usd_per_month, created_at "
+                # 호출부가 읽는 컬럼을 전부 담는다. 빠뜨리면 sqlite3.Row 키 오류로
+                # 500 이 되고, 목록 조회는 성공 경로 테스트가 없으면 안 드러난다.
+                "SELECT id, name, locale, status, budget_usd_per_month, "
+                "rate_limit_per_min, dek_wrapped, created_at "
                 "FROM tenants WHERE purged_at IS NULL ORDER BY created_at"
             )
         )

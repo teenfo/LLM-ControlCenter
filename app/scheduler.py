@@ -31,6 +31,7 @@ from .cluster import FAIL, WAIT, Cluster, Placement
 from .config import EXTERNAL, Config
 from .cost import CostAccountant
 from .models import ModelRegistrar
+from .roles import RoleResolver, resolver_for
 from .providers import BackendError
 from .store import SqliteStore, TenantScope
 
@@ -61,8 +62,10 @@ class Scheduler:
         now: Callable[[], float] = time.time,
         notify: Callable[[str, dict[str, Any]], None] | None = None,
         notifier: Any = None,
+        resolver: RoleResolver | None = None,
     ) -> None:
         self._config = config
+        self._roles = resolver_for(config, store, resolver)
         self._store = store
         self._cluster = cluster
         self._accountant = accountant or CostAccountant(config.pricing, store, now=now)
@@ -184,7 +187,10 @@ class Scheduler:
 
     async def _try_dispatch(self, job: Any, lane: str) -> bool:
         scope = TenantScope(job.tenant_id)
-        role = self._config.roles.get(job.role)
+        # **현재 설정**을 읽는다. 배치 티어는 스냅샷 ∩ 현재이고, 그 "현재" 에는
+        # 테넌트 오버라이드가 포함된다 — 안 그러면 오버라이드로 좁힌 배치가
+        # 디스패치에서 무시된다.
+        role = self._roles.get(job.tenant_id, job.role)
         if role is None:
             self._fail(scope, job, "unknown_role", f"역할 {job.role} 이 없다")
             return False
@@ -258,7 +264,7 @@ class Scheduler:
 
             state = self._cluster.state(placement.node)
             provider = state.provider
-            role = self._config.roles[job.role]
+            role = self._roles.get(job.tenant_id, job.role) or self._config.roles[job.role]
 
             # 경계 밖으로 나가면 더 강하게 마스킹된 변형을 보낸다.
             # 한 벌만 저장했다면 이 구분이 여기서 사라진다.

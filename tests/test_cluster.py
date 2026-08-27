@@ -598,3 +598,93 @@ def test_snapshot_exposes_boundary_and_load(cluster):
 def test_metered_nodes_are_identified_for_crash_recovery(cluster):
     """크래시 복구가 이중 청구를 피하려면 어느 노드가 과금인지 알아야 한다."""
     assert cluster.metered_nodes() == ("out-1",)
+
+
+# ── 감사 H5 — 노드 선언 영속화 ───────────────────────────────────────────────
+
+
+async def test_a_registered_node_survives_a_restart(tmp_path, clock):
+    """**메모리에만 두면 컨테이너 재시작 한 번에 사라진다.**
+
+    그 노드에서 돌던 잡은 복구 후 배치 불가가 되고, 관리자는 증설한 노드가 왜
+    없어졌는지 알 수 없다. `config/nodes.yaml` 의 "이후로는 DB 가 권위다" 주석은
+    구현되지 않은 약속이었다.
+    """
+    from app.store import SqliteStore
+
+    path = tmp_path / "cc.db"
+    config = two_tier_config()
+
+    store = SqliteStore(path, now=clock)
+    first = Cluster(config, store, now=clock)
+    await first.register_node(
+        {"name": "added-later", "provider": "mock", "data_boundary": "internal",
+         "max_concurrent": 3, "tags": ["internal"], "models": ["m"]},
+        actor="platform_admin",
+    )
+    assert "added-later" in first.nodes
+    store.close()
+
+    # 재기동
+    reopened = SqliteStore(path, now=clock)
+    try:
+        second = Cluster(config, reopened, now=clock)
+        assert "added-later" in second.nodes, "등록한 노드가 재기동에서 사라졌다"
+
+        node = second.nodes["added-later"].node
+        assert node.data_boundary == "internal"
+        assert node.max_concurrent == 3
+        assert node.tags == ("internal",)
+    finally:
+        reopened.close()
+
+
+async def test_the_database_wins_over_the_yaml_seed(tmp_path, clock):
+    """YAML 은 시드다. 관제 UI 에서 고친 값이 재기동마다 되돌아가면 안 된다."""
+    from app.store import SqliteStore
+
+    path = tmp_path / "cc.db"
+    config = two_tier_config()
+    seeded = next(iter(config.nodes))
+
+    store = SqliteStore(path, now=clock)
+    before = Cluster(config, store, now=clock)
+    assert before.nodes[seeded].node.max_concurrent == config.nodes[seeded].max_concurrent
+    # 시드 노드와 같은 이름을 다른 용량으로 다시 등록한다(관리자가 증설한 상황).
+    store.save_node(
+        {"name": seeded, "provider": "mock", "data_boundary": "internal",
+         "max_concurrent": 9, "tags": ["internal"], "models": ["m"]},
+        actor="platform_admin",
+    )
+    store.close()
+
+    reopened = SqliteStore(path, now=clock)
+    try:
+        restarted = Cluster(config, reopened, now=clock)
+        assert restarted.nodes[seeded].node.max_concurrent == 9
+    finally:
+        reopened.close()
+
+
+async def test_a_broken_node_row_does_not_stop_startup(tmp_path, clock):
+    """노드 한 줄이 깨졌다고 컨트롤 플레인이 안 뜨면 그 줄을 고칠 방법도 없어진다."""
+    from app.store import SqliteStore
+
+    path = tmp_path / "cc.db"
+    config = two_tier_config()
+
+    store = SqliteStore(path, now=clock)
+    store._conn.execute(
+        "INSERT INTO nodes(name, provider, data_boundary, max_concurrent, created_at) "
+        "VALUES('broken', 'mock', '경계가아님', 1, 0)"
+    )
+    store._conn.commit()
+    store.close()
+
+    reopened = SqliteStore(path, now=clock)
+    try:
+        cluster = Cluster(config, reopened, now=clock)     # 예외 없이 뜬다
+        assert "broken" not in cluster.nodes
+        assert cluster.nodes, "시드 노드까지 사라졌다"
+    finally:
+        reopened.close()

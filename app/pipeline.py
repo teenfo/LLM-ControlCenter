@@ -29,6 +29,7 @@ from .evals import Evaluator
 from .guard import Guard, GuardResult
 from .i18n import ApiError, guard_pack_for
 from .identity import hash_end_user, hash_prompt, hash_system, looks_like_pii
+from .roles import RoleResolver, resolver_for
 from .store import SqliteStore, TenantScope
 
 DEFAULT_WAIT_SECONDS = 30.0
@@ -98,9 +99,13 @@ class Pipeline:
         limiter: RateLimiter | None = None,
         accountant: CostAccountant | None = None,
         evaluator: Evaluator | None = None,
+        resolver: RoleResolver | None = None,
         now: Callable[[], float] = time.time,
     ) -> None:
         self._config = config
+        # 역할 해석은 한 곳에서만 한다 — 파이프라인과 스케줄러가 각자 읽으면
+        # 한쪽만 오버라이드를 반영하는 조합이 생긴다.
+        self._roles = resolver_for(config, store, resolver)
         self._store = store
         self._cluster = cluster
         self._guard = guard
@@ -123,7 +128,7 @@ class Pipeline:
         if service is None or service["status"] != "active":
             raise ApiError("unauthorized", status=401)
 
-        role = self._config.roles.get(role_name)
+        role = self._roles.get(principal.tenant_id, role_name)
         if role is None or not is_public_role(role_name):
             # 내부 역할은 소비자에게 **존재하지 않는다.** `allow_roles` 검사보다 먼저
             # 걸러야 403 과 404 로 존재 여부가 새지 않는다.
@@ -660,6 +665,8 @@ class Pipeline:
         실패는 예외로 던진다 — `Guard` 가 그것을 `classifier_failed` 로 받아
         `on_classifier_error` 정책을 태운다. **분류 실패는 "민감하지 않음" 판정이 아니다.**
         """
+        # 가드 역할은 **플랫폼 소유다.** 테넌트 오버라이드를 태우지 않는다 —
+        # 테넌트가 자기 분류기의 타임아웃이나 배치를 바꿀 수 있으면 안 된다.
         role = self._config.roles.get(GUARD_ROLE)
 
         async def classify(text: str, rules: Sequence[GuardRule]) -> set[str]:

@@ -144,12 +144,42 @@ class Cluster:
         # 확인과 차감 사이에 다른 코루틴이 끼어들면 원자성이 깨진다.
         self._lock = threading.Lock()
 
+        # **YAML 은 시드이고 DB 가 권위다.** 순서가 중요하다 — 시드를 먼저 깔고
+        # DB 선언으로 덮는다. 반대로 하면 관제 UI 에서 고친 노드가 재기동 때마다
+        # YAML 값으로 되돌아간다.
         self._nodes: dict[str, NodeState] = {}
         for name, node in config.nodes.items():
-            provider = (providers or {}).get(name) or build_provider(node)
-            self._nodes[name] = NodeState(node=node, provider=provider)
+            self._install(node, providers)
+        for declaration in self._load_declarations():
+            self._install(declaration, providers)
 
         self._model_sizes = {e.name: e.est_size_gb for e in config.catalog}
+
+    def _install(
+        self, node: Node, providers: Mapping[str, Provider] | None = None
+    ) -> NodeState:
+        provider = (providers or {}).get(node.name) or build_provider(node)
+        state = NodeState(node=node, provider=provider)
+        self._nodes[node.name] = state
+        return state
+
+    def _load_declarations(self) -> list[Node]:
+        """DB 에 저장된 노드 선언. **읽기 실패가 기동을 막지 않는다.**
+
+        노드 한 줄이 깨졌다고 컨트롤 플레인이 안 뜨면 그 줄을 고칠 방법도 없어진다.
+        """
+        found: list[Node] = []
+        try:
+            rows = self._store.list_nodes()
+        except Exception:
+            return found
+        for row in rows:
+            name = row.pop("name", "")
+            try:
+                found.append(node_from_dict(name, row))
+            except ConfigError:
+                continue
+        return found
 
     # -- 조회 -----------------------------------------------------------------
 
@@ -480,8 +510,23 @@ class Cluster:
             # 설정에 남아 있는데 조용히 실패하는 것이 최악이다. 등록에서 거절한다.
             raise ApiError("airgap_cloud_disabled", status=400)
 
-        state = NodeState(node=node, provider=build_provider(node))
-        self._nodes[node.name] = state
+        # **먼저 영속화한다.** 메모리에만 두면 재기동 한 번에 사라지고,
+        # 그 노드에서 돌던 잡은 복구 후 배치 불가가 된다.
+        self._store.save_node(
+            {
+                "name": node.name, "provider": node.provider,
+                "base_url": node.base_url, "api_key_env": node.api_key_env,
+                "auth_header_env": node.auth_header_env,
+                "data_boundary": node.data_boundary,
+                "mem_budget_gb": node.mem_budget_gb,
+                "max_concurrent": node.max_concurrent,
+                "tags": list(node.tags), "models": list(node.models),
+                "tenant_affinity": list(node.tenant_affinity),
+                "enabled": node.enabled, "metered_override": node.metered_override,
+            },
+            actor=actor or "platform_admin",
+        )
+        state = self._install(node)
         self._store.audit(
             actor or "platform_admin", "register_node", target=node.name,
             detail={
