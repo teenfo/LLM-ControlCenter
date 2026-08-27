@@ -591,17 +591,18 @@ class SqliteStore:
 
     **다중 워커는 지원 구성이다** — API 워커 N 개 + 스케줄러 싱글턴이 같은 호스트에서
     이 파일을 공유한다. 계약 전문은 `docs/architecture.md` §11 에 있고, 이 저장소가
-    지는 몫은 셋이다:
+    지는 몫은 넷이다:
 
     1. 잡 상태 전이는 `update_job(..., expect_status=...)` **CAS 로만** 한다.
        진 쪽은 갱신하지 않고 `False` 를 받는다.
-    2. 다중 문장 쓰기는 `_tx()` 안에서만 — 실패하면 되돌린다.
-    3. 테넌트 조건은 `_scoped_where()` 한 곳에서만 붙는다.
+    2. 노드 용량은 `node_leases` 가 지킨다. `try_acquire_node_lease()` 가 쓰기
+       트랜잭션 안에서 용량을 재확인하며 삽입한다 — 진 쪽은 `False` 를 받는다.
+    3. 다중 문장 쓰기는 `_tx()` 안에서만 — 실패하면 되돌린다.
+    4. 테넌트 조건은 `_scoped_where()` 한 곳에서만 붙는다.
 
-    **다만 이 계약을 다중 프로세스에서 검증한 테스트가 아직 없다.** 지원한다고
-    적어 두고 검증하지 않는 것이 애초에 이 문단을 쓰게 만든 결함이므로, 그 사실을
-    같이 적는다. 슬롯·메모리 예약이 프로세스 로컬인 것(`cluster.place()`)도
-    이 계약 밖이다 — 부채 표 참고.
+    **이 계약은 다중 프로세스에서 검증됐다** — `tests/test_multiprocess.py` 가 진짜
+    프로세스로 CAS·롤백·슬롯 장부·리스 만료를 잰다. 한동안 이 독스트링은 검증 없이
+    지원을 단언했고, 그것이 설계 감사에서 지적된 결함이었다.
     """
 
     def __init__(
@@ -1883,6 +1884,50 @@ class SqliteStore:
             (scope.tenant_id,),
         ).fetchone()
         return row["dek_wrapped"] if row else None
+
+    # -- KEK 회전 -------------------------------------------------------------
+
+    def wrapped_deks(self) -> dict[str, bytes]:
+        """살아 있는 테넌트의 래핑된 DEK 전부. **회전이 훑는 목록이다.**
+
+        `dek_wrapped IS NULL` 인 행은 안 담는다. 그런 테넌트는 둘 중 하나인데
+        둘 다 회전의 대상이 아니다 — KEK 없이 기동해 원문 보관이 꺼져 있거나,
+        파기돼 DEK 가 지워졌거나. 목록에 담으면 회전이 "풀 수 없는 DEK 를 만났다"
+        고 멈추고, 그 멈춤은 사고가 아닌데 사고처럼 보인다.
+
+        **테넌트 스코프가 없다.** 회전은 플랫폼 운영이고 전 테넌트를 가로지른다.
+        """
+        return {
+            row["id"]: row["dek_wrapped"]
+            for row in self._conn.execute(
+                "SELECT id, dek_wrapped FROM tenants "
+                "WHERE purged_at IS NULL AND dek_wrapped IS NOT NULL"
+            )
+        }
+
+    def replace_wrapped_deks(self, rewrapped: Mapping[str, bytes], *, actor: str) -> int:
+        """새 래핑을 **한 트랜잭션으로** 쓴다.
+
+        절반만 쓰이면 그 테넌트들은 **어느 키로도 안 열린다** — 옛 키는 새로 감싼
+        쪽을, 새 키는 아직 옛 것인 쪽을 못 푼다. 이 저장소에서 원자성이 데이터
+        손실과 직결되는 몇 안 되는 자리다.
+
+        감사도 같은 커밋 안이다. 회전이 됐는데 기록이 없거나 그 반대면, 유출 대응을
+        되짚는 사람이 무엇이 사실인지 판단할 근거를 잃는다. `audit()` 이 자기
+        트랜잭션을 커밋하므로 마지막에 두면 래핑 교체와 기록이 함께 나간다.
+        """
+        with self._tx():
+            for tenant_id, wrapped in rewrapped.items():
+                self._conn.execute(
+                    "UPDATE tenants SET dek_wrapped = ? "
+                    "WHERE id = ? AND purged_at IS NULL",
+                    (wrapped, tenant_id),
+                )
+            self.audit(
+                actor, "rotate_master_kek",
+                detail={"tenants": sorted(rewrapped)},
+            )
+        return len(rewrapped)
 
     # -- 테넌트 가드 규칙 ------------------------------------------------------
 

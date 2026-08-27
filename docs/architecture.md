@@ -418,6 +418,7 @@ HTTP (Starlette)                                              main.py · meta.py
 설치        부트스트랩 · CLI · 백업 스냅샷 · 복원              bootstrap.py · cli.py ·
                                                               backup.py · restore.py ·
                                                               cli_paths.py
+키 회전      마스터 KEK 교체 — 중단돼도 두 키가 디스크에 남는다  keyrotation.py
 설정                                                          config.py · i18n.py
 ```
 

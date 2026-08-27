@@ -131,7 +131,7 @@ class KeyVault:
         nonce = secrets.token_bytes(NONCE_BYTES)
         return nonce + self._kek.encrypt(nonce, dek, None)
 
-    def _unwrap(self, wrapped: bytes | None) -> AESGCM:
+    def _unwrap_bytes(self, wrapped: bytes | None) -> bytes:
         if self._kek is None:
             raise CryptoError("마스터 KEK 가 없다")
         if not wrapped:
@@ -139,9 +139,45 @@ class KeyVault:
             raise KeyDestroyed("이 테넌트의 DEK 가 폐기됐다")
         nonce, blob = wrapped[:NONCE_BYTES], wrapped[NONCE_BYTES:]
         try:
-            return AESGCM(self._kek.decrypt(nonce, blob, None))
+            return self._kek.decrypt(nonce, blob, None)
         except InvalidTag as exc:
             raise CryptoError("DEK 를 풀 수 없다 — 마스터 KEK 가 다르다") from exc
+
+    def _unwrap(self, wrapped: bytes | None) -> AESGCM:
+        return AESGCM(self._unwrap_bytes(wrapped))
+
+    # -- KEK 회전 -------------------------------------------------------------
+
+    def rewrap(self, wrapped_dek: bytes | None, new_vault: "KeyVault") -> bytes:
+        """이 금고의 KEK 로 감싼 DEK 를 **다른 금고의 KEK 로 다시 감싼다.**
+
+        **암호문은 건드리지 않는다.** 프롬프트·응답은 DEK 로 봉인돼 있고 DEK 자체는
+        안 바뀌므로, KEK 회전은 테넌트 행 하나씩의 래핑 교체로 끝난다. 저장된
+        암호문이 몇 기가바이트든 재암호화가 없다.
+
+        유출 의심 상황에서 이 사실을 그 자리에서 알아내는 것은 최악의 시점이다 —
+        그래서 절차를 코드로 두고 `docs/runbook-key-compromise.md` 가 그것을 가리킨다.
+
+        평문 DEK 는 이 함수 안에서만 존재한다. 돌려주는 것은 새로 감싼 바이트다.
+        """
+        if not new_vault.enabled:
+            raise CryptoError("새 마스터 KEK 가 없다")
+        dek = self._unwrap_bytes(wrapped_dek)
+        nonce = secrets.token_bytes(NONCE_BYTES)
+        return nonce + new_vault._kek.encrypt(nonce, dek, None)  # type: ignore[union-attr]
+
+    def can_open(self, wrapped_dek: bytes | None) -> bool:
+        """이 KEK 로 그 DEK 를 풀 수 있는가. **검증 전용 — 예외 대신 참·거짓.**
+
+        회전 전후로 전 테넌트를 훑는 데 쓴다. 훑는 쪽이 매번 예외를 잡게 하면
+        `KeyDestroyed`(정상)와 `CryptoError`(사고)를 구분하는 책임이 호출자마다
+        복제되고, 언젠가 한 곳이 그것을 뭉갠다.
+        """
+        try:
+            self._unwrap_bytes(wrapped_dek)
+        except CryptoError:
+            return False
+        return True
 
     # -- 봉인·해제 ------------------------------------------------------------
 

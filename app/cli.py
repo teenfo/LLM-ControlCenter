@@ -31,9 +31,15 @@ from .bootstrap import (
 from .cluster import Cluster
 from .config import Config, ConfigError, load_config, validate_cross_references
 from .cost import CostAccountant
-from .crypto import KeyVault
+from .crypto import CryptoError, KeyVault
 from .evals import Evaluator
 from .guard import Guard
+from .keyrotation import (
+    RotationRefused,
+    interrupted as interrupted_rotation,
+    rotate_master_kek,
+    vault_from_file,
+)
 from .i18n import Translator
 from .models import ModelRegistrar
 from .notify import Notifier, channels_from_env
@@ -224,6 +230,48 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         notes.append("마스터 KEK 없음 — 마스킹본만 저장됩니다.")
 
+    # **키가 있다는 것과 그 키가 맞는다는 것은 다르다.**
+    #
+    # 예전에는 위 한 줄이 전부였다. 키 파일을 잘못 바꾼 설치처는 사용자가 원문을
+    # 열려는 순간에야 알게 되고, 그 증상은 "복호화 실패" 로만 보여서 원인을 찾는 데
+    # 한참 걸린다. 진단은 그 순간보다 먼저 와야 한다.
+    wrapped = store.wrapped_deks() if vault.enabled else {}
+    unopenable = sorted(t for t, w in wrapped.items() if not vault.can_open(w))
+
+    stale = interrupted_rotation(keys_dir)
+    if stale:
+        # **어느 쪽이 사실인지 사람에게 묻지 않는다 — 열어 보면 안다.**
+        #
+        # "DB 가 새 키로 감싸여 있다면 이렇게 하세요" 라고만 적으면, 그 판단을
+        # 유출 대응 중인 운영자에게 떠넘기는 것이다. 틀리면 어떤 키로도 못 여는
+        # 상태가 되므로 진단이 대신 판정한다.
+        staged_vault = vault_from_file(stale)
+        staged_opens = bool(wrapped) and staged_vault is not None and all(
+            staged_vault.can_open(w) for w in wrapped.values()
+        )
+        if staged_opens:
+            problems.append(
+                f"KEK 회전이 파일 교체 직전에 중단됐습니다: {stale}\n"
+                "    DB 는 이미 **새 키**로 감싸여 있습니다. 그 파일을 제자리로 옮기세요:\n"
+                f"      mv {stale} {keys_dir / 'master.key'}"
+            )
+        else:
+            problems.append(
+                f"중단된 KEK 회전의 잔여 파일이 있습니다: {stale}\n"
+                "    DB 는 아직 **현재 키**로 감싸여 있습니다 — 회전은 반영되지 않았습니다.\n"
+                f"      rm {stale}    # 그 뒤 다시 `rotate-kek`"
+            )
+
+    if unopenable:
+        problems.append(
+            f"현재 마스터 KEK 로 열리지 않는 테넌트 {len(unopenable)}개: "
+            f"{', '.join(unopenable[:5])}"
+            f"{' …' if len(unopenable) > 5 else ''}\n"
+            "    키를 바꿨다면 되돌리세요. 회전하려면 `rotate-kek` 를 쓰세요."
+        )
+    elif wrapped:
+        notes.append(f"KEK 검증 OK — 테넌트 {len(wrapped)}개의 DEK 를 모두 풉니다")
+
     if store.platform_setting(GRACE_KEY, False):
         warnings.append(
             "가드 유예 모드가 켜져 있습니다 — 차단 규칙이 실제로 막지 않습니다. "
@@ -285,6 +333,59 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"\n진단 통과 — 확인이 필요한 항목 {len(warnings)}건")
     else:
         print("\n진단 통과")
+    return 0
+
+
+def cmd_rotate_kek(args: argparse.Namespace) -> int:
+    """마스터 KEK 회전. **암호문은 재암호화하지 않는다** — 래핑만 바꾼다.
+
+    절차와 각 단계의 근거는 `app/keyrotation.py` 와
+    `docs/runbook-key-compromise.md` 에 있다. 여기서는 사람과 말을 주고받는 몫만 한다.
+    """
+    data_dir = Path(args.data or DEFAULT_DATA_DIR)
+    keys_dir = Path(args.keys or DEFAULT_KEYS_DIR)
+    db_path = data_dir / "controlcenter.db"
+
+    if not db_path.exists():
+        print(f"DB 가 없습니다: {db_path}", file=sys.stderr)
+        return 2
+
+    store = SqliteStore(db_path)
+    try:
+        vault = KeyVault(load_master_key_from(keys_dir))
+        tenants = len(store.wrapped_deks()) if vault.enabled else 0
+
+        if not args.yes:
+            print(f"테넌트 {tenants}개의 DEK 래핑을 새 마스터 KEK 로 교체합니다.")
+            print(f"  키 디렉터리  {keys_dir}")
+            print("  저장된 프롬프트·응답 암호문은 재암호화하지 않습니다.")
+            print("  옛 키는 지우지 않고 밀어 둡니다 — 서비스 확인 뒤 직접 파기하세요.")
+            if input("진행할까요? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("취소했습니다. 아무것도 바뀌지 않았습니다.")
+                return 1
+
+        new_key = os.environ.get(args.new_key_env) or None
+        result = rotate_master_kek(
+            store, keys_dir=keys_dir, old_vault=vault, new_key=new_key,
+            actor=f"cli:{os.environ.get('USER', 'unknown')}",
+        )
+    except (RotationRefused, CryptoError) as exc:
+        print(f"회전 중단: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+    print(f"\n  회전 완료 — 테넌트 {result.tenants}개")
+    print(f"  새 키       {result.new_key_path}")
+    if result.retired_key_path:
+        print(f"  옛 키       {result.retired_key_path}  ← 확인 뒤 파기하세요")
+    if result.generated_key:
+        # **여기서만 표시한다.** 부트스트랩이 마스터 KEK 를 1회만 표시하는 것과 같은
+        # 규칙이다. 운영자가 준 키(환경 변수)는 절대 되찍지 않는다 — 남의 시크릿
+        # 매니저에서 온 값을 이쪽 로그에 흘리는 것이 되기 때문이다.
+        print(f"\n  새 마스터 KEK  {result.generated_key}")
+        print("  이 값은 여기서만 표시됩니다. 백업과 **다른 곳에** 보관하세요.")
+    print("\n  다음: 워커를 새 키로 재기동한 뒤 `doctor` 로 확인하세요.")
     return 0
 
 
@@ -351,6 +452,27 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--probe", action="store_true", help="노드 도달성까지 확인")
     doctor.add_argument("--bundle", help="진단 번들을 이 경로에 쓴다")
     doctor.set_defaults(func=cmd_doctor)
+
+    rotate = sub.add_parser(
+        "rotate-kek",
+        help="마스터 KEK 를 회전한다 (암호문 재암호화 없음)",
+        description=(
+            "테넌트 DEK 의 래핑만 새 KEK 로 교체합니다. 저장된 프롬프트·응답 "
+            "암호문은 건드리지 않으므로 데이터 양과 무관하게 빠릅니다.\n"
+            "절차와 되돌리기는 docs/runbook-key-compromise.md 를 보세요."
+        ),
+    )
+    # **새 키를 인자로 안 받는다.** argv 는 같은 호스트의 다른 사용자에게 `ps` 로
+    # 보이고 셸 히스토리에도 남는다. 시크릿 매니저를 쓰는 설치처는 환경 변수로 준다.
+    rotate.add_argument(
+        "--new-key-env", default="LCC_PROMPT_KEY_NEW",
+        help="새 KEK 를 담은 환경 변수 이름. 비어 있으면 새로 만든다",
+    )
+    rotate.add_argument(
+        "--yes", action="store_true",
+        help="확인 프롬프트를 건너뛴다. 무인 실행용",
+    )
+    rotate.set_defaults(func=cmd_rotate_kek)
 
     return parser
 
