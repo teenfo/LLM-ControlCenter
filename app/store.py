@@ -25,6 +25,15 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 SCHEMA_VERSION = 1
 
+#: 예산 롤링 창(일). 달력 월이 아니라 롤링인 이유는 설치처의 시간대·회계 월을
+#: 모르는데 달력 월을 가정하면 월초에 예산이 통째로 리셋되는 절벽이 생기기 때문이다.
+#:
+#: **보존 정리가 이 창을 침범하면 안 된다.** 사용량 행이 창보다 먼저 지워지면
+#: `spend_since` 가 조용히 과소 계상하고 예산이 남은 것처럼 보인다 — 두 값이
+#: 우연히 둘 다 30일이라 지금까지 안 드러났을 뿐이다. 여기 두는 이유는 이 모듈이
+#: 어느 앱 모듈도 임포트하지 않는 바닥 레이어이기 때문이다.
+BUDGET_WINDOW_DAYS = 30
+
 #: 한 문장에 넣을 파라미터 상한. SQLite 의 실제 상한은 빌드에 따라 999~32766 인데,
 #: 넘으면 `too many SQL variables` 로 **문장 전체가** 실패한다. 보수적으로 잡는다 —
 #: 쪼개는 비용은 무시할 만하고, 넘쳐서 실패하는 쪽은 파기가 안 되는 사고다.
@@ -58,6 +67,9 @@ RETAINABLE_STATUSES = TERMINAL_STATUSES
 #: 같은 관리자의 같은 **읽기 전용** 조회를 이 안에서는 한 줄로 합친다.
 #: 관제 대시보드 폴링이 감사 테이블을 무한 증식시키던 것을 막는다.
 AUDIT_COALESCE_SECONDS = 300.0
+
+#: 검토를 마친 가드 이벤트의 보존. 승격 게이트의 표본이므로 잡보다 길다.
+REVIEWED_EVENT_RETENTION_DAYS = 180
 
 #: 감사 보존. 잡보다 길게 둔다(규제 대응) — 다만 상한은 있어야 한다.
 AUDIT_RETENTION_DAYS = 365
@@ -674,9 +686,16 @@ class SqliteStore:
         ).fetchone()
 
     def touch_token(self, token_id: str) -> None:
-        self._conn.execute(
-            "UPDATE tokens SET last_used_at = ? WHERE id = ?", (self._now(), token_id)
-        )
+        """마지막 사용 시각. **커밋한다.**
+
+        커밋 없는 쓰기는 열린 트랜잭션으로 남아 다음 커밋까지 WAL 쓰기 락을
+        붙잡는다. 요청마다 일어나는 쓰기라서, 다중 프로세스 구성에서는 그
+        붙잡음이 스케줄러의 쓰기를 기다리게 만든다.
+        """
+        with self._tx():
+            self._conn.execute(
+                "UPDATE tokens SET last_used_at = ? WHERE id = ?", (self._now(), token_id)
+            )
 
     def set_token_expiry(
         self, scope: TenantScope, token_id: str, expires_at: float | None
@@ -896,7 +915,9 @@ class SqliteStore:
 
     # -- 크래시 복구 ----------------------------------------------------------
 
-    def recover_running_jobs(self, metered_nodes: Iterable[str]) -> dict[str, int]:
+    def recover_running_jobs(
+        self, metered_nodes: Iterable[str], *, max_retries: int | None = None
+    ) -> dict[str, int]:
         """기동 시 `running` 으로 남은 잡을 정리한다.
 
         단일 백엔드 시절에는 전부 `queued` 로 되돌리면 됐다. 클러스터에서는 다르다 —
@@ -908,15 +929,27 @@ class SqliteStore:
         막지는 못하고 **드러내기만** 한다.
         """
         metered = set(metered_nodes)
-        requeued = reviewed = 0
+        requeued = reviewed = exhausted = 0
 
-        rows = list(self._conn.execute("SELECT id, node FROM jobs WHERE status='running'"))
+        rows = list(
+            self._conn.execute("SELECT id, node, attempts FROM jobs WHERE status='running'")
+        )
 
         # **한 트랜잭션이다.** 절반만 복구된 상태로 기동하면 나머지는 `running` 인
         # 채 남아 영원히 아무도 안 건드린다 — 크래시 복구가 그 자체로 사고가 된다.
         with self._tx():
             for row in rows:
-                if row["node"] in metered:
+                # **재큐도 시도다.** 이 경로가 max_retries 를 안 보면, 기동할
+                # 때마다 죽는 잡이 영원히 재큐된다 — 크래시 루프에 빠진 노드가
+                # 있으면 그 잡들이 매 기동 재시도되며 계속 자원을 먹는다.
+                if max_retries is not None and row["attempts"] + 1 > max_retries:
+                    self._conn.execute(
+                        "UPDATE jobs SET status='failed', error_code='max_retries', "
+                        "wait_reason='crash_recovery_exhausted', finished_at=? WHERE id=?",
+                        (self._now(), row["id"]),
+                    )
+                    exhausted += 1
+                elif row["node"] in metered:
                     self._conn.execute(
                         "UPDATE jobs SET status='needs_review', "
                         "error_code='possible_double_execution', "
@@ -932,7 +965,7 @@ class SqliteStore:
                     )
                     requeued += 1
 
-        return {"requeued": requeued, "needs_review": reviewed}
+        return {"requeued": requeued, "needs_review": reviewed, "exhausted": exhausted}
 
     # -- 사용량·가드 이벤트 ---------------------------------------------------
 
@@ -1850,12 +1883,43 @@ class SqliteStore:
     # -- 레이트리밋 카운터 -----------------------------------------------------
 
     def bump_rate_counter(self, key: str, bucket: int) -> None:
-        self._conn.execute(
-            "INSERT INTO rate_counters(key, bucket, count) VALUES(?,?,1) "
-            "ON CONFLICT(key, bucket) DO UPDATE SET count = count + 1",
-            (key, bucket),
-        )
-        self._conn.commit()
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO rate_counters(key, bucket, count) VALUES(?,?,1) "
+                "ON CONFLICT(key, bucket) DO UPDATE SET count = count + 1",
+                (key, bucket),
+            )
+
+    def consume_rate_slots(
+        self, checks: Sequence[tuple[str, str, int]], bucket: int, since_bucket: int
+    ) -> str | None:
+        """세 단계를 **한 트랜잭션 안에서** 전부 검사하고 전부 증가시킨다.
+
+        걸린 단계의 이름을 돌려주고, 통과하면 `None`.
+
+        검사와 증가가 분리돼 있으면 동시 요청이 둘 다 통과한 뒤 둘 다 증가해서
+        한도를 조금 넘긴다. 그리고 단계마다 따로 소비하면 3단계에서 걸렸을 때
+        1·2단계는 이미 늘어난 채로 남아 **안 받은 요청이 한도를 먹는다.**
+        전부 아니면 전무여야 한다.
+
+        SQLite 는 단일 라이터라 이 구간이 직렬화된다.
+        """
+        with self._tx():
+            for scope_name, key, limit in checks:
+                row = self._conn.execute(
+                    "SELECT COALESCE(SUM(count), 0) AS n FROM rate_counters "
+                    "WHERE key = ? AND bucket >= ?",
+                    (key, since_bucket),
+                ).fetchone()
+                if int(row["n"]) >= limit:
+                    return scope_name
+            for _, key, _ in checks:
+                self._conn.execute(
+                    "INSERT INTO rate_counters(key, bucket, count) VALUES(?,?,1) "
+                    "ON CONFLICT(key, bucket) DO UPDATE SET count = count + 1",
+                    (key, bucket),
+                )
+        return None
 
     def rate_count(self, key: str, since_bucket: int) -> int:
         row = self._conn.execute(
@@ -1955,9 +2019,26 @@ class SqliteStore:
                 "AND finished_at IS NOT NULL AND finished_at < ?",
                 (*statuses, job_cutoff),
             ).rowcount
-            usage = self._conn.execute("DELETE FROM usage WHERE ts < ?", (job_cutoff,)).rowcount
+            # **예산 창 안의 사용량은 보존 설정보다 우선한다.**
+            #
+            # 잡 보존을 14일로 줄이면 30일 롤링 예산이 `spend_since` 에서 절반을
+            # 잃고, 예산이 남은 것처럼 보인다. 지금까지 둘 다 30일이라 우연히
+            # 안 드러났을 뿐이고, 한쪽 상수만 바뀌면 조용히 깨진다.
+            usage_cutoff = min(job_cutoff, now - BUDGET_WINDOW_DAYS * 86400)
+            usage = self._conn.execute(
+                "DELETE FROM usage WHERE ts < ?", (usage_cutoff,)
+            ).rowcount
+
+            # **검토를 마친 가드 이벤트는 오래 둔다.** 그것이 승격 게이트의
+            # 표본이다 — 잡과 같은 주기로 지우면 승격 가능하던 규칙이 표본 부족으로
+            # 되돌아가고, 관리자는 어제 되던 것이 왜 안 되는지 알 수 없다.
             events = self._conn.execute(
-                "DELETE FROM filter_events WHERE ts < ?", (job_cutoff,)
+                "DELETE FROM filter_events WHERE ts < ? AND reviewed = 0",
+                (job_cutoff,),
+            ).rowcount
+            events += self._conn.execute(
+                "DELETE FROM filter_events WHERE ts < ? AND reviewed = 1",
+                (now - REVIEWED_EVENT_RETENTION_DAYS * 86400,),
             ).rowcount
 
             # **감사와 평가 이력도 자란다.** 플랫폼 개요 화면이 호출마다 감사를

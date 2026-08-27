@@ -624,3 +624,46 @@ async def test_a_missing_model_still_gives_up_eventually(store, clock):
     job = store.get_job(ACME, job_id)
     assert job.status == "failed"
     assert job.error_code == "model_not_installed"
+
+
+# ── 감사 LOW — 재시도가 전부 같은 시각에 몰린다 ─────────────────────────────
+
+
+def test_retry_backoff_is_jittered_per_job():
+    """**노드 하나가 죽으면 그 노드에 있던 잡이 전부 같은 시각에 재시도한다.**
+
+    다음 노드가 그 순간 몰린 요청을 받고 같이 죽는 경로다.
+    """
+    from app.scheduler import _jitter
+
+    delays = {_jitter(f"job-{n}", 4.0) for n in range(50)}
+    assert len(delays) > 40, "지연이 흩어지지 않는다"
+    assert all(0 <= d <= 1.0 for d in delays), "지터가 백오프를 크게 넘는다"
+
+
+def test_the_jitter_is_stable_for_one_job():
+    """난수를 쓰면 같은 잡의 준비 여부가 틱마다 달라진다 — 됐다가 안 됐다가 한다."""
+    from app.scheduler import _jitter
+
+    assert _jitter("job-a", 4.0) == _jitter("job-a", 4.0)
+
+
+def test_a_zero_backoff_gets_no_jitter():
+    from app.scheduler import _jitter
+
+    assert _jitter("job-a", 0.0) == 0.0
+
+
+def test_the_backoff_still_ends(store, clock):
+    """지터가 재시도를 영원히 미루면 안 된다."""
+    cluster, scheduler = build(store, clock)
+    job_id = enqueue(store, ACME)
+    store.update_job(
+        ACME, job_id, attempts=1, wait_reason="retry_backoff", wait_since=clock(),
+    )
+
+    job = store.get_job(ACME, job_id)
+    assert scheduler._retry_ready(job, clock()) is False
+
+    clock.advance(10)      # 백오프 2초 + 지터 최대 0.5초를 넉넉히 넘긴다
+    assert scheduler._retry_ready(job, clock()) is True

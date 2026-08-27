@@ -418,9 +418,18 @@ def _need(body: Mapping[str, Any], field_name: str) -> Any:
 
 
 def _ok(request: Request, payload: Any, status: int = 200) -> JSONResponse:
-    locale = getattr(request.state, "response_locale", None)
-    headers = {"Content-Language": locale} if locale else {}
-    return JSONResponse(payload, status_code=status, headers=headers)
+    """성공 응답. **`Content-Language` 를 실제로 붙인다.**
+
+    예전에는 `request.state.response_locale` 을 읽었는데 그것을 세우는 곳이 없어서
+    헤더가 한 번도 안 나갔다. 오류 응답만 로케일을 협상하고 성공 응답은 안 하면,
+    소비자는 사람이 읽는 문자열이 어느 언어인지 알 방법이 없다 — 다국어를
+    넣으면서 계약의 절반만 지킨 셈이다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    locale = _locale(request, getattr(request.state, "tenant_locale", None), ctx)
+    return JSONResponse(
+        payload, status_code=status, headers={"Content-Language": locale}
+    )
 
 
 def _submission_body(submission: Submission) -> dict[str, Any]:
@@ -625,6 +634,9 @@ async def session(request: Request) -> Response:
     locale = _locale(request, tenant["locale"] if tenant else None, ctx)
 
     service = ctx.store.get_service(principal.scope(), principal.service_id)
+    # 한 번만 계산한다 — 두 번 부르면 DB 조회도 두 번이고, 그 사이에 값이
+    # 달라지면 화면이 "준비됨 + 준비 안 된 사유" 라는 모순된 조합을 받는다.
+    classifier_ready, classifier_reason = _classifier_ready(ctx)
     return _ok(request, {
         "tenant": {
             "id": principal.tenant_id,
@@ -645,8 +657,8 @@ async def session(request: Request) -> Response:
         "raw_prompt_storage": ctx.vault.enabled,
         # **배선만 되고 인증이 안 된 분류기는 안 붙은 것과 결과가 같다.**
         # "붙었는가" 를 답하면 화면이 거짓말을 한다.
-        "guard_classifier_ready": _classifier_ready(ctx)[0],
-        "guard_classifier_reason": _classifier_ready(ctx)[1],
+        "guard_classifier_ready": classifier_ready,
+        "guard_classifier_reason": classifier_reason,
         # **유예를 조용히 두면 그게 더 나쁘다.** 차단 규칙이 audit 로 낮춰진 채
         # 도는 것을 모르면 관리자는 필터가 지키고 있다고 믿는다.
         "guard_grace_mode": ctx.guard.grace_mode,

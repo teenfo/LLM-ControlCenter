@@ -161,11 +161,27 @@ class WebhookChannel:
     name: str = "webhook"
     blocking: bool = True
 
+    @staticmethod
+    def payload_for(subject: str, body: str, detail: Mapping[str, Any]) -> dict[str, Any]:
+        """웹훅 본문. **`attachments` 를 안 쓴다.**
+
+        Slack 의 `attachments.fields` 는 `[{"title": ..., "value": ...}]` 형태를
+        요구하는데 여기서는 평평한 dict 를 넣고 있었다. 스키마가 안 맞으면 400 이
+        나고, 그 예외는 위에서 삼켜져 **알림이 통째로 유실된다** — 채널이 붙어
+        있다고 믿는 채로 아무것도 안 나가는 상태가 가장 나쁘다.
+
+        두 서비스의 최소 공통분모는 `text` 뿐이므로 세부를 본문에 접어 넣는다.
+        """
+        lines = [f"[{subject}] {body}"]
+        lines += [f"· {key}: {value}" for key, value in sorted(detail.items())]
+        return {"text": "\n".join(lines)}
+
     def send(self, subject: str, body: str, detail: Mapping[str, Any]) -> None:
         import httpx
 
-        payload = {"text": f"[{subject}] {body}", "attachments": [{"fields": detail}]}
-        httpx.post(self.url, json=payload, timeout=self.timeout).raise_for_status()
+        httpx.post(
+            self.url, json=self.payload_for(subject, body, detail), timeout=self.timeout
+        ).raise_for_status()
 
 
 @dataclass

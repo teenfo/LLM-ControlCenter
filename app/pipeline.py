@@ -618,6 +618,9 @@ class Pipeline:
             systems={},
             detections=tuple(d for v in verdicts for d in v.detections),
             blocked_rules=tuple(dict.fromkeys(blocked_rules)),
+            # **분모도 함께 옮긴다.** 실패만 세고 시도를 안 세면 임베딩 경로의
+            # 분류 실패율이 통째로 과소 집계된다 — 경보가 안 울린다는 뜻이다.
+            classifier_attempted=any(v.classifier_attempted for v in verdicts),
             classifier_failed=any(v.classifier_failed for v in verdicts),
         )
         if not allowed:

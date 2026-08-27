@@ -730,3 +730,124 @@ def test_mutations_are_never_coalesced(store, clock):
         "SELECT id FROM admin_audit WHERE action='purge_end_user'"
     ))
     assert len(rows) == 3
+
+
+# ── 감사 LOW — 정합성 ───────────────────────────────────────────────────────
+
+
+def test_the_rate_limiter_counts_and_consumes_together(store):
+    """검사와 증가가 나뉘어 있으면 동시 요청이 둘 다 통과한 뒤 둘 다 증가한다."""
+    checks = [("tenant", "t:acme", 2)]
+
+    assert store.consume_rate_slots(checks, bucket=100, since_bucket=41) is None
+    assert store.consume_rate_slots(checks, bucket=100, since_bucket=41) is None
+    assert store.consume_rate_slots(checks, bucket=100, since_bucket=41) == "tenant"
+
+
+def test_a_tripped_tier_does_not_consume_the_others(store):
+    """**전부 아니면 전무여야 한다.**
+
+    단계마다 따로 소비하면 3단계에서 걸렸을 때 1·2단계는 이미 늘어난 채로 남고,
+    안 받은 요청이 한도를 먹는다.
+    """
+    checks = [("tenant", "t:acme", 10), ("service", "s:acme:web", 0)]
+
+    assert store.consume_rate_slots(checks, bucket=100, since_bucket=41) == "service"
+    assert store.rate_count("t:acme", 41) == 0, "걸렸는데 테넌트 카운터가 늘었다"
+
+
+def test_touching_a_token_commits(store, clock):
+    """커밋 없는 쓰기는 열린 트랜잭션으로 남아 WAL 쓰기 락을 붙잡는다."""
+    scope = TenantScope("acme")
+    token_id = store.create_token(scope, "acme-web", "hash", "pfx", role="service")
+
+    store.touch_token(token_id)
+    assert store._conn.in_transaction is False
+
+
+def test_crash_recovery_respects_the_retry_ceiling(store, clock):
+    """**재큐도 시도다.**
+
+    이 경로가 상한을 안 보면 기동할 때마다 죽는 잡이 영원히 재큐된다.
+    """
+    scope = TenantScope("acme")
+    job_id = store.create_job(
+        scope, service_id="acme-web", role="r", lane="interactive", prompt_masked="x",
+    )
+    store.update_job(scope, job_id, status="running", attempts=3)
+
+    counts = store.recover_running_jobs([], max_retries=3)
+
+    assert counts["exhausted"] == 1
+    job = store.get_job(scope, job_id)
+    assert job.status == "failed" and job.error_code == "max_retries"
+
+
+def test_crash_recovery_still_requeues_below_the_ceiling(store, clock):
+    scope = TenantScope("acme")
+    job_id = store.create_job(
+        scope, service_id="acme-web", role="r", lane="interactive", prompt_masked="x",
+    )
+    store.update_job(scope, job_id, status="running", attempts=1)
+
+    counts = store.recover_running_jobs([], max_retries=3)
+
+    assert counts["requeued"] == 1
+    assert store.get_job(scope, job_id).status == "queued"
+
+
+def test_usage_survives_as_long_as_the_budget_window(store, clock):
+    """**보존 설정이 예산 창을 침범하면 안 된다.**
+
+    잡 보존을 14일로 줄이면 30일 롤링 예산이 `spend_since` 에서 절반을 잃고,
+    예산이 남은 것처럼 보인다.
+    """
+    from app.store import BUDGET_WINDOW_DAYS
+
+    scope = TenantScope("acme")
+    store.record_usage(scope, service_id="acme-web", role="r", cost_usd=5.0)
+
+    clock.advance(20 * 86400)                 # 예산 창(30일) 안이다
+    store.purge_expired(job_retention_days=14)
+
+    assert store.spend_since(scope, clock() - BUDGET_WINDOW_DAYS * 86400) == 5.0
+
+
+def test_usage_beyond_the_budget_window_is_still_cleaned(store, clock):
+    """창을 지킨다고 영원히 쌓아 두면 그것대로 사고다."""
+    from app.store import BUDGET_WINDOW_DAYS
+
+    scope = TenantScope("acme")
+    store.record_usage(scope, service_id="acme-web", role="r", cost_usd=5.0)
+
+    clock.advance((BUDGET_WINDOW_DAYS + 5) * 86400)
+    result = store.purge_expired(job_retention_days=14)
+
+    assert result["usage"] == 1
+
+
+def test_reviewed_guard_events_outlive_the_jobs(store, clock):
+    """검토를 마친 이벤트는 **승격 게이트의 표본**이다.
+
+    잡과 같은 주기로 지우면 승격 가능하던 규칙이 표본 부족으로 되돌아가고,
+    관리자는 어제 되던 것이 왜 안 되는지 알 수 없다.
+    """
+    scope = TenantScope("acme")
+    store.record_filter_event(scope, rule_id="card", stage="pattern", action="audit")
+    event = store.list_filter_events(scope, unreviewed_only=True, limit=1)[0]
+    store.review_filter_event(scope, event["id"], "true_positive")
+
+    clock.advance(60 * 86400)                 # 잡 보존(30일)은 지났다
+    store.purge_expired(job_retention_days=30)
+
+    assert len(store.list_filter_events(scope)) == 1, "검토 표본이 사라졌다"
+
+
+def test_unreviewed_events_are_still_cleaned_on_the_job_schedule(store, clock):
+    scope = TenantScope("acme")
+    store.record_filter_event(scope, rule_id="card", stage="pattern", action="audit")
+
+    clock.advance(60 * 86400)
+    store.purge_expired(job_retention_days=30)
+
+    assert store.list_filter_events(scope) == []

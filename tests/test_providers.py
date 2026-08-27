@@ -343,7 +343,12 @@ async def test_anthropic_refusal_is_surfaced_not_silently_empty():
 
 
 async def test_anthropic_passes_only_known_options():
-    """모르는 옵션 키를 그대로 던지면 400 이 나고, 그건 재시도해도 같아서 잡이 죽는다."""
+    """모르는 옵션 키를 그대로 던지면 400 이 나고, 그건 재시도해도 같아서 잡이 죽는다.
+
+    **다만 아는 것은 통과시킨다.** 예전에는 `temperature` 까지 버려서 같은 역할이
+    티어에 따라 다른 샘플링으로 돌았다 — 로컬에서는 결정적인데 경계 밖에서는
+    기본값이었다. 역할이 정책인데 그 정책의 일부가 경로에 따라 사라지는 셈이다.
+    """
     provider = anthropic_with(FakeResponse())
     await provider.generate(
         model="claude-opus-5", prompt="p", system="s",
@@ -352,9 +357,23 @@ async def test_anthropic_passes_only_known_options():
 
     payload = provider._client.messages.last_payload
     assert payload["output_config"] == {"effort": "low"}
-    assert "temperature" not in payload
-    assert "num_predict" not in payload
+    assert payload["temperature"] == 0.7, "샘플링 옵션이 조용히 사라졌다"
+    assert "num_predict" not in payload, "모르는 키는 여전히 안 넘긴다"
     assert payload["system"] == "s"
+
+
+async def test_the_same_role_samples_the_same_way_on_every_tier():
+    """티어가 달라도 역할이 정한 샘플링은 같아야 한다 — 품질 비교의 전제다."""
+    from app.providers.anthropic_provider import SAMPLING_OPTIONS
+
+    provider = anthropic_with(FakeResponse())
+    options = {"temperature": 0.2, "top_p": 0.9, "top_k": 40}
+    await provider.generate(model="m", prompt="p", options=options)
+
+    payload = provider._client.messages.last_payload
+    for key, value in options.items():
+        assert key in SAMPLING_OPTIONS
+        assert payload[key] == value
 
 
 async def test_anthropic_does_not_support_embed():

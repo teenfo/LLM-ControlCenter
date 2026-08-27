@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .config import Pricing
-from .store import SqliteStore, TenantScope
+from .store import BUDGET_WINDOW_DAYS, SqliteStore, TenantScope
 
 #: 라틴 문자 기준 문자당 토큰 비율. 영어 산문이 대략 이 근처다.
 ASCII_CHARS_PER_TOKEN = 4.0
@@ -132,7 +132,7 @@ class CostAccountant:
         달력 월이 아니라 롤링 창을 쓰는 이유: 설치처의 시간대·회계 월을 모르는데
         달력 월을 가정하면 월초에 예산이 통째로 리셋되는 절벽이 생긴다.
         """
-        return self._now() - 30 * 86400
+        return self._now() - BUDGET_WINDOW_DAYS * 86400
 
     def budget_status(
         self, scope: TenantScope, *, limit: float | None, service_id: str | None = None
@@ -144,6 +144,49 @@ class CostAccountant:
             reserved=self._store.reserved_cost(scope, service_id=service_id),
         )
 
+    def budget_snapshot(
+        self,
+        scope: TenantScope,
+        *,
+        tenant_limit: float | None,
+        service_limit: float | None = None,
+        service_id: str | None = None,
+    ) -> tuple[BudgetStatus, BudgetStatus | None]:
+        """두 단계의 예산 현황을 **한 번에** 읽는다.
+
+        배치는 후보 노드마다 예산을 확인하는데, 예산은 노드에 따라 달라지지 않는다.
+        후보마다 다시 읽으면 락 안에서 노드 수 × 2회의 DB 조회를 하게 되고,
+        그동안 다른 레인 루프가 통째로 멈춘다.
+        """
+        tenant = self.budget_status(scope, limit=tenant_limit)
+        service = None
+        if service_limit is not None and service_id:
+            service = self.budget_status(scope, limit=service_limit, service_id=service_id)
+        return tenant, service
+
+    @staticmethod
+    def afford_with(
+        snapshot: tuple[BudgetStatus, BudgetStatus | None],
+        amount: float,
+        *,
+        extra_committed: float = 0.0,
+    ) -> tuple[bool, str | None]:
+        """읽어 둔 현황으로 판정한다. 반환은 (가능한가, 걸린 단계).
+
+        `extra_committed` 는 **같은 임계 구역에서 이미 예약한 금액**이다. 스냅샷을
+        읽은 뒤 예약한 것은 DB 에 반영돼 있어도 이 스냅샷에는 없다 — 안 더하면
+        한 번의 배치 루프 안에서 예산을 두 번 쓴다.
+        """
+        if amount <= 0:
+            return True, None  # 무료 경로는 예산을 소모하지 않는다
+
+        tenant, service = snapshot
+        if not tenant.can_afford(amount + extra_committed):
+            return False, "tenant"
+        if service is not None and not service.can_afford(amount + extra_committed):
+            return False, "service"
+        return True, None
+
     def can_afford(
         self,
         scope: TenantScope,
@@ -154,19 +197,13 @@ class CostAccountant:
         service_id: str | None = None,
     ) -> tuple[bool, str | None]:
         """테넌트·서비스 두 단계를 확인한다. 반환은 (가능한가, 걸린 단계)."""
-        if amount <= 0:
-            return True, None  # 무료 경로는 예산을 소모하지 않는다
-
-        tenant = self.budget_status(scope, limit=tenant_limit)
-        if not tenant.can_afford(amount):
-            return False, "tenant"
-
-        if service_limit is not None and service_id:
-            service = self.budget_status(scope, limit=service_limit, service_id=service_id)
-            if not service.can_afford(amount):
-                return False, "service"
-
-        return True, None
+        return self.afford_with(
+            self.budget_snapshot(
+                scope, tenant_limit=tenant_limit,
+                service_limit=service_limit, service_id=service_id,
+            ),
+            amount,
+        )
 
     # -- 정산 -----------------------------------------------------------------
 

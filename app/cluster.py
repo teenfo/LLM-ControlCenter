@@ -78,6 +78,9 @@ class NodeState:
     reserved_mem_gb: float = 0.0
     last_probe_at: float | None = None
     last_error: str | None = None
+    #: 강제 드레이닝됐는가. 실행 중인 잡을 세는 것과는 별개다 — 그 둘을 섞으면
+    #: 드레이닝을 풀었을 때 노드가 비어 있는 것처럼 보인다.
+    force_drained: bool = False
 
     @property
     def name(self) -> str:
@@ -263,6 +266,13 @@ class Cluster:
         boundaries = frozenset(allowed_boundaries)
 
         with self._lock:
+            # **예산 현황은 락 안에서 한 번만 읽는다.**
+            #
+            # 밖에서 읽으면 읽기와 예약 사이가 벌어져 동시 배치 두 건이 각각
+            # "예산 남음" 을 보고 둘 다 예약한다 — 락을 둔 이유가 정확히 그것을
+            # 막는 것이다(B3-1). 후보마다 읽으면 노드 수 × 2회가 되므로 한 번만
+            # 읽고, metered 후보를 만나기 전까지는 아예 안 읽는다.
+            budget: Any = None
             candidates: list[tuple[int, NodeState, str, str, float, float]] = []
             # 직전 실패 노드만 남았을 때 쓸 후보. **배제는 선호이지 금지가 아니다** —
             # 아래 주석 참고.
@@ -285,11 +295,14 @@ class Cluster:
                         provider=state.node.provider, model=model,
                         prompt=prompt, max_output_tokens=max_output_tokens,
                     )
-                    affordable, tripped = self._accountant.can_afford(
-                        scope, cost,
-                        tenant_limit=tenant_budget,
-                        service_limit=service_budget,
-                        service_id=service_id,
+                    if cost > 0 and budget is None:
+                        budget = self._accountant.budget_snapshot(
+                            scope, tenant_limit=tenant_budget,
+                            service_limit=service_budget, service_id=service_id,
+                        )
+                    affordable, tripped = (
+                        (True, None) if cost <= 0
+                        else self._accountant.afford_with(budget, cost)
                     )
                     if not affordable:
                         rejections.setdefault(state.name, f"budget_exceeded:{tripped}")
@@ -327,9 +340,13 @@ class Cluster:
             state.running += 1
             state.reserved_mem_gb += mem
 
-        # 비용 예약은 DB 라 락 밖에서 한다. 슬롯을 이미 잡았으므로 이중 배정은 없다.
-        if cost > 0:
-            self._store.update_job(scope, job_id, cost_reserved_usd=cost)
+            # **비용 예약도 락 안에서 한다.**
+            #
+            # 밖에서 하면 확인과 차감 사이가 벌어져, 동시 배치 두 건이 각각
+            # "예산 남음" 을 보고 둘 다 예약한다 — 락을 둔 이유가 정확히
+            # 그것을 막는 것인데(B3-1) 비용만 그 밖에 있었다.
+            if cost > 0:
+                self._store.update_job(scope, job_id, cost_reserved_usd=cost)
 
         return PlacementResult(
             PLACED,
@@ -639,14 +656,23 @@ class Cluster:
             return
         state.status = DRAINING
         if force:
-            state.running = 0
-            state.reserved_mem_gb = 0.0
+            # **카운터를 0 으로 밀지 않는다.**
+            #
+            # 실행 중인 잡은 여전히 노드에서 돌고 있고, 끝날 때 `release()` 가
+            # 카운터를 한 번 더 내린다(`max(0, ...)` 라 0 에 머문다). 그 상태로
+            # `undrain` 하면 노드는 비어 있는 것처럼 보이는데 실제로는 잡이
+            # 돌고 있어서 **동시성 상한을 넘겨 배치된다.**
+            #
+            # 강제 드레이닝의 목적은 "신규를 즉시 막는 것" 이고 그것은
+            # `DRAINING` 상태가 이미 한다. 세는 것과 막는 것은 다른 일이다.
+            state.force_drained = True
         self._persist_health(state)
 
     def undrain(self, node: str) -> None:
         state = self._nodes.get(node)
         if state is None:
             return
+        state.force_drained = False
         state.status = UNKNOWN
         state.consecutive_failures = 0
         state.consecutive_successes = 0

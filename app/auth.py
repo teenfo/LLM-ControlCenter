@@ -292,22 +292,23 @@ class RateLimiter:
                 ("end_user", f"u:{principal.tenant_id}:{end_user_hash}", limits.end_user)
             )
 
-        # 넓은 단계부터 검사한다 — 테넌트 총량에 걸렸는데 서비스 한도를 탓하지 않게.
-        for scope_name, key, limit in checks:
-            if self._store.rate_count(key, since) >= limit:
-                raise ApiError(
-                    "rate_limited", status=429, retryable=True,
-                    params={
-                        "scope": scope_name, "limit": limit,
-                        # **언제 다시 오면 되는지를 준다.** 이 값이 없으면 소비자는
-                        # 자기 판단으로 재시도하고, 그 판단은 대개 "바로 다시" 다 —
-                        # 그러면 한도에 걸린 소비자가 입구를 계속 두드린다.
-                        "retry_after": self._retry_after(key, since),
-                    },
-                )
-
-        for _, key, _ in checks:
-            self._store.bump_rate_counter(key, bucket)
+        # **검사와 증가가 한 트랜잭션이다.** 나눠 두면 동시 요청이 둘 다 통과한 뒤
+        # 둘 다 증가해 한도를 넘긴다. 넓은 단계부터 보는 순서는 그대로다 —
+        # 테넌트 총량에 걸렸는데 서비스 한도를 탓하지 않게.
+        tripped = self._store.consume_rate_slots(checks, bucket, since)
+        if tripped is not None:
+            limit = next(limit for name, _, limit in checks if name == tripped)
+            key = next(key for name, key, _ in checks if name == tripped)
+            raise ApiError(
+                "rate_limited", status=429, retryable=True,
+                params={
+                    "scope": tripped, "limit": limit,
+                    # **언제 다시 오면 되는지를 준다.** 이 값이 없으면 소비자는
+                    # 자기 판단으로 재시도하고, 그 판단은 대개 "바로 다시" 다 —
+                    # 그러면 한도에 걸린 소비자가 입구를 계속 두드린다.
+                    "retry_after": self._retry_after(key, since),
+                },
+            )
 
     def check_named(self, key: str, limit: int, *, scope_label: str) -> None:
         """이름 붙은 별도 한도. 상태 조회(폴링)처럼 제출과 다르게 재야 하는 경로용.
@@ -318,7 +319,7 @@ class RateLimiter:
         """
         bucket = int(self._now())
         since = bucket - RATE_WINDOW_SECONDS + 1
-        if self._store.rate_count(key, since) >= limit:
+        if self._store.consume_rate_slots([(scope_label, key, limit)], bucket, since):
             raise ApiError(
                 "rate_limited", status=429, retryable=True,
                 params={
@@ -326,7 +327,6 @@ class RateLimiter:
                     "retry_after": self._retry_after(key, since),
                 },
             )
-        self._store.bump_rate_counter(key, bucket)
 
     def _retry_after(self, key: str, since: int) -> int:
         """윈도가 다시 열릴 때까지 남은 초.

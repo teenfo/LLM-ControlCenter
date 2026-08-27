@@ -569,9 +569,55 @@ def test_draining_blocks_new_but_keeps_running_jobs(cluster):
 
 
 def test_force_drain_clears_immediately(cluster):
-    place(cluster, "classify")
+    """강제 드레이닝은 **신규를 즉시 막는다** — 그것이 목적이다."""
+    for name in ("in-2", "out-1"):
+        cluster.nodes[name].status = UNHEALTHY
+
+    first = place(cluster, "classify", job_id="a")
+    assert first.placement.node == "in-1"
+
     cluster.drain("in-1", force=True)
-    assert cluster.nodes["in-1"].running == 0
+
+    blocked = place(cluster, "classify", job_id="b")
+    assert blocked.outcome != PLACED
+    assert blocked.rejections["in-1"] == "draining"
+
+
+def test_force_drain_does_not_lose_the_running_count(cluster):
+    """**세는 것과 막는 것은 다른 일이다.**
+
+    실행 중인 잡은 여전히 노드에서 돌고 있다. 카운터를 0 으로 밀면 그 잡들이
+    끝날 때 `release()` 가 한 번 더 내려 0 에 머물고, 드레이닝을 풀었을 때
+    노드가 비어 있는 것처럼 보여 **동시성 상한을 넘겨 배치된다.**
+    """
+    for name in ("in-2", "out-1"):
+        cluster.nodes[name].status = UNHEALTHY
+
+    placed = place(cluster, "classify", job_id="a")
+    cluster.drain("in-1", force=True)
+
+    assert cluster.nodes["in-1"].running == 1, "실행 중인 잡을 잊었다"
+
+    cluster.undrain("in-1")
+    cluster.nodes["in-1"].status = HEALTHY
+    cluster.release(placed.placement)          # 그 잡이 이제 끝난다
+
+    assert cluster.nodes["in-1"].running == 0, "해제가 두 번 세어졌다"
+
+
+def test_undrain_does_not_oversubscribe(cluster):
+    """in-1 은 슬롯 2개다. 강제 드레이닝 후 풀어도 3개가 들어가면 안 된다."""
+    for name in ("in-2", "out-1"):
+        cluster.nodes[name].status = UNHEALTHY
+
+    place(cluster, "classify", job_id="a")
+    place(cluster, "classify", job_id="b")
+    cluster.drain("in-1", force=True)
+    cluster.undrain("in-1")
+    cluster.nodes["in-1"].status = HEALTHY
+
+    third = place(cluster, "classify", job_id="c")
+    assert third.outcome != PLACED, "동시성 상한을 넘겨 배치됐다"
 
 
 # ── 관제 ────────────────────────────────────────────────────────────────────

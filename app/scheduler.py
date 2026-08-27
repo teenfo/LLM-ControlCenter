@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
@@ -71,6 +72,23 @@ def _longest_outbound(job: Any) -> str:
         job.system_external or job.system_masked or ""
     )
     return max(internal, external, key=len)
+
+
+#: 백오프에 얹는 흔들림의 비율. 노드 하나가 죽으면 그 노드에 있던 잡이 **전부 같은
+#: 시각에** 재시도한다 — 다음 노드가 그 순간 몰린 요청을 받고 같이 죽는 경로다.
+JITTER_RATIO = 0.25
+
+
+def _jitter(seed: str, delay: float) -> float:
+    """잡마다 다른 지연을 준다. **난수가 아니라 잡 id 의 함수다.**
+
+    난수를 쓰면 같은 잡의 준비 여부가 틱마다 달라져서, 아직 안 됐다가 됐다가
+    한다. 잡 id 로 정하면 그 잡의 지연은 고정이고 잡들 사이에서는 흩어진다.
+    """
+    if delay <= 0:
+        return 0.0
+    spread = int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+    return delay * JITTER_RATIO * spread
 
 
 def _loop_failure(loop: str, exc: BaseException) -> None:
@@ -131,7 +149,10 @@ class Scheduler:
         기동 시 크래시 복구를 먼저 돌린다 — 과금 노드에서 돌던 잡은 자동 재큐하지 않고
         `needs_review` 로 남겨 이중 청구를 드러낸다.
         """
-        recovered = self._store.recover_running_jobs(self._cluster.metered_nodes())
+        recovered = self._store.recover_running_jobs(
+            self._cluster.metered_nodes(),
+            max_retries=self._thresholds.max_retries,
+        )
         if recovered["needs_review"]:
             self._notify("crash_recovery_needs_review", recovered)
 
@@ -245,7 +266,7 @@ class Scheduler:
 
         backoff = self._thresholds.retry_backoff_seconds
         delay = backoff[min(job.attempts - 1, len(backoff) - 1)]
-        return now - job.wait_since >= delay
+        return now - job.wait_since >= delay + _jitter(job.id, delay)
 
     # -- 디스패치 --------------------------------------------------------------
 

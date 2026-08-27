@@ -35,6 +35,10 @@ CAPABILITIES = Capabilities(
     supports_embed=False,           # Messages API 에 임베딩이 없다
 )
 
+#: 이 API 가 그대로 받는 샘플링 옵션. 모르는 키를 던지면 400 이 나고 재시도해도
+#: 같으므로, 아는 것만 통과시킨다 — 다만 **아는 것은 통과시킨다.**
+SAMPLING_OPTIONS = ("temperature", "top_p", "top_k", "stop_sequences")
+
 DEFAULT_MAX_TOKENS = 4096
 
 
@@ -130,6 +134,16 @@ class AnthropicProvider:
             payload["output_config"] = {"effort": opts["effort"]}
         if "thinking" in opts:
             payload["thinking"] = opts["thinking"]
+
+        # **샘플링 옵션을 조용히 버리지 않는다.**
+        #
+        # 버리면 같은 역할이 티어에 따라 다른 샘플링으로 돈다 — 로컬에서는
+        # `temperature: 0.2` 로 결정적인데 경계 밖으로 나가면 기본값이다.
+        # 역할이 정책인데 그 정책의 일부가 경로에 따라 사라지는 셈이고,
+        # 품질 비교(C8 의 프롬프트 해시)가 그 차이를 설명하지 못한다.
+        for key in SAMPLING_OPTIONS:
+            if key in opts and opts[key] is not None:
+                payload[key] = opts[key]
 
         try:
             response = await self._client.messages.create(

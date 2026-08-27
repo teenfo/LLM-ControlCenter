@@ -73,7 +73,14 @@ class OllamaProvider:
 
         if response.status_code >= 400:
             body = response.text[:500]
-            if response.status_code == 404 or "not found" in body.lower():
+            # **본문 문자열로 판정하지 않는다.** `"not found"` 는 무관한 5xx 본문에도
+            # 흔히 들어 있고(리버스 프록시의 오류 페이지 등), 그렇게 오분류되면
+            # 재시도 가능한 장애가 `retryable=False` 로 죽는다.
+            #
+            # 404 는 Ollama 가 모르는 모델에 주는 상태 코드이고, 그것이 판정 근거다.
+            # 5xx 에 섞인 문자열은 그 노드가 잠깐 이상하다는 뜻이지 모델이 없다는
+            # 뜻이 아니다 — 오류 계약(§5.4)이 문자열 분기를 금지한 것과 같은 이유다.
+            if response.status_code == 404:
                 raise ModelNotFound(dict(payload).get("model", "?"), self.node_name)
             raise BackendError(
                 f"노드 {self.node_name} 오류 {response.status_code}: {body}",

@@ -756,3 +756,49 @@ def test_a_loop_failure_log_carries_no_prompt_body():
     source = inspect.getsource(_loop_failure)
     assert "prompt" not in source
     assert "[:200]" in source, "예외 문자열을 자르지 않으면 본문이 통째로 실릴 수 있다"
+
+
+# ── 감사 LOW — 알림 페이로드와 응답 헤더 ────────────────────────────────────
+
+
+def test_the_webhook_payload_is_the_minimum_common_shape():
+    """`attachments.fields` 는 Slack 이 `[{title, value}]` 를 요구한다.
+
+    평평한 dict 를 넣으면 400 이 나고, 그 예외는 삼켜져 **알림이 통째로
+    유실된다** — 채널이 붙어 있다고 믿는 채로 아무것도 안 나가는 상태다.
+    """
+    from app.notify import WebhookChannel
+
+    payload = WebhookChannel.payload_for("제목", "본문", {"node": "in-1", "count": 3})
+
+    assert set(payload) == {"text"}, "attachments 를 아직 보낸다"
+    assert "in-1" in payload["text"] and "count" in payload["text"]
+
+
+def test_the_webhook_payload_still_carries_no_prompt():
+    """세부를 본문에 접어 넣는다고 걸러야 할 것이 들어가면 안 된다."""
+    from app.notify import Notifier, WebhookChannel
+
+    notifier = Notifier([], now=FakeClock(), min_interval_seconds=0.0)
+    clean = redact({"node": "in-1", "prompt": f"카드 {VALID_CARD}"})
+    payload = WebhookChannel.payload_for("제목", "본문", clean)
+
+    assert VALID_CARD not in payload["text"]
+    assert notifier is not None
+
+
+def test_a_successful_response_says_which_language_it_is_in(client, acme):
+    """오류만 로케일을 협상하고 성공 응답은 안 하면 계약의 절반만 지킨 것이다."""
+    response = client.get("/v1/roles", headers=auth(acme["service"]))
+    assert response.status_code == 200
+    assert response.headers["content-language"]
+
+
+def test_the_response_language_follows_the_request(client, acme):
+    ko = client.get(
+        "/v1/roles", headers={**auth(acme["service"]), "Accept-Language": "ko-KR"}
+    )
+    en = client.get(
+        "/v1/roles", headers={**auth(acme["service"]), "Accept-Language": "en-US"}
+    )
+    assert ko.headers["content-language"] != en.headers["content-language"]
