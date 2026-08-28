@@ -409,3 +409,31 @@ def test_the_audit_chain_does_not_fork_across_processes(shared_db):
     assert written == WORKERS * 3, f"감사 {WORKERS * 3}건 중 {written}건만 남았다"
     assert distinct_links == written, "같은 앞 고리를 가진 행이 있다 — 체인이 포크됐다"
     assert verdict["ok"], f"프로세스를 넘은 체인이 어긋난다: {verdict}"
+
+
+def test_a_crashed_workers_lease_does_not_block_its_own_retry(shared_db):
+    """**자기가 남긴 리스가 자기 재배치를 막으면 안 된다.**
+
+    워커가 실행 중에 죽으면 `release()` 를 못 부르고 리스가 남는다. 그 잡이 다시
+    배치될 때 같은 `lease_id` 로 잡으므로 점유는 늘지 않는데, 자기 행까지 세면
+    `max_concurrent=1` 노드에서 만료될 때까지 자기 자리를 못 되찾는다.
+    """
+    store = SqliteStore(shared_db)
+    try:
+        assert store.try_acquire_node_lease(
+            lease_id="job-1", node="solo", mem_gb=0.0, now=1000.0,
+            ttl_seconds=600.0, max_concurrent=1, mem_budget_gb=None,
+        )
+        # 같은 잡이 다시 배치된다 — 아직 만료 전이다.
+        assert store.try_acquire_node_lease(
+            lease_id="job-1", node="solo", mem_gb=0.0, now=1010.0,
+            ttl_seconds=600.0, max_concurrent=1, mem_budget_gb=None,
+        ), "자기 리스가 자기 재배치를 막았다"
+        # 남이 끼어드는 것은 여전히 막힌다.
+        assert not store.try_acquire_node_lease(
+            lease_id="job-2", node="solo", mem_gb=0.0, now=1010.0,
+            ttl_seconds=600.0, max_concurrent=1, mem_budget_gb=None,
+        ), "자기 제외가 남에게까지 열렸다"
+        assert store.node_occupancy(1010.0)["solo"] == (1, 0.0)
+    finally:
+        store.close()

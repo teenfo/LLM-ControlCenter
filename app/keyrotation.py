@@ -42,6 +42,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from .bootstrap import fsync_directory, write_key_file
 from .crypto import CryptoError, KeyVault, generate_master_key
 
 #: 회전 중에만 존재하는 파일. 남아 있으면 회전이 중단된 것이다.
@@ -149,9 +150,10 @@ def rotate_master_kek(
     if not new_vault.enabled:
         raise RotationRefused("새 마스터 KEK 가 유효하지 않습니다.")
 
+    # **fsync 까지 하고 넘어간다.** 이 단계의 존재 이유가 "DB 커밋보다 먼저 디스크에
+    # 있다" 인데, 페이지 캐시에만 있으면 그 순서를 OS 가 지켜 줄 이유가 없다.
     staged = staged_key_path(directory)
-    staged.write_text(key_value + "\n", encoding="utf-8")
-    os.chmod(staged, 0o600)
+    write_key_file(staged, key_value)
 
     # ── 3. 래핑을 다시 만들어 한 트랜잭션으로 ───────────────────────────────
     #
@@ -182,6 +184,9 @@ def rotate_master_kek(
         os.chmod(retired, 0o600)
     shutil.move(str(staged), str(live))
     os.chmod(live, 0o600)
+    # 이름 변경도 디스크에 남겨야 한다. 안 그러면 크래시 뒤 `master.key` 가 아직
+    # 옛 키이거나 아예 없을 수 있고, 둘 다 이 절차가 막으려던 상태다.
+    fsync_directory(directory)
 
     # ── 5. 새 키만으로 다시 열어 본다 ───────────────────────────────────────
     #

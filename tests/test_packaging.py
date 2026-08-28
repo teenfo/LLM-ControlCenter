@@ -870,16 +870,19 @@ def test_a_failed_key_write_does_not_leave_a_lost_key(tmp_path, monkeypatch):
 
     다음 기동이 다른 키를 만들고, 그 사이 암호문은 영구히 열리지 않는다.
     """
+    import os
+
     from app.bootstrap import KeyDirectoryUnwritable, ensure_master_key
 
     keys = tmp_path / "keys"
 
-    def refuse(self, *args, **kwargs):
-        # 디스크가 찼거나 마운트가 읽기 전용인 경우. 검사를 통과한 뒤에도 일어난다.
-        self.write_bytes(b"half")     # 반쯤 쓰인 파일이 남는 상황까지 재현한다
-        raise PermissionError(13, "Permission denied")
+    # **fsync 에서 터뜨린다.** 디스크가 찬 것은 write 가 아니라 여기서 드러나는
+    # 일이 흔하고, 그 시점이면 파일은 이미 만들어져 있다 — 정리가 필요한 바로
+    # 그 상황이다.
+    def refuse(fd):
+        raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(Path, "write_text", refuse)
+    monkeypatch.setattr(os, "fsync", refuse)
     with pytest.raises(KeyDirectoryUnwritable):
         ensure_master_key(keys, env={})
 

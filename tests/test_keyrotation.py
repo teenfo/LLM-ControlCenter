@@ -428,3 +428,61 @@ def test_the_runbook_and_the_decision_agree_that_dek_rotation_is_rejected():
     assert "보류" not in decisions.split("### D4 / G5")[1].split("### D5")[0], (
         "D4 가 구현됐는데 판정이 아직 보류다"
     )
+
+
+# ── 내구성 — "디스크에 있다" 가 사실이어야 한다 ─────────────────────────────
+
+
+def test_the_staged_key_is_fsynced_before_the_db_commit(store, keys_dir, kek, monkeypatch):
+    """**이 절차의 안전 논거 전체가 이 순서 위에 서 있다.**
+
+    "새 키가 DB 커밋보다 먼저 디스크에 있다" 가 회전이 어디서 죽어도 복구되는
+    이유다. `write_text` 만 하면 값은 페이지 캐시에 남고, 프로세스 죽음에는
+    살아남지만 **정전에는 사라진다** — 그러면 DB 만 새 래핑을 들고 남는다.
+    """
+    import os
+
+    order: list[str] = []
+    real_fsync = os.fsync
+    real_replace = store.replace_wrapped_deks
+
+    def watching_fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    def watching_replace(rewrapped, *, actor):
+        order.append("db_commit")
+        return real_replace(rewrapped, actor=actor)
+
+    monkeypatch.setattr(os, "fsync", watching_fsync)
+    store.replace_wrapped_deks = watching_replace
+
+    rotate_master_kek(store, keys_dir=keys_dir, old_vault=vault_for(kek))
+
+    assert "db_commit" in order, "커밋이 안 일어났다"
+    assert order.index("fsync") < order.index("db_commit"), (
+        f"새 키를 디스크에 굳히기 전에 DB 를 커밋했다: {order}"
+    )
+
+
+def test_the_rename_is_fsynced_too(store, keys_dir, kek, monkeypatch):
+    """내용만 굳히고 **이름**을 안 굳히면 크래시 뒤 파일이 없을 수 있다."""
+    import os
+
+    synced_dirs: list[str] = []
+    real_open, real_fsync = os.open, os.fsync
+
+    def watching_fsync(fd):
+        try:
+            if os.path.isdir(f"/proc/self/fd/{fd}"):
+                synced_dirs.append(str(fd))
+        except OSError:
+            pass
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", watching_fsync)
+    assert real_open
+
+    rotate_master_kek(store, keys_dir=keys_dir, old_vault=vault_for(kek))
+
+    assert synced_dirs, "디렉터리를 fsync 하지 않았다 — 이름 변경이 안 굳는다"

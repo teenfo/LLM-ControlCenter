@@ -157,13 +157,42 @@ def ensure_master_key(
 
     key = generate_master_key()
     try:
-        path.write_text(key + "\n", encoding="utf-8")
-        # 같은 호스트의 다른 사용자가 읽지 못하게. 컨테이너에서도 의미가 있다.
-        os.chmod(path, 0o600)
+        write_key_file(path, key)
     except OSError as exc:
         path.unlink(missing_ok=True)   # 반쯤 쓰인 키 파일을 남기지 않는다
         raise KeyDirectoryUnwritable(_keys_dir_complaint(directory)) from exc
     return key, path
+
+
+def write_key_file(path: Path, key: str) -> None:
+    """마스터 KEK 를 파일로. **디스크에 닿은 것을 확인하고 돌아온다.**
+
+    `write_text` 만으로는 부족하다. 그것은 파이썬 버퍼를 OS 로 넘길 뿐이고 값은
+    페이지 캐시에 남는다 — 프로세스가 죽어도 살아남지만 **정전·커널 패닉에는
+    사라진다.** 그 사이 DB 는 이 키로 감싼 DEK 를 들고 있을 수 있고, 그러면 남는 것은
+    **어떤 키로도 못 여는 DB** 다.
+
+    이것이 특히 회전에서 중요하다. `keyrotation` 의 안전 논거 전체가 "새 키가 DB
+    커밋보다 **먼저** 디스크에 있다" 인데, fsync 가 없으면 그 순서를 OS 가 지켜 줄
+    이유가 없다. 디렉터리까지 fsync 하는 이유는 파일 내용과 **이름**이 따로 놀기
+    때문이다 — 내용만 동기화하면 크래시 뒤 이름이 없을 수 있다.
+    """
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(key + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    # 같은 호스트의 다른 사용자가 읽지 못하게. 컨테이너에서도 의미가 있다.
+    os.chmod(path, 0o600)
+    fsync_directory(path.parent)
+
+
+def fsync_directory(directory: Path) -> None:
+    """디렉터리 엔트리를 디스크에. 이름 변경·생성이 살아남게 한다."""
+    fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def load_master_key_from(keys_dir: Path | str | None, env: Mapping[str, str] | None = None) -> bytes | None:

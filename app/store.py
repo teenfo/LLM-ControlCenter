@@ -1123,10 +1123,14 @@ class SqliteStore:
             # 구성(스케줄러 없이 API 워커만)에서 장부가 영원히 새 것처럼 안 보인다.
             self._conn.execute("DELETE FROM node_leases WHERE expires_at <= ?", (now,))
 
+            # **자기 자신은 안 센다.** 삽입이 `INSERT OR REPLACE` 라 같은 `lease_id`
+            # 로 다시 잡는 것은 점유를 늘리지 않는다. 안 빼면 워커가 죽고 남긴 자기
+            # 리스가 그 잡의 재배치를 막아, `max_concurrent=1` 노드에서 잡이 만료될
+            # 때까지 자기 자리를 못 되찾는다.
             row = self._conn.execute(
                 "SELECT COUNT(*) AS n, COALESCE(SUM(mem_gb), 0) AS mem "
-                "FROM node_leases WHERE node = ?",
-                (node,),
+                "FROM node_leases WHERE node = ? AND id != ?",
+                (node, lease_id),
             ).fetchone()
             if int(row["n"]) >= max_concurrent:
                 return False
@@ -2206,6 +2210,11 @@ class SqliteStore:
 
         해시가 NULL 인 행은 체인 도입 이전 구간이다. 어긋난 것이 아니라 **보증 범위
         밖**이므로 그렇게 센다 — 섞으면 옛 설치처가 업그레이드하자마자 "변조됨" 을 본다.
+
+        `limit` 은 **앞에서부터** 자른다. 뒤 N 개만 보는 선택지는 없다 — 체인은 알려진
+        앵커에서 앞으로만 검증할 수 있고, 중간부터 시작하면 그 시작점의 해시를 그냥
+        믿는 것이 되어 검증이 아니게 된다. 원가는 행당 약 4.4µs 다(실측, 20만 행에
+        875ms). 진단용이므로 전량을 본다.
         """
         anchor = self._conn.execute(
             "SELECT value FROM meta WHERE key = ?", (AUDIT_ANCHOR_KEY,)
