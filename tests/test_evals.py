@@ -8,7 +8,9 @@ from app.config import load_config
 from app.evals import (
     BUNDLED_FIXTURES,
     KIND_CLASSIFIER,
+    KIND_ROUTER,
     MIN_REVIEWS_FOR_PROMOTION,
+    EvalError,
     Evaluator,
     RuleEval,
 )
@@ -453,3 +455,109 @@ def test_snapshot_counts_the_unreviewed_backlog(evaluator, store):
         store.record_filter_event(ACME, rule_id="email", stage="pattern", action="audit")
 
     assert evaluator.snapshot(ACME)["unreviewed"] == 3
+
+
+# ── 라우터 품질 (P1-7) ───────────────────────────────────────────────────────
+#
+# 가드 정답셋 체계를 재사용하되 **쓰임이 반대다.** 규칙 성적은 승격 게이트의
+# 입력이고(틀리면 못 켠다), 라우터 성적은 계기판이다(틀려도 켜져 있다).
+# 오분류의 대가가 보안이 아니라 비용이기 때문이다.
+
+
+def routed_role():
+    from app.config import Role, RoleRouting, RouteSpec
+
+    return Role(
+        name="summarize", model="기본",
+        routing=RoleRouting(
+            classifier="_guard_classify",
+            routes={
+                "simple": RouteSpec(model="작은모델", description="한두 문장 요약"),
+                "complex": RouteSpec(model="큰모델", description="장문 분석"),
+            },
+        ),
+    )
+
+
+async def test_the_router_report_counts_accuracy(evaluator):
+    role = routed_role()
+    answers = {"짧은 글": "simple", "긴 보고서": "complex", "표 분석": "complex"}
+
+    async def route_once(_role, text):
+        return answers[text]
+
+    report = await evaluator.measure_router(
+        role, route_once,
+        [("짧은 글", "simple"), ("긴 보고서", "complex"), ("표 분석", "simple")],
+    )
+
+    assert report.total == 3
+    assert report.correct == 2
+    assert report.rate == pytest.approx(2 / 3)
+
+
+async def test_the_report_names_which_description_to_fix(evaluator):
+    """**정확도 하나만 주면 관리자는 고칠 데를 모른다.**
+
+    운영 루프는 "82% 입니다" 가 아니라 "simple 이 complex 로 샌다" 에서 돈다 —
+    고칠 것은 `routes["simple"].description` 이다.
+    """
+    role = routed_role()
+
+    async def always_complex(_role, _text):
+        return "complex"
+
+    report = await evaluator.measure_router(
+        role, always_complex,
+        [("짧은 글", "simple"), ("또 짧은 글", "simple"), ("긴 보고서", "complex")],
+    )
+
+    assert report.worst_leak == ("simple", "complex", 2)
+
+
+async def test_a_routing_failure_is_recorded_as_the_default_not_dropped(evaluator):
+    """판정 실패는 **버리지 않고 기본 모델로 샌 것**으로 센다.
+
+    건너뛰면 라우터가 절반을 포기해도 나머지 절반의 정확도만 보이고, 그 수치는
+    높다. 라우팅을 켜 둔 채 아무 이득이 없는 상태가 계기판에서 좋아 보인다.
+    """
+    role = routed_role()
+
+    async def always_fails(_role, _text):
+        raise RuntimeError("분류 백엔드가 죽었다")
+
+    report = await evaluator.measure_router(
+        role, always_fails, [("짧은 글", "simple"), ("긴 보고서", "complex")],
+    )
+
+    assert report.total == 2
+    assert report.correct == 0
+    assert report.confusion == {("simple", None): 1, ("complex", None): 1}
+
+
+async def test_a_fixture_naming_an_unknown_route_is_an_error(evaluator):
+    """**픽스처의 오타가 정확도 100% 로 보이면 안 된다.**"""
+    role = routed_role()
+
+    async def never_called(_role, _text):     # pragma: no cover - 도달하면 실패다
+        raise AssertionError("픽스처를 검증하기 전에 라우터를 불렀다")
+
+    with pytest.raises(EvalError, match="어휘에 없다"):
+        await evaluator.measure_router(role, never_called, [("글", "simpel")])
+
+
+async def test_the_router_run_is_recorded_under_its_own_kind(evaluator, store):
+    """분류기 인증(`KIND_CLASSIFIER`)과 **섞이면 안 된다.**
+
+    같은 칸에 쓰면 라우터 성적이 낮을 때 가드 2단 분류기가 인증을 잃는다 —
+    라우팅을 켰다가 가드가 꺼지는 경로다.
+    """
+    role = routed_role()
+
+    async def always_simple(_role, _text):
+        return "simple"
+
+    await evaluator.measure_router(role, always_simple, [("글", "simple")])
+
+    assert store.latest_eval_run(KIND_ROUTER, "summarize")["passed"] == 1
+    assert store.latest_eval_run(KIND_CLASSIFIER, "summarize") is None

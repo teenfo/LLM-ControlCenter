@@ -403,10 +403,13 @@ rented-gpu:
 
 ```
 HTTP (Starlette)                                              main.py · meta.py
-  └ 파이프라인  ① 인증 → ② 가드 → ③ 저장 → ④ 배치 → ⑤ 실행    pipeline.py
+  └ 파이프라인  ① 인증 → ② 가드 → ②-b 라우팅 → ③ 저장
+                → ④ 배치 → ⑤ 실행 → ⑥ 출력 가드 → ⑦ 저장      pipeline.py
      ├ 인증      토큰 → 테넌트·서비스 · 3단 레이트리밋         auth.py · identity.py
      ├ 역할      설정 기본값 + 테넌트 오버라이드                roles.py
      ├ 가드      1단 패턴 → 2단 내부 노드 분류                 guard.py · evals.py
+     ├ 라우팅    역할 단위 옵트인. 마스킹본으로 1회 판정하고    pipeline.py · scheduler.py
+     │           **모델 값만** 치환한다 — 실패는 기본 모델
      ├ 저장      마스킹본 평문 + 원문 AES-GCM                  store.py · crypto.py
      ├ 배치      (잡, 노드) 쌍 선택 + 원자적 예약              cluster.py · cost.py
      │           입력 토큰 상한은 제출 시 재서 컬럼에 둔다      tokens.py

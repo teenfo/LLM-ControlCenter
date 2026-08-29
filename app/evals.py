@@ -21,8 +21,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .config import Config, GuardRule
 from .guard import ACTION_STRENGTH, Guard
@@ -30,6 +30,12 @@ from .store import SqliteStore, TenantScope
 
 KIND_RULES = "rules"
 KIND_CLASSIFIER = "classifier"
+#: 라우터 정확도. **인증 게이트가 아니다** — 관리자가 보고 고치는 값이다.
+KIND_ROUTER = "router"
+
+class EvalError(ValueError):
+    """정답셋·픽스처 자체가 틀렸다. **측정 결과가 아니라 측정의 오류다.**"""
+
 
 #: 승격 게이트가 요구하는 최소 검토 건수.
 #:
@@ -130,6 +136,42 @@ class ComplianceReport:
     @property
     def has_enough_samples(self) -> bool:
         return self.total >= MIN_SAMPLES_FOR_CERTIFICATION
+
+
+@dataclass(frozen=True)
+class RouterReport:
+    """라우터 정확도 — **가시화이지 게이트가 아니다.**
+
+    가드 2단은 인증(`ComplianceReport`)을 통과해야 판정할 자격이 생긴다.
+    오분류의 대가가 보안이기 때문이다. 라우팅은 다르다. 틀려도 기본 모델로
+    가고, 대가는 아낄 수 있었던 비용뿐이다. 그래서 **문턱을 두지 않는다** —
+    문턱을 두면 정확도가 낮은 설치처에서 라우팅이 조용히 꺼지고, 관리자는
+    켜 놓은 기능이 왜 안 도는지 모른 채 남는다.
+
+    대신 어디서 틀렸는지를 남긴다(`confusion`). `routes[key].description` 을
+    고치는 것이 관리자의 운영 루프이고, 그 루프에 필요한 것은 합격/불합격이
+    아니라 **어느 라우트가 어느 라우트로 새는가**다.
+    """
+
+    role: str
+    correct: int = 0
+    total: int = 0
+    #: (기대, 실제) → 건수. 실제가 `None` 이면 판정 실패 = 기본 모델.
+    confusion: Mapping[tuple[str, str | None], int] = field(default_factory=dict)
+
+    @property
+    def rate(self) -> float:
+        return self.correct / self.total if self.total else 0.0
+
+    @property
+    def worst_leak(self) -> tuple[str, str | None, int] | None:
+        """가장 많이 새는 (기대, 실제, 건수). 고칠 `description` 을 지목한다."""
+        leaks = [
+            (expected, actual, count)
+            for (expected, actual), count in self.confusion.items()
+            if expected != actual
+        ]
+        return max(leaks, key=lambda item: item[2]) if leaks else None
 
 
 #: 분류기 한 번 호출. 유효한 판정이면 규칙 id 집합, 스키마를 어기면 예외를 던진다.
@@ -550,6 +592,65 @@ class Evaluator:
                 KIND_CLASSIFIER, model,
                 passed=report.valid, total=report.total,
                 metrics={"rate": round(report.rate, 4), "failures": list(report.failures)},
+            )
+        return report
+
+    # -- 라우터 품질 ----------------------------------------------------------
+
+    async def measure_router(
+        self,
+        role: Any,
+        route_once: "Callable[[Any, str], Awaitable[str | None]]",
+        fixtures: "Sequence[tuple[str, str]]",
+        *,
+        record: bool = True,
+    ) -> RouterReport:
+        """라우터 정확도를 잰다. `fixtures` 는 (텍스트, 기대 라우트) 쌍이다.
+
+        가드 정답셋과 같은 체계를 재사용하되 **쓰임이 다르다.** 규칙 정답셋은
+        승격 게이트의 입력이고, 이것은 관리자가 보는 계기판이다 — 여기서 나온
+        수치로 무엇을 막지 않는다(`RouterReport` 참고).
+
+        기대 라우트가 이 역할의 어휘에 없으면 **픽스처를 고쳐야 한다.** 조용히
+        건너뛰면 라우트 키의 오타가 정확도 100% 로 보인다.
+        """
+        vocabulary = set(role.routing.routes) if role.routing else set()
+        confusion: dict[tuple[str, str | None], int] = {}
+        correct = 0
+
+        for text, expected in fixtures:
+            if expected not in vocabulary:
+                raise EvalError(
+                    f"픽스처의 기대 라우트 {expected!r} 가 역할 {role.name} 의 "
+                    f"어휘에 없다: {sorted(vocabulary)}"
+                )
+            try:
+                actual = await route_once(role, text)
+            except Exception:
+                # 라우터의 계약이 그렇다 — 실패는 예외가 아니라 기본 모델이다.
+                actual = None
+            confusion[(expected, actual)] = confusion.get((expected, actual), 0) + 1
+            if actual == expected:
+                correct += 1
+
+        report = RouterReport(
+            role=role.name, correct=correct, total=len(fixtures),
+            confusion=dict(confusion),
+        )
+        if record:
+            self._store.record_eval_run(
+                KIND_ROUTER, role.name,
+                passed=report.correct, total=report.total,
+                metrics={
+                    "rate": round(report.rate, 4),
+                    # JSON 키는 문자열이어야 한다. `None` 은 판정 실패다.
+                    "confusion": {
+                        f"{expected}->{actual or '기본'}": count
+                        for (expected, actual), count in sorted(
+                            report.confusion.items(), key=lambda kv: str(kv[0])
+                        )
+                    },
+                },
             )
         return report
 

@@ -887,7 +887,13 @@ async function renderJobs() {
         [t('ui.status'), t('ui.role'), t('ui.node'), t('ui.model'), '', { label: t('ui.cost'), num: true }, ''],
         (data.jobs || []).map((j) => [
           badge(j.status, j.status === 'ok' ? 'healthy' : (j.status === 'failed' ? 'unhealthy' : '')),
-          j.role, j.node || '—', j.model || '—',
+          j.role, j.node || '—',
+          // **"왜 이 모델로 갔는가" 는 모델 옆에서 물어보게 된다.** 열을 따로 두면
+          // 라우팅을 안 켠 설치처에서 언제나 비어 있는 열이 하나 는다.
+          el('span', {}, [
+            j.model || '—',
+            j.route ? el('span', { class: 'hint', text: ' ← ' + j.route }) : null,
+          ]),
           el('span', { class: 'mono', text: (j.prompt_masked || '').slice(0, 60) }),
           money(j.cost_usd),
           j.has_raw

@@ -1158,6 +1158,9 @@ async def tenant_jobs(request: Request) -> Response:
             "id": j.id, "service_id": j.service_id, "end_user_hash": j.end_user_hash,
             "role": j.role, "lane": j.lane, "status": j.status, "node": j.node,
             "model": j.model, "tier": j.tier, "attempts": j.attempts,
+            # **"왜 이 모델로 갔는가" 에 답한다.** 관리자 표면에만 나간다 —
+            # 소비자 계약(`/v1/generate`·`/v1/meta`)은 라우팅을 모른다(I5).
+            "route": j.route,
             "prompt_masked": j.prompt_masked, "response": j.response,
             "prompt_hash": j.prompt_hash, "system_hash": j.system_hash,
             "has_raw": j.prompt_cipher is not None,

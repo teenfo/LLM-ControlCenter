@@ -465,3 +465,154 @@ async def test_routing_failure_leaves_the_job_on_the_default_model(harness, clie
     assert response.status_code in (200, 202), "라우팅 실패가 제출을 깨뜨렸다"
     assert job.route is None
     assert _routed(harness.config.roles["summarize"], job.route).model == "m"
+
+
+# ── 3. 분류 실패 4종 — 전부 기본 모델 ───────────────────────────────────────
+#
+# 계획서가 네 가지를 이름으로 지정했다: 배치 불가 · 타임아웃 · 쓰레기 출력 · 미인증.
+# 넷을 **진짜 `make_router()`** 로 돈다 — `_router` 를 주입해 흉내 내면 검증되는 것은
+# 파이프라인의 실패 처리뿐이고, 정작 실패가 나는 자리는 라우터 안이다.
+
+
+def routed_role(harness):
+    return Role(
+        **{**harness.config.roles["summarize"].__dict__,
+           "placement": ("internal",),
+           "routing": routing(simple="m", complex="guard-m")},
+    )
+
+
+def certify(harness, model="guard-m", *, rate=1.0) -> None:
+    from app.evals import KIND_CLASSIFIER
+
+    total = 30
+    harness.store.record_eval_run(
+        KIND_CLASSIFIER, model, passed=int(total * rate), total=total,
+        metrics={"rate": rate},
+    )
+
+
+async def test_an_unplaceable_classifier_means_the_default_model(harness):
+    """배치 불가 — 내부 노드가 전부 죽어도 제출은 산다."""
+    certify(harness)
+    for state in harness.cluster.nodes.values():
+        state.provider.kill()
+        state.health = "unhealthy"
+
+    assert await harness.pipeline.make_router()(routed_role(harness), "분기 실적") is None
+
+
+async def test_a_classifier_timeout_means_the_default_model(harness):
+    """타임아웃 — 라우팅 때문에 제출이 늦어질지언정 실패하지는 않는다."""
+    certify(harness)
+
+    async def times_out(**_):
+        raise asyncio.TimeoutError()
+
+    for state in harness.cluster.nodes.values():
+        state.provider.generate = times_out
+
+    assert await harness.pipeline.make_router()(routed_role(harness), "분기 실적") is None
+
+
+async def test_garbage_output_means_the_default_model(harness):
+    """쓰레기 출력 — 어휘에 없는 답은 판정이 아니다."""
+    certify(harness)
+    for state in harness.cluster.nodes.values():
+        state.provider.reply = "음... 상황에 따라 다릅니다 🤔"
+
+    assert await harness.pipeline.make_router()(routed_role(harness), "분기 실적") is None
+
+
+async def test_an_uncertified_classifier_means_the_default_model(harness):
+    """미인증 — **인증 게이트는 라우팅에도 그대로 걸린다.**
+
+    구조화 출력을 못 지키는 모델로 라우팅하면 어차피 파싱이 실패한다. 그때
+    노드 시간만 쓰고 기본 모델로 가느니 부르지 않는 것이 맞다.
+    """
+    certify(harness, rate=0.1)      # 인증 문턱 아래
+    for state in harness.cluster.nodes.values():
+        state.provider.reply = "complex"      # 모델은 답할 수 있는데도
+
+    assert await harness.pipeline.make_router()(routed_role(harness), "분기 실적") is None
+    assert not [
+        call
+        for state in harness.cluster.nodes.values()
+        for call in state.provider.call_log
+    ], "미인증 모델을 부르고 나서 버렸다 — 노드 시간이 샌다"
+
+
+# ── 6. 오버라이드와의 우선순위 ──────────────────────────────────────────────
+
+
+def test_the_route_wins_over_a_tenant_override_on_the_model():
+    """**라우트가 마지막에 온다.**
+
+    테넌트 오버라이드는 `_roles.get()` 이 이미 적용해서 넘겨주고, `_routed` 는
+    그 결과 위에 얹는다. 순서가 뒤집히면 라우팅을 켠 테넌트에서 판정이 조용히
+    무시된다 — 모델은 오버라이드 값이고 잡의 `route` 는 채워져 있으니, 로그만
+    봐서는 라우팅이 도는 것처럼 보인다.
+    """
+    overridden = Role(
+        name="summarize", model="테넌트가_고른_모델",
+        routing=routing(simple="작은모델", complex="큰모델"),
+    )
+
+    assert _routed(overridden, "complex").model == "큰모델"
+    # 판정이 없으면 오버라이드가 그대로 남는다.
+    assert _routed(overridden, None).model == "테넌트가_고른_모델"
+
+
+# ── 데모 프로파일이 실제로 라우팅을 켠다 ────────────────────────────────────
+
+
+def test_the_shipped_config_routes_the_analyze_role():
+    """**README 데모 표가 주장하는 것을 설정이 실제로 하는가.**
+
+    표에 한 줄 적고 설정에 안 켜면, 시연자는 없는 기능을 보여주려다 그 자리에서
+    막힌다. `docs/architecture.md` §13-8 과 같은 이유의 장치다.
+    """
+    from app.config import load_config
+
+    config = load_config(ROOT / "config")
+    role = config.roles["analyze"]
+
+    assert role.routing is not None, "README 는 analyze 에 라우팅이 켜졌다고 말한다"
+    assert set(role.routing.routes) == {"simple", "complex"}
+    # 라우트 모델이 기본과 달라야 라우팅이 실제로 무언가를 한다.
+    assert role.routing.routes["simple"].model != role.model
+    assert role.routing.classifier in config.roles
+
+
+def test_the_readme_demo_row_names_the_routed_role():
+    """반대 방향 — 설정에서 라우팅을 끄면 표의 그 줄이 거짓말이 된다."""
+    from app.config import load_config
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    row = next(
+        (line for line in readme.splitlines() if "스마트 라우팅" in line and "|" in line),
+        "",
+    )
+    assert row, "README 데모 표에 스마트 라우팅 행이 없다"
+
+    routed = sorted(
+        name for name, role in load_config(ROOT / "config").roles.items()
+        if role.routing is not None
+    )
+    assert routed, "라우팅을 켠 역할이 없는데 README 는 데모할 수 있다고 말한다"
+    assert any(name in row for name in routed), (
+        f"README 가 지목한 역할과 설정이 어긋난다 — 켜진 역할: {routed}"
+    )
+
+
+def test_the_shipped_routes_carry_descriptions_the_classifier_can_use():
+    """`description` 이 곧 분류기의 프롬프트다 — 비어 있으면 판정이 무작위다."""
+    from app.config import load_config
+
+    for role in load_config(ROOT / "config").roles.values():
+        if role.routing is None:
+            continue
+        for key, spec in role.routing.routes.items():
+            assert len(spec.description) >= 10, (
+                f"{role.name}.{key} 의 설명이 너무 짧다 — 분류기가 읽는 문장이다"
+            )
