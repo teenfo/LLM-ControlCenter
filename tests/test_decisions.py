@@ -158,3 +158,51 @@ def test_the_roadmap_and_the_verdicts_do_not_contradict():
                 contradictions.append(f"{ref}: 로드맵은 ✅, 판정은 '{verdict}'")
 
     assert not contradictions, contradictions
+
+
+#: 구현 주장이 가리켜야 하는 것 — **저장소 안의 경로.**
+#:
+#: 문서는 백틱을 여러 뜻으로 쓴다: SQL 컬럼(`jobs.response`) · URL(`/v1/admin/*`) ·
+#: 표준 라이브러리(`asyncio.Event`) · 파일 이름(`master.key.new`). 어느 것이 코드
+#: 참조인지 추측하려 들면 장치가 시끄러워지고, **시끄러운 장치는 결국 꺼진다.**
+#: 그래서 추측하지 않고 형식을 요구한다: 디렉터리로 시작하는 경로 하나.
+_CODE_ROOTS = ("app/", "tests/", "config/", "static/")
+
+
+def test_an_item_claiming_implementation_points_at_code_that_exists():
+    """**"구현 완료" 는 검사받는 판정이다.**
+
+    이 문서의 다른 판정(채택·보류·기각)은 의도의 기록이라 코드로 확인할 것이
+    없다. 구현 완료는 다르다 — 사실 주장이고, **틀리면 그 항목을 다시 하려는
+    사람이 이미 있는 코드를 새로 짠다.** 반대로 코드를 지워도 문서는 여전히
+    그것이 있다고 말한다.
+
+    기계로 볼 수 있는 것은 **가리킨 경로가 실재하는가**까지다. 그 파일이 정말
+    그 기능인지는 그 파일의 테스트가 답한다. 그래도 이 정도로 충분하다 —
+    구현 완료라고 적으면서 어느 파일인지 못 적는 항목은 대개 완료가 아니다.
+
+    `docs/orchestration-plan.md` 처럼 다른 브랜치의 입력 문서는 대상이 아니다 —
+    이 저장소의 산출물이 아니라고 문서 자신이 밝히고 있다.
+    """
+    root = DOC.resolve().parent.parent
+
+    # "구현 보류" 는 구현 완료가 아니다 — 부분 문자열로 세면 정반대를 승인한다.
+    claimed = [
+        item for item, verdict in items().items()
+        if "구현 완료" in verdict or "구현됨" in verdict
+    ]
+    assert claimed, "구현 완료를 주장하는 항목이 하나도 없다 — 형식이 바뀌었나"
+
+    guilty: list[str] = []
+    for item in claimed:
+        paths = [
+            reference.split("::")[0]           # pytest 노드 id 는 파일까지만 본다
+            for reference in re.findall(r"`([^`\s]+)`", bodies()[item])
+            if reference.startswith(_CODE_ROOTS)
+        ]
+        if not paths:
+            guilty.append(f"{item}: 구현됐다면서 코드 경로를 하나도 안 가리킨다")
+            continue
+        guilty += [f"{item} → {path}" for path in paths if not (root / path).exists()]
+
+    assert not guilty, f"구현 주장이 코드와 어긋난다: {guilty}"
