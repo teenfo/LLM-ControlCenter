@@ -268,6 +268,7 @@ class Cluster:
         role: Role,
         placement_snapshot: Sequence[str] = (),
         prompt: str = "",
+        input_tokens: int | None = None,
         tenant_budget: float | None = None,
         service_budget: float | None = None,
         last_failed_node: str | None = None,
@@ -323,7 +324,8 @@ class Cluster:
 
                     cost = self._accountant.estimate_upper_bound(
                         provider=state.node.provider, model=model,
-                        prompt=prompt, max_output_tokens=max_output_tokens,
+                        prompt=prompt, input_tokens=input_tokens,
+                        max_output_tokens=max_output_tokens,
                     )
                     if cost > 0 and budget is None:
                         budget = self._accountant.budget_snapshot(

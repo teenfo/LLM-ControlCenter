@@ -208,3 +208,50 @@ def test_the_debt_table_records_that_offload_does_not_defend():
     assert "처리량 수치는 추정" not in readme, (
         "부하 테스트를 했는데 부채 표는 아직 추정이라고 말한다"
     )
+
+
+# ── 스캔 창의 원가가 프롬프트 크기를 따라가면 안 된다 ────────────────────────
+
+
+def test_the_scan_window_does_not_grow_with_prompt_size():
+    """**세 번째 결함이 같은 모양이었다.**
+
+    비용 상한을 재려면 텍스트가 필요했고, 그래서 스케줄러가 매 틱 스캔 창의
+    프롬프트를 통째로 읽었다 — 200KB 프롬프트 51건에서 그것만 60ms 다.
+    지금은 제출 시 잰 숫자 한 칸(`jobs.input_tokens_estimate`)을 읽는다.
+
+    위 두 장치와 같은 이유로 **시간을 재지 않는다.** 스캔 창이 물어 오는
+    바이트가 프롬프트 크기와 무관해야 한다는 성질로 못박는다 — 느린 러너에서
+    깜빡이지 않고, 텍스트를 다시 읽기 시작하면 반드시 실패한다.
+    """
+    from app.store import SqliteStore, TenantScope
+
+    def window_bytes(chars: int) -> int:
+        store = SqliteStore(":memory:")
+        store.create_tenant("acme", name="Acme", end_user_salt="s")
+        store.create_service(TenantScope("acme"), service_id="web", name="web")
+        for _ in range(20):
+            store.create_job(
+                TenantScope("acme"), service_id="web", role="summarize",
+                lane="interactive", prompt_masked="가" * chars,
+                prompt_external="가" * chars, system_masked="요약한다",
+            )
+        rows = store.claim_queued("interactive", limit=20)
+        assert len(rows) == 20
+        total = sum(
+            len(value)
+            for row in rows
+            for value in vars(row).values()
+            if isinstance(value, (str, bytes))
+        )
+        store.close()
+        return total
+
+    small = window_bytes(100)
+    large = window_bytes(100_000)
+
+    # 1,000배 긴 프롬프트인데 스캔 창이 물어 오는 양은 그대로여야 한다.
+    assert large == small, (
+        f"스캔 창이 프롬프트를 따라 커진다 ({small} → {large} 바이트) — "
+        "claim_queued 가 본문을 다시 읽고 있다"
+    )

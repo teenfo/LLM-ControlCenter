@@ -667,3 +667,136 @@ def test_the_backoff_still_ends(store, clock):
 
     clock.advance(10)      # 백오프 2초 + 지터 최대 0.5초를 넉넉히 넘긴다
     assert scheduler._retry_ready(job, clock()) is True
+
+
+# ── claim_queued 가 뽑는 컬럼 ────────────────────────────────────────────────
+#
+# 열거식 SELECT 가 두 번 사고를 냈다. `route` 가 빠져 라우팅 판정이 노드까지 안
+# 갔고, 마스킹본이 빠져 입력 토큰이 비용 예약에서 통째로 빠졌다. 둘 다 예외가
+# 아니라 **기본값**으로 나타났다 — `_row_to_job` 이 없는 컬럼을 조용히 `None`
+# 으로 채우기 때문이다. 아래 셋이 그 자리를 막는다.
+
+
+def _job_row_readers(tree):
+    """`claim_queued` 행을 그대로 받는 함수들.
+
+    `job` 이라는 매개변수를 받으면서 스스로 `get_job` 을 부르지 않는 함수가
+    그것이다 — `_execute` 는 `job_id` 만 받고 안에서 다시 읽으므로 전체 행을
+    갖는다. **목록을 손으로 관리하지 않는 것이 요점이다**: 새 함수가 생겨도
+    이 규칙이 알아서 덮는다.
+    """
+    import ast
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = {a.arg for a in node.args.args + node.args.kwonlyargs}
+        if "job" not in params:
+            continue
+        rereads = any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Attribute)
+            and c.func.attr == "get_job"
+            for c in ast.walk(node)
+        )
+        if not rereads:
+            yield node
+
+
+def test_the_scheduler_never_reads_a_blind_column():
+    """`SCHEDULER_BLIND_COLUMNS` 에 적힌 컬럼을 스케줄러가 읽으면 실패한다.
+
+    **빼도 되는 이유가 "안 읽으니까" 라면, 안 읽는다는 것을 검사해야 한다.**
+    안 그러면 다음 사람이 `_try_dispatch` 에서 `job.prompt_masked` 를 한 줄
+    읽는 순간 그 값은 언제나 `None` 이고, 아무도 그것을 못 본다 — 실제로
+    그렇게 됐었다.
+    """
+    import ast
+    from pathlib import Path
+
+    from app.store import SCHEDULER_BLIND_COLUMNS
+
+    source = Path(__file__).resolve().parent.parent / "app" / "scheduler.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+
+    # `_row_to_job` 이 JSON 컬럼은 이름을 바꿔서 준다.
+    field_to_column = {
+        "placement": "placement_json",
+        "tier_models": "tier_models_json",
+        "options": "options_json",
+        "allowed_boundaries": "allowed_boundaries_json",
+    }
+    functions = list(_job_row_readers(tree))
+    assert functions, "`job` 행을 받는 함수를 하나도 못 찾았다 — 검사가 헛돌고 있다"
+
+    trespass = {}
+    for function in functions:
+        for node in ast.walk(function):
+            if not (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)):
+                continue
+            if not (isinstance(node.value, ast.Name) and node.value.id == "job"):
+                continue
+            column = field_to_column.get(node.attr, node.attr)
+            if column in SCHEDULER_BLIND_COLUMNS:
+                trespass.setdefault(function.name, set()).add(column)
+
+    assert not trespass, (
+        f"{ {k: sorted(v) for k, v in trespass.items()} } — claim_queued 는 이 컬럼을 "
+        "안 뽑으므로 언제나 기본값이다. SCHEDULER_BLIND_COLUMNS 에서 빼거나 읽기를 지워라"
+    )
+
+
+def test_a_new_job_column_reaches_the_scheduler_by_default(store):
+    """**새 컬럼은 가만히 둬도 들어온다.** 방향이 뒤집힌 것이 이 수정의 요지다."""
+    from app.store import SCHEDULER_BLIND_COLUMNS
+
+    schema = {row["name"] for row in store._conn.execute("PRAGMA table_info(jobs)")}
+    selected = set(store._scheduler_columns())
+
+    assert selected == schema - SCHEDULER_BLIND_COLUMNS
+    # 사고가 났던 컬럼들을 이름으로 못박는다.
+    assert {"route", "input_tokens_estimate"} <= selected
+
+
+def test_the_dispatch_path_reserves_input_tokens_for_a_queued_job(store):
+    """큐에서 꺼낸 잡이 **입력 토큰 수를 들고 나온다.**
+
+    이 값이 `0` 이던 동안 `estimate_upper_bound` 는 입력 토큰을 통째로 빼고
+    계상했다 — 예산 초과가 **정산 뒤에야** 드러나는 그 경로다. 텍스트가 아니라
+    숫자를 들고 나오는 것이 요점이다: 스케줄러는 스캔 창만큼 매 틱 이것을 읽는다.
+    """
+    from app.tokens import estimate_input_tokens
+
+    enqueue(store, ACME, prompt="가" * 4_000)
+    job = store.claim_queued("interactive", limit=5)[0]
+
+    assert job.prompt_masked is None, "스케줄러는 프롬프트를 안 읽는다"
+    assert job.input_tokens_estimate == estimate_input_tokens("가" * 4_000)
+    assert job.input_tokens_estimate > 0
+
+
+def test_an_upgraded_database_backfills_the_estimate_for_live_jobs(tmp_path):
+    """**업그레이드 이전 잡도 `0` 으로 계상되면 안 된다.**
+
+    컬럼을 추가만 하면 그 순간 큐에 있던 잡은 전부 NULL 이고, 그것이 곧
+    "입력 토큰 없음" 이다. 이 제품이 고치려던 바로 그 침묵이다.
+    """
+    from app.store import SqliteStore, TenantScope
+
+    path = tmp_path / "jobs.db"
+    store = SqliteStore(path)
+    store.create_tenant("acme", name="Acme", end_user_salt="s")
+    store.create_service(TenantScope("acme"), service_id="web", name="web")
+    job_id = enqueue(store, ACME, prompt="가" * 1_000)
+    # 컬럼이 생기기 전 상태로 되돌린다 (ALTER 로는 컬럼을 못 지우므로 값만 비운다).
+    store._conn.execute("UPDATE jobs SET input_tokens_estimate = NULL")
+    store._conn.commit()
+    store.close()
+
+    reopened = SqliteStore(path)
+    try:
+        job = reopened.claim_queued("interactive", limit=5)[0]
+        assert job.id == job_id
+        assert job.input_tokens_estimate == 1_000, "백필이 안 돌았다"
+    finally:
+        reopened.close()

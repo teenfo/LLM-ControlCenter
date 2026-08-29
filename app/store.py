@@ -20,6 +20,8 @@ import json
 import sqlite3
 import time
 import uuid
+
+from .tokens import estimate_outbound_tokens
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
@@ -34,6 +36,36 @@ SCHEMA_VERSION = 1
 #: 우연히 둘 다 30일이라 지금까지 안 드러났을 뿐이다. 여기 두는 이유는 이 모듈이
 #: 어느 앱 모듈도 임포트하지 않는 바닥 레이어이기 때문이다.
 BUDGET_WINDOW_DAYS = 30
+
+#: `claim_queued` 가 **의도적으로 안 읽는** 잡 컬럼.
+#:
+#: 스캔 창(`scan_window_per_lane`, 기본 50)만큼 매 틱 읽으므로 큰 값을 넣으면
+#: 배치 결정과 무관한 바이트를 초당 수십 번 옮긴다. 실측으로 200KB 프롬프트
+#: 51건이면 텍스트를 같이 읽는 것만 60ms 다. 여기 있는 것은 전부 **디스패치
+#: 이전에는 쓸 일이 없는** 값이다:
+#:
+#: - 프롬프트 텍스트·암호문 — 스케줄러는 프롬프트를 안 본다. 비용 상한에 필요한
+#:   토큰 수는 제출 시 재서 `input_tokens_estimate` 에 넣어 뒀다. 실행 직전
+#:   `get_job` 이 본문을 꺼낸다.
+#: - 응답 계열 — 아직 응답이 없는 `queued` 잡만 뽑으므로 언제나 NULL 이다.
+#: - `error` — 재시도 판단은 `attempts`·`wait_*` 로 하고 메시지는 안 본다.
+#:
+#: **"안 읽으니까 뺀다" 는 검사받는다** — `test_the_scheduler_never_reads_a_blind_column`
+#: 이 `app/scheduler.py` 를 파싱해 여기 적힌 컬럼을 읽는지 본다. 한때
+#: 마스킹본이 여기 있었고 `_longest_outbound` 가 그것을 읽었다. 예외는 안 났다.
+#: 큐를 지난 모든 잡의 입력 토큰이 예약에서 조용히 `0` 이 됐을 뿐이다.
+SCHEDULER_BLIND_COLUMNS = frozenset({
+    "prompt_masked",
+    "prompt_external",
+    "system_masked",
+    "system_external",
+    "prompt_cipher",
+    "prompt_nonce",
+    "response",
+    "response_cipher",
+    "response_nonce",
+    "error",
+})
 
 #: 멱등성 키가 사는 시간(시). 업계 관행(24시간)을 따른다.
 #:
@@ -295,6 +327,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     options_json      TEXT NOT NULL DEFAULT '{}',
     timeout_s         INTEGER NOT NULL DEFAULT 120,
     max_prompt_chars  INTEGER,
+
+    -- 제출 시 잰 입력 토큰 상한(경계별 마스킹본 중 큰 쪽).
+    --
+    -- 값이 아니라 **위치**가 요점이다. 스케줄러는 매 틱 스캔 창만큼 잡을 훑는데,
+    -- 추정에 텍스트가 필요하면 그 창의 프롬프트 전량을 매 틱 읽어야 한다
+    -- (200KB 프롬프트 51건에서 60ms, 실측). 필요한 것은 숫자 한 칸이다.
+    input_tokens_estimate INTEGER,
 
     -- 디스패치 시점 결정 (노드 헬스가 런타임 상태라 불가피)
     node              TEXT,
@@ -568,6 +607,13 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 증명하지 못하면서 증명한 것처럼 보이게 만든다.
     ("admin_audit", "prev_hash", "TEXT"),
     ("admin_audit", "row_hash", "TEXT"),
+    # 라우팅 판정의 스냅샷. NULL = 라우팅을 안 켰거나 분류가 실패했다 = 기본 모델.
+    # 두 경우를 구분하는 컬럼을 따로 두지 않는 이유: 둘 다 결과가 같고, 왜 실패했는지는
+    # 메트릭(route_failures)이 답한다.
+    ("jobs", "route", "TEXT"),
+    # 제출 시 잰 입력 토큰 상한. 스케줄러가 매 틱 프롬프트를 다시 읽지 않게 하려고
+    # 둔다 — 옛 행은 NULL 이고 `_backfill_input_token_estimates` 가 채운다.
+    ("jobs", "input_tokens_estimate", "INTEGER"),
 )
 
 #: 컬럼이 생긴 **뒤에** 만들어야 하는 인덱스. `_SCHEMA` 에 두면 옛 DB 에서
@@ -631,6 +677,9 @@ class JobRow:
     prompt_hash: str | None = None
     system_hash: str | None = None
     idempotency_key: str | None = None
+    #: 제출 시점에 고정된 라우팅 판정. 재시도해도 안 바뀐다 — 디스패치마다 다시
+    #: 판정하면 같은 잡이 재시도마다 다른 모델을 타고 재현성이 사라진다.
+    route: str | None = None
     response: str | None = None
     response_cipher: bytes | None = None
     response_nonce: bytes | None = None
@@ -641,6 +690,9 @@ class JobRow:
     options: Mapping[str, Any] = field(default_factory=dict)
     timeout_s: int = 120
     max_prompt_chars: int | None = None
+    #: 제출 시 잰 입력 토큰 상한. 스케줄러가 비용을 예약할 때 읽는 값이다.
+    #: 업그레이드 이전 행은 마이그레이션이 채운다.
+    input_tokens_estimate: int = 0
     node: str | None = None
     model: str | None = None
     tier: str | None = None
@@ -706,6 +758,9 @@ class SqliteStore:
         now: Callable[[], float] = time.time,
     ) -> None:
         self._now = now
+        #: `_scheduler_columns` 의 결과. 스키마는 기동 시 한 번 정해지므로 매 틱
+        #: `PRAGMA` 를 때릴 이유가 없다.
+        self._scheduler_columns_cache: "tuple[str, ...] | None" = None
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -727,10 +782,43 @@ class SqliteStore:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         for statement in _POST_MIGRATION_INDEXES:
             self._conn.execute(statement)
+        self._backfill_input_token_estimates()
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
+        )
+
+    def _backfill_input_token_estimates(self) -> None:
+        """업그레이드 이전 잡의 입력 토큰 추정치를 채운다.
+
+        **아직 디스패치될 수 있는 잡만** 채운다. 끝난 잡은 이 값을 아무도 안 읽고,
+        보존 기간이 지나면 사라진다 — 전량을 다시 훑는 것은 업그레이드를 느리게 할
+        뿐이다. 반대로 `queued`·`running` 인 잡을 안 채우면 그 잡들의 입력 토큰이
+        예약에서 `0` 으로 계상된다. 그 조용한 `0` 이 이 컬럼을 만든 이유다.
+
+        비어 있어도(둘 다 NULL) `0` 을 써 둔다 — NULL 로 두면 "안 잰 것" 과
+        "재 보니 0" 이 다시 구분되지 않는다.
+        """
+        rows = self._conn.execute(
+            "SELECT id, prompt_masked, system_masked, prompt_external, system_external "
+            "FROM jobs WHERE input_tokens_estimate IS NULL "
+            "AND status IN ('queued', 'running')"
+        ).fetchall()
+        if not rows:
+            return
+        self._conn.executemany(
+            "UPDATE jobs SET input_tokens_estimate = ? WHERE id = ?",
+            [
+                (
+                    estimate_outbound_tokens(
+                        row["prompt_masked"], row["system_masked"],
+                        row["prompt_external"], row["system_external"],
+                    ),
+                    row["id"],
+                )
+                for row in rows
+            ],
         )
 
     @property
@@ -941,6 +1029,7 @@ class SqliteStore:
             "prompt_hash": fields.pop("prompt_hash", None),
             "system_hash": fields.pop("system_hash", None),
             "idempotency_key": fields.pop("idempotency_key", None),
+            "route": fields.pop("route", None),
             "placement_json": _json(list(fields.pop("placement", ()))),
             "tier_models_json": _json(dict(fields.pop("tier_models", {}))),
             "options_json": _json(dict(fields.pop("options", {}))),
@@ -953,6 +1042,13 @@ class SqliteStore:
         }
         if fields:
             raise StoreError(f"알 수 없는 잡 필드: {sorted(fields)}")
+
+        # **여기서 한 번만 잰다.** 호출자가 넘기는 값이 아니라 저장되는 텍스트에서
+        # 유도하므로 둘이 어긋날 수 없다 — 파이프라인이 깜박해도 채워진다.
+        row["input_tokens_estimate"] = estimate_outbound_tokens(
+            row["prompt_masked"], row["system_masked"],
+            row["prompt_external"], row["system_external"],
+        )
 
         columns = ", ".join(row)
         placeholders = ", ".join("?" * len(row))
@@ -1077,6 +1173,25 @@ class SqliteStore:
             f"SELECT COUNT(*) AS ahead FROM jobs WHERE {where}", params
         ).fetchone()
         return int(row["ahead"])
+
+    def route_counts(self) -> list[tuple[str, str | None, int]]:
+        """(역할, 라우트, 건수). `route` 가 `None` 인 행도 담는다.
+
+        **인메모리 카운터를 두지 않는 이유는 슬롯 장부와 같다** — 워커마다 하나씩
+        생기고 재기동이면 사라진다. 잡 행이 이미 판정을 들고 있으므로 세기만 하면 된다.
+
+        라우팅을 켠 역할의 `route IS NULL` 이 곧 라우팅 실패다. 둘을 구분하는 컬럼을
+        따로 두지 않은 대가인데, 어느 역할이 라우팅을 켰는지는 설정이 알므로
+        호출자가 그 둘을 가른다.
+
+        **테넌트를 가로지른다.** 메트릭에 테넌트 라벨을 안 붙이는 원칙이라 합계만 낸다.
+        """
+        return [
+            (row["role"], row["route"], int(row["n"]))
+            for row in self._conn.execute(
+                "SELECT role, route, COUNT(*) AS n FROM jobs GROUP BY role, route"
+            )
+        ]
 
     # -- 노드 점유 ------------------------------------------------------------
     #
@@ -1209,18 +1324,46 @@ class SqliteStore:
         쓰면 그 자리에서 중복 실행이 난다.
 
         스케줄러는 전 테넌트를 가로질러 봐야 하므로 테넌트 스코프가 없다.
-        대신 **프롬프트 본문을 읽지 않는다** — 배치 결정에 필요한 것은 정책과 메타데이터뿐이다.
+        무거운 컬럼은 `SCHEDULER_BLIND_COLUMNS` 로만 뺀다 — **빼는 쪽을 이름으로
+        적는다**(`_scheduler_columns` 참고).
         """
         rows = self._conn.execute(
-            "SELECT id, tenant_id, service_id, end_user_hash, role, lane, kind, status, "
-            "priority, placement_json, tier_models_json, options_json, timeout_s, "
-            "allowed_boundaries_json, node, model, tier, last_failed_node, attempts, "
-            "wait_reason, wait_since, cost_reserved_usd, created_at "
+            f"SELECT {', '.join(self._scheduler_columns())} "
             "FROM jobs WHERE status = 'queued' AND lane = ? "
             "ORDER BY priority DESC, created_at ASC LIMIT ?",
             (lane, int(limit)),
         )
         return [_row_to_job(r) for r in rows]
+
+    def _scheduler_columns(self) -> tuple[str, ...]:
+        """`claim_queued` 가 읽을 컬럼 — **스키마 전체에서 눈감을 것만 뺀다.**
+
+        원래 이 자리에는 컬럼을 하나하나 나열한 SELECT 가 있었다. 그러다
+        `route` 컬럼이 추가됐고 이 목록에는 안 들어갔다. `_row_to_job` 은 없는
+        컬럼을 조용히 기본값으로 채우므로(`get()`), 스케줄러는 **모든 잡의
+        `route` 를 `None` 으로 읽었다** — 라우팅 판정이 잡에는 박히는데 노드까지
+        안 갔다. 같은 사고가 이미 한 번 더 있었다: `prompt_masked` 계열이 빠져
+        있어서 `_longest_outbound` 가 언제나 빈 문자열을 냈고, 큐를 지난 모든 잡의
+        **입력 토큰이 비용 예약에서 빠졌다.**
+
+        둘 다 예외가 아니라 기본값으로 나타났다. 열거식 SELECT 의 실패는 언제나
+        이 모양이다 — 안 뽑은 컬럼과 NULL 인 컬럼이 구분되지 않는다.
+
+        그래서 방향을 뒤집는다. 새 컬럼은 **가만히 둬도 들어온다**(안전한 쪽으로
+        틀린다). 빼려면 `SCHEDULER_BLIND_COLUMNS` 에 이름을 적어야 하고, 거기 적힌
+        컬럼을 스케줄러가 읽으면 `test_the_scheduler_never_reads_a_blind_column`
+        이 실패한다.
+
+        `PRAGMA` 로 읽으므로 마이그레이션으로 늘어난 컬럼도 자동으로 따라온다.
+        """
+        if self._scheduler_columns_cache is None:
+            columns = tuple(
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(jobs)")
+                if str(row["name"]) not in SCHEDULER_BLIND_COLUMNS
+            )
+            self._scheduler_columns_cache = columns
+        return self._scheduler_columns_cache
 
     def count_queued(self, lane: str) -> int:
         row = self._conn.execute(
@@ -2845,6 +2988,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRow:
         prompt_hash=get("prompt_hash"),
         system_hash=get("system_hash"),
         idempotency_key=get("idempotency_key"),
+        route=get("route"),
         response=get("response"),
         response_cipher=get("response_cipher"),
         response_nonce=get("response_nonce"),
@@ -2855,6 +2999,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRow:
         options=loads("options_json", {}),
         timeout_s=get("timeout_s", 120) or 120,
         max_prompt_chars=get("max_prompt_chars"),
+        input_tokens_estimate=get("input_tokens_estimate", 0) or 0,
         node=get("node"),
         model=get("model"),
         tier=get("tier"),

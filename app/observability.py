@@ -110,6 +110,7 @@ def collect(
     version: str = "",
     airgap: bool = False,
     thresholds: Any = None,
+    roles: Any = None,
 ) -> list[Metric]:
     """지금 상태를 메트릭으로.
 
@@ -246,6 +247,38 @@ def collect(
             ({"direction": "output"}, rate["output_tokens_per_minute"]),
         ],
     )
+
+    # -- 라우팅 --
+    #
+    # 라벨은 **역할과 라우트 키뿐이다.** 둘 다 설정 어휘라 카디널리티가 유한하고,
+    # 테넌트 라벨 금지 원칙은 여기서도 그대로다.
+    if roles is not None:
+        routed_roles = {name for name, role in roles.items() if role.routing is not None}
+        if routed_roles:
+            counts = store.route_counts()
+            decisions = [
+                ({"role": role, "route": route}, float(n))
+                for role, route, n in sorted(counts, key=lambda row: (row[0], row[1] or ""))
+                if route and role in routed_roles
+            ]
+            if decisions:
+                gauge(
+                    "route_decisions",
+                    "라우트별 배치 건수(전 테넌트 합계)",
+                    decisions,
+                )
+            # **라우팅을 켠 역할의 `route` 없음 = 분류가 답을 못 준 것이다.**
+            # 이것이 0 이 아니라고 고장은 아니다 — fail-to-default 라 결과는 정상이고,
+            # 계속 높으면 `description` 을 고치라는 신호다.
+            gauge(
+                "route_failures",
+                "라우팅을 켠 역할인데 라우트가 안 정해진 건수(기본 모델로 갔다)",
+                [
+                    ({"role": role}, float(n))
+                    for role, route, n in sorted(counts)
+                    if route is None and role in routed_roles
+                ],
+            )
 
     # -- 알림 --
     if notifier is not None:

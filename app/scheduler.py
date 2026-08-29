@@ -25,14 +25,14 @@ import asyncio
 import contextlib
 import hashlib
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Sequence
 
 import logging
 
 from .cluster import FAIL, WAIT, Cluster, Placement
 from .completion import CompletionSignal
-from .config import EXTERNAL, Config
+from .config import EXTERNAL, Config, Role
 from .cost import CostAccountant
 from .crypto import response_aad
 from .guard import (
@@ -71,17 +71,42 @@ class LaneStats:
     wait_reasons: dict[str, int] = field(default_factory=dict)
 
 
-def _longest_outbound(job: Any) -> str:
-    """이 잡이 노드로 보낼 수 있는 가장 긴 텍스트. 비용 예약의 입력 근거다.
+def _routed(role: Role, route: str | None) -> Role:
+    """라우팅 판정을 **역할 값의 치환**으로 적용한다.
 
-    경계마다 마스킹 결과가 다르고(외부용이 더 많이 가려진다) 배치 전에는 어느 쪽으로
-    갈지 모른다. **예약은 상한이므로 긴 쪽을 쓴다** — 남는 예약은 정산에서 풀린다.
+    이 함수가 이 설계의 요지다. "모델은 정책" 이므로 라우팅은 정책 값을 바꾸는 것으로
+    끝나고, 그래서 **`cluster.py` 는 한 줄도 안 바뀐다** — 배치는 여전히
+    `role.model_for_tier(tier)` 를 그대로 읽는다.
+
+    바꾸는 것은 모델뿐이다. `placement` 도 `internal_only` 도 안 건드린다 — 설정
+    파서가 그 키를 아예 거부하지만(불변식 I2), 여기서도 못 넓히는 것이 두 번째
+    자물쇠다.
+
+    라우트 키가 지금 설정에 없으면(관리자가 지운 뒤 옛 잡이 남았으면) 그냥 기본
+    모델이다. 판정은 스냅샷이지만 **그 판정이 가리키는 대상이 사라질 수는 있다.**
     """
-    internal = (job.prompt_masked or "") + (job.system_masked or "")
-    external = (job.prompt_external or job.prompt_masked or "") + (
-        job.system_external or job.system_masked or ""
+    if not route or role.routing is None:
+        return role
+    spec = role.routing.routes.get(route)
+    if spec is None:
+        return role
+    return replace(
+        role,
+        model=spec.model,
+        tier_models={**role.tier_models, **spec.tier_models},
     )
-    return max(internal, external, key=len)
+
+
+#: 이 잡이 노드로 보낼 수 있는 최대 입력 토큰 — 비용 예약의 입력 근거.
+#:
+#: 한때 이 자리에는 마스킹본을 이어 붙여 긴 쪽을 고르는 함수가 있었다. 그런데
+#: `claim_queued` 가 그 컬럼들을 안 뽑았고, `_row_to_job` 은 없는 컬럼을 조용히
+#: `None` 으로 채운다 — 함수는 언제나 빈 문자열을 냈고 **큐를 지난 모든 잡의
+#: 입력 토큰이 예약에서 `0` 이 됐다.** 예외도 로그도 없이.
+#:
+#: 그래서 스케줄러가 텍스트를 안 보게 만들었다. 값은 제출 시 한 번 재서
+#: `jobs.input_tokens_estimate` 에 들어 있다(`tokens.estimate_outbound_tokens`).
+#: 매 틱 스캔 창의 프롬프트를 다시 읽지도 않고, 재시도마다 다시 재지도 않는다.
 
 
 #: 백오프에 얹는 흔들림의 비율. 노드 하나가 죽으면 그 노드에 있던 잡이 **전부 같은
@@ -306,6 +331,8 @@ class Scheduler:
             self._fail(scope, job, "unknown_role", f"역할 {job.role} 이 없다")
             return False
 
+        role = _routed(role, job.route)
+
         tenant = self._store.get_tenant(job.tenant_id)
         service = self._store.get_service(scope, job.service_id)
 
@@ -315,13 +342,11 @@ class Scheduler:
             service_id=job.service_id,
             role=role,
             placement_snapshot=job.placement,
-            # **실제로 나갈 텍스트를 넘긴다.** 여기가 `0` 이었고, 그래서 큐를 지난
+            # **제출 시 잰 값을 넘긴다.** 여기가 `0` 이었고, 그래서 큐를 지난
             # 모든 잡의 입력 토큰이 비용 예약에서 빠졌다 — 긴 프롬프트가 과금 노드로
             # 나가도 예약은 출력 토큰만 잡았고, 예산 초과가 정산 뒤에야 드러났다.
-            #
-            # 어느 경계로 갈지는 아직 모르므로 **둘 중 긴 쪽**을 쓴다. 예약은 상한이라
-            # 넉넉한 쪽으로 틀리는 것이 맞고, 남는 예약은 정산에서 풀린다.
-            prompt=_longest_outbound(job),
+            # 경위는 이 모듈 상단 `_routed` 위의 주석에 적어 뒀다.
+            input_tokens=job.input_tokens_estimate,
             tenant_budget=tenant["budget_usd_per_month"] if tenant else None,
             service_budget=service["budget_usd_per_month"] if service else None,
             last_failed_node=job.last_failed_node,

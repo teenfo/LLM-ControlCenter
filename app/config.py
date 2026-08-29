@@ -97,6 +97,37 @@ class Node:
 
 
 @dataclass(frozen=True)
+class RouteSpec:
+    """한 라우트가 바꾸는 것 — **모델뿐이다.**
+
+    `placement` 도 `internal_only` 도 여기 없다. 있으면 라우트가 역할의 경계를 넓힐 수
+    있게 되고, 그것은 "경계는 좁아지기만 한다"(불변식 I2)를 정면으로 깬다. 파서가
+    그 키들을 **읽지 않는 것이 아니라 거부한다** — 안 읽으면 관리자는 적어 둔 값이
+    듣는 줄 안다.
+    """
+
+    model: str
+    #: 분류 프롬프트에 실리는 재료. **없으면 판정할 근거가 없다** — 가드 LLM 규칙이
+    #: `description` 을 필수로 두는 것과 같은 이유다.
+    description: str
+    tier_models: Mapping[str, str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tier_models", dict(self.tier_models or {}))
+
+
+@dataclass(frozen=True)
+class RoleRouting:
+    """역할 안의 라우팅 정책. **역할 단위 옵트인이다** — 안 적으면 아무것도 안 바뀐다."""
+
+    classifier: str
+    routes: Mapping[str, RouteSpec]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "routes", dict(self.routes))
+
+
+@dataclass(frozen=True)
 class Role:
     """모델 정책에 이름을 붙인 것. 소비자와의 계약 단위."""
 
@@ -115,6 +146,8 @@ class Role:
     system: str | None = None
     #: True 면 external 경계 노드에 절대 배치되지 않는다. 오버라이드로 풀 수 없다.
     internal_only: bool = False
+    #: 라우팅 정책. `None` 이면 이 역할은 라우팅을 **호출조차 하지 않는다.**
+    routing: "RoleRouting | None" = None
 
     def __post_init__(self) -> None:
         # 동결 데이터클래스에서 가변 기본값을 피하기 위한 처리.
@@ -357,7 +390,62 @@ def _role_from_dict(name: str, raw: Mapping[str, Any]) -> Role:
         tier_models=raw.get("tier_models") or {},
         system=raw.get("system"),
         internal_only=bool(raw.get("internal_only", False)),
+        routing=_routing_from_dict(name, raw.get("routing")),
     )
+
+
+#: 라우트가 가질 수 **없는** 키. 여기 있는 것은 역할의 것이고 라우트는 모델만 바꾼다.
+FORBIDDEN_ROUTE_KEYS = ("placement", "internal_only", "lane", "kind", "system")
+
+
+def _routing_from_dict(role_name: str, raw: Any) -> "RoleRouting | None":
+    """`routing:` 절을 읽는다. **기동 시점에 거부하는 것이 요지다.**
+
+    라우팅 오류는 런타임에 조용히 드러난다 — 분류가 실패하면 기본 모델로 도니까
+    "설정이 틀렸다" 가 아니라 "라우팅이 원래 잘 안 된다" 로 읽힌다. 그래서 틀릴 수
+    있는 것을 전부 기동 시점으로 끌어올린다.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ConfigError(f"역할 {role_name}: routing 은 매핑이어야 한다")
+
+    classifier = raw.get("classifier")
+    if not classifier:
+        raise ConfigError(f"역할 {role_name}: routing.classifier 가 필요하다")
+
+    routes_raw = raw.get("routes") or {}
+    if not routes_raw:
+        raise ConfigError(
+            f"역할 {role_name}: routing.routes 가 비어 있다 — 고를 것이 없으면 "
+            "라우팅을 켜지 않는 것과 같고, 켰다고 믿는 쪽이 나쁘다"
+        )
+
+    routes: dict[str, RouteSpec] = {}
+    for key, spec in routes_raw.items():
+        if not isinstance(spec, Mapping):
+            raise ConfigError(f"역할 {role_name}: 라우트 {key} 가 매핑이 아니다")
+        present = [k for k in FORBIDDEN_ROUTE_KEYS if k in spec]
+        if present:
+            raise ConfigError(
+                f"역할 {role_name}: 라우트 {key} 에 {', '.join(present)} 을 둘 수 없다 — "
+                "라우트는 모델만 바꾼다. 경계·레인·종류는 역할의 것이고, "
+                "라우트가 그것을 넓히면 경계가 좁아지기만 한다는 계약이 깨진다"
+            )
+        if not spec.get("model"):
+            raise ConfigError(f"역할 {role_name}: 라우트 {key} 에 model 이 없다")
+        if not spec.get("description"):
+            raise ConfigError(
+                f"역할 {role_name}: 라우트 {key} 에 description 이 없다 — "
+                "분류기가 무엇을 보고 이 라우트를 고르는지가 그 문장이다"
+            )
+        routes[str(key)] = RouteSpec(
+            model=str(spec["model"]),
+            description=str(spec["description"]),
+            tier_models=spec.get("tier_models") or {},
+        )
+
+    return RoleRouting(classifier=str(classifier), routes=routes)
 
 
 def _guard_rule_from_dict(raw: Mapping[str, Any], locale_pack: str) -> GuardRule:
@@ -531,13 +619,57 @@ def load_config(config_dir: str | Path) -> Config:
     return config
 
 
+def _validate_routing(config: Config, role: Role, catalog_models: set[str]) -> None:
+    """라우팅이 다른 파일과 맞물리는 지점. `routing` 절만 봐서는 못 잡는 것들.
+
+    **분류 역할이 `internal_only` 여야 하는 것이 여기서 가장 중요하다.** 라우터는
+    소비자 프롬프트(마스킹본)를 LLM 에 보여준다. 그 역할이 경계 밖에 배치될 수 있으면
+    라우팅을 켠 것만으로 프롬프트가 밖으로 나가는 경로가 생긴다 — 가드 2단 분류기에
+    같은 제약이 걸려 있는 것과 같은 이유다.
+    """
+    routing = role.routing
+    assert routing is not None
+
+    classifier = config.roles.get(routing.classifier)
+    if classifier is None:
+        raise ConfigError(
+            f"역할 {role.name}: 라우팅 분류 역할 {routing.classifier!r} 이 없다"
+        )
+    if not classifier.internal_only:
+        raise ConfigError(
+            f"역할 {role.name}: 라우팅 분류 역할 {routing.classifier!r} 이 "
+            "internal_only 가 아니다 — 라우터는 소비자 프롬프트를 LLM 에 보여주므로 "
+            "경계 밖에 배치될 수 있으면 그 자체가 유출 경로다"
+        )
+
+    # 카탈로그에 없는 모델은 설치 요청 경로도 못 타므로 그 라우트는 영원히 안 돈다.
+    # 라우팅은 실패해도 기본 모델로 도니까 **조용히** 안 도는 것이 문제다.
+    if catalog_models:
+        for key, spec in routing.routes.items():
+            unknown = [
+                model
+                for model in (spec.model, *spec.tier_models.values())
+                if model not in catalog_models
+            ]
+            if unknown:
+                raise ConfigError(
+                    f"역할 {role.name}: 라우트 {key} 의 모델 {unknown} 이 "
+                    "카탈로그에 없다 — 그 라우트는 조용히 안 돈다"
+                )
+
+
 def validate_cross_references(config: Config) -> None:
     """파일을 넘나드는 검증. 개별 파일만 봐서는 못 잡는 것들."""
+    catalog_models = {entry.name for entry in config.catalog}
+
     for role in config.roles.values():
         if role.lane not in config.lanes:
             raise ConfigError(
                 f"역할 {role.name}: 레인 {role.lane!r} 이 lanes.yaml 에 없다"
             )
+
+        if role.routing is not None:
+            _validate_routing(config, role, catalog_models)
 
         # placement 티어가 어떤 노드와도 매칭되지 않으면 그 역할은 영원히 못 돈다.
         # 시드 노드만 보고 판정하므로 경고성이지만, 오타를 기동 시점에 잡아준다.

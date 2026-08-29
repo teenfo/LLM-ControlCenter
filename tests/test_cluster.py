@@ -921,7 +921,7 @@ def test_the_estimator_errs_high_not_low():
 
     과소 추정은 예산을 넘긴 뒤에 드러나고, 과대 추정은 정산에서 풀린다.
     """
-    from app.cost import estimate_input_tokens
+    from app.tokens import estimate_input_tokens
 
     # 한글 한 글자가 토큰 하나 아래로 계상되면 안 된다.
     assert estimate_input_tokens("가" * 100) >= 100

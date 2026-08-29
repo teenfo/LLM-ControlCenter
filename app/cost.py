@@ -20,31 +20,10 @@ from typing import Callable
 from .config import Pricing
 from .store import BUDGET_WINDOW_DAYS, SqliteStore, TenantScope
 
-#: 라틴 문자 기준 문자당 토큰 비율. 영어 산문이 대략 이 근처다.
-ASCII_CHARS_PER_TOKEN = 4.0
-
-#: 한글·한자·가나는 BPE 에서 **문자 하나가 토큰 하나 이상**이 되는 일이 흔하다.
-#: 하나의 비율(3.0)로 뭉뚱그리면 한국어 프롬프트의 입력 토큰을 서너 배 과소 추정하고,
-#: 그 순간 "상한 예약" 이 상한이 아니게 된다 — 예산이 넘은 뒤에야 드러난다.
-WIDE_CHARS_PER_TOKEN = 1.0
-
-#: 이 코드포인트 이상을 넓은 문자로 본다. CJK 부수(U+2E80)부터 시작해 한중일 문자와
-#: 가나·한글·이모지를 모두 덮는다. 정확한 토크나이저를 흉내 내지 않는다 —
-#: **예약은 상한이므로 넉넉한 쪽으로 틀리는 것이 맞다.**
-WIDE_CODEPOINT_START = 0x2E80
-
-
-def estimate_input_tokens(text: str) -> int:
-    """입력 토큰 상한 추정. 프로바이더마다 토크나이저가 달라 정확할 수 없다.
-
-    정확할 수 없으므로 **어느 쪽으로 틀릴지를 고른다.** 과소 추정은 예산을 넘긴 뒤에
-    드러나고, 과대 추정은 예약이 조금 더 잡혔다가 정산에서 풀린다. 후자를 고른다.
-    """
-    if not text:
-        return 0
-    wide = sum(1 for ch in text if ord(ch) >= WIDE_CODEPOINT_START)
-    narrow = len(text) - wide
-    return int(narrow / ASCII_CHARS_PER_TOKEN + wide / WIDE_CHARS_PER_TOKEN)
+# 추정 자체는 `tokens.py` 에 있다 — `store.py` 도 같은 함수를 써야 하는데
+# 그쪽이 이 모듈을 임포트할 수 없기 때문이다(순환). 비율 상수는 그쪽에 두고
+# 여기서 다시 내보내지 않는다 — 두 군데서 임포트할 수 있으면 언젠가 한쪽만 바뀐다.
+from .tokens import estimate_input_tokens
 
 
 @dataclass(frozen=True)
@@ -99,6 +78,7 @@ class CostAccountant:
         provider: str,
         model: str,
         prompt: str = "",
+        input_tokens: int | None = None,
         max_output_tokens: int | None = None,
     ) -> float:
         """이 잡이 최대로 쓸 수 있는 비용.
@@ -106,14 +86,20 @@ class CostAccountant:
         예약은 상한이어야 한다 — 평균으로 예약하면 절반의 잡이 예산을 넘긴 뒤에 드러난다.
 
         **문자 수가 아니라 프롬프트를 받는다.** 호출자가 길이만 넘기면 어떤 문자였는지가
-        사라지고, 한국어와 영어가 같은 토큰 수로 계상된다. 실제로 스케줄러가 길이를
-        `0` 으로 넘기고 있었고 — 큐를 지난 모든 잡의 입력 토큰이 예약에서 빠졌다.
+        사라지고, 한국어와 영어가 같은 토큰 수로 계상된다.
+
+        `input_tokens` 를 주면 그것을 그대로 믿는다 — 스케줄러가 쓰는 경로다.
+        큐에 있는 잡의 토큰 수는 **제출 시 이미 재서 컬럼에 넣어 뒀다**
+        (`jobs.input_tokens_estimate`). 매 틱 스캔 창의 프롬프트 전량을 다시 읽는
+        대신 숫자 한 칸을 읽는다. 같은 함수(`tokens.estimate_input_tokens`)로
+        잰 값이라 두 경로의 결과가 갈리지 않는다.
         """
         input_rate, output_rate = self._pricing.rate(provider, model)
         if input_rate == 0.0 and output_rate == 0.0:
             return 0.0  # 로컬 노드. 같은 경로를 타되 0 이 계상된다
 
-        input_tokens = estimate_input_tokens(prompt)
+        if input_tokens is None:
+            input_tokens = estimate_input_tokens(prompt)
         output_tokens = max_output_tokens or self._pricing.assumed_max_output_tokens
 
         return (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000

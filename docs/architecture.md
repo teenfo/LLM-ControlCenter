@@ -409,6 +409,7 @@ HTTP (Starlette)                                              main.py · meta.py
      ├ 가드      1단 패턴 → 2단 내부 노드 분류                 guard.py · evals.py
      ├ 저장      마스킹본 평문 + 원문 AES-GCM                  store.py · crypto.py
      ├ 배치      (잡, 노드) 쌍 선택 + 원자적 예약              cluster.py · cost.py
+     │           입력 토큰 상한은 제출 시 재서 컬럼에 둔다      tokens.py
      └ 실행      프로바이더                                    providers/
 
 배경        레인 루프 · 헬스 · 모델 설치 · 보존 · 감시         scheduler.py · models.py

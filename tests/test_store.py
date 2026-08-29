@@ -259,7 +259,14 @@ def test_unknown_job_field_is_rejected(store):
 def test_claim_queued_does_not_read_prompt_bodies(store):
     """스케줄러는 전 테넌트를 가로지르므로 프롬프트 본문을 읽지 않는다.
 
-    배치 결정에 필요한 것은 정책과 메타데이터뿐이다.
+    **하지만 이 단언 하나만 있으면 안 된다.** 한동안 그랬고, 그동안 배치는
+    프롬프트가 필요했다 — 비용 상한을 재려면 텍스트를 봐야 했기 때문이다.
+    그래서 큐를 지난 모든 잡의 입력 토큰이 예약에서 `0` 으로 계상됐고,
+    **이 테스트는 그것을 통과시켰다.** 없는 컬럼과 NULL 인 컬럼이 구분되지
+    않으므로, "안 읽는다" 는 단언은 언제나 통과한다.
+
+    지금은 배치가 텍스트를 안 본다. 필요한 숫자는 제출 시 재서 컬럼에 들어
+    있다 — 아래 줄이 그 짝이고, 둘이 같이 있어야 이 테스트가 의미를 갖는다.
     """
     make_job(store, ACME, prompt_masked="민감할 수 있는 내용")
     claimed = store.claim_queued("interactive", limit=10)
@@ -267,6 +274,9 @@ def test_claim_queued_does_not_read_prompt_bodies(store):
     assert len(claimed) == 1
     assert claimed[0].prompt_masked is None
     assert claimed[0].prompt_cipher is None
+    # **본문을 안 읽어도 비용은 잰다.** 이 줄이 없으면 위 세 줄은 조용한 `0` 을
+    # 정상으로 승인한다.
+    assert claimed[0].input_tokens_estimate > 0
 
 
 def test_claim_queued_orders_by_priority_then_age(store, clock):

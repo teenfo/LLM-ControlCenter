@@ -1649,6 +1649,7 @@ async def metrics(request: Request) -> Response:
         store=ctx.store, cluster=ctx.cluster, scheduler=ctx.scheduler,
         registrar=ctx.registrar, notifier=ctx.notifier, vault=ctx.vault,
         version=ctx.version, airgap=ctx.airgap, thresholds=ctx.config.thresholds,
+        roles=ctx.config.roles,
     ))
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
