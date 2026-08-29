@@ -616,3 +616,23 @@ def test_the_shipped_routes_carry_descriptions_the_classifier_can_use():
             assert len(spec.description) >= 10, (
                 f"{role.name}.{key} 의 설명이 너무 짧다 — 분류기가 읽는 문장이다"
             )
+
+
+def test_the_debt_table_records_what_routing_does_not_do():
+    """**구현한 것마다 한계를 적는 자리에 라우팅만 빠져 있으면 안 된다.**
+
+    이 표의 규칙은 "안 적으면 설치처가 한다고 믿습니다" 이다. 라우팅은 두 가지를
+    안 한다: 가드와 호출을 합치지 않고(요청당 최대 3회), 정확도 픽스처를 번들에
+    넣지 않는다(설치처 워크로드가 정한다). 둘 다 켜 놓고 모르면 손해가 나는
+    쪽이라 표에 있어야 한다.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    debt = readme.split("### 아직 없는 것")[1].split("### 하지 않기로 한 것")[0]
+
+    merge = next((line for line in debt.splitlines() if "합치지 않았다" in line), "")
+    assert merge, "부채 표에 라우팅 호출 합치기 항목이 없다"
+    assert "3회" in merge, "요청당 호출 수라는 대가가 안 적혀 있다"
+
+    accuracy = next((line for line in debt.splitlines() if "라우팅 정확도" in line), "")
+    assert accuracy, "부채 표에 라우팅 정확도 측정 항목이 없다"
+    assert "measure_router" in accuracy, "설치처가 어떻게 재는지를 안 가리킨다"
