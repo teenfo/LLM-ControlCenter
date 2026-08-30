@@ -698,6 +698,13 @@ async def session(request: Request) -> Response:
         # "붙었는가" 를 답하면 화면이 거짓말을 한다.
         "guard_classifier_ready": classifier_ready,
         "guard_classifier_reason": classifier_reason,
+        # 라우팅도 같은 함정이다 — 분류기가 미인증이면 켜 놓은 라우팅이 조용히
+        # 전건 기본 모델로 간다. 관리자 화면이 그것을 보여줘야 한다(QA R-HIGH).
+        "routing_ready": {
+            name: ctx.evaluator.classifier_ready(role.routing.classifier)[0]
+            for name, role in ctx.config.roles.items()
+            if role.routing is not None
+        },
         # **유예를 조용히 두면 그게 더 나쁘다.** 차단 규칙이 audit 로 낮춰진 채
         # 도는 것을 모르면 관리자는 필터가 지키고 있다고 믿는다.
         "guard_grace_mode": ctx.guard.grace_mode,

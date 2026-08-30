@@ -179,6 +179,9 @@ def harness(config, store, clock, vault):
         config, store, cluster, accountant=accountant, registrar=registrar,
         now=clock, notifier=notifier, guard=guard, vault=vault,
         completion=completion,
+        # 프로덕션 조립(cli.Assembly)과 같은 배선 — 테스트만 다른 모양으로 조립하면
+        # 배선 누락이 테스트에 안 걸린다. QA R-HIGH 가 정확히 그 빈칸이었다.
+        evaluator=evaluator, certifier_factory=pipeline.make_certifier,
     )
 
     app = build_app(

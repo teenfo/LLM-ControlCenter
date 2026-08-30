@@ -299,3 +299,32 @@ def test_the_contract_warns_about_control_tokens(client, acme):
 
     assert "인젝션" in guide
     assert "im_start" in guide, "제어 토큰이 마스킹된다는 사실이 계약에 없다"
+
+
+def test_the_mock_answers_the_routing_prompt_with_a_key():
+    """목↔파이프라인 형식 드리프트 장치 — 라우팅판.
+
+    목은 `[선택지]` 절을 텍스트로 인식한다(카나리아와 같은 이유로 파이프라인을
+    임포트하지 않는다). 프롬프트 형식이 바뀌어 목이 못 알아보면 데모의 라우팅
+    판정이 전부 NONE 이 된다 — 그 갈림을 여기서 잡는다.
+    """
+    from app.pipeline import _parse_route, _routing_prompt
+    from app.providers.mock import _compliant_classifier_reply
+
+    routes = {
+        "simple": type("S", (), {"description": "한두 문단 요약"})(),
+        "complex": type("S", (), {"description": "장문 분석"})(),
+    }
+    prompt = _routing_prompt(
+        "분기 실적을 요약해줘", routes, fence="f" * 16, canary="a1b2c3d4e5f60718",
+    )
+    reply = _compliant_classifier_reply(prompt)
+
+    assert reply is not None, "목이 라우팅 프롬프트를 못 알아봤다"
+    assert _parse_route(reply, routes, canary="a1b2c3d4e5f60718") in routes, (
+        f"목의 답이 판정으로 안 읽힌다: {reply!r}"
+    )
+
+    # 결정론 — 같은 입력은 같은 라우트다. 데모에서 매번 다른 결과가 나오면
+    # 시연이 산으로 간다.
+    assert _compliant_classifier_reply(prompt) == reply

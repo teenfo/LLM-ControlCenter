@@ -636,3 +636,94 @@ def test_the_debt_table_records_what_routing_does_not_do():
     accuracy = next((line for line in debt.splitlines() if "라우팅 정확도" in line), "")
     assert accuracy, "부채 표에 라우팅 정확도 측정 항목이 없다"
     assert "measure_router" in accuracy, "설치처가 어떻게 재는지를 안 가리킨다"
+
+
+# ── QA R-HIGH — 인증을 수행할 제품 경로가 없었다 ────────────────────────────
+#
+# `certify_classifier` 를 부르는 곳이 테스트뿐이었다. 신규 설치·데모에서 분류
+# 모델은 영원히 미인증이었고, 라우팅은 전건 기본 모델로 갔다 — fail-to-default
+# 라 피해는 없지만 README 가 약속한 데모는 그 자리에서 막힌다. 계획서의 테스트
+# 8종이 전부 인증을 명시 시드하거나 `_router` 를 주입해서 이 빈칸이 테스트에
+# 안 걸렸다. 아래는 **아무것도 시드하지 않는다.**
+
+
+async def test_a_fresh_install_routes_after_the_certify_pass(harness, client, acme):
+    """감사서의 재현 그대로 — 신규 설치에서 제출하면 라우팅이 실제로 돈다.
+
+    시드 없이: 스케줄러의 인증 패스(기동 시 자동으로 도는 그것)가 돌고 나면
+    분류기가 인증돼 있고, 라우팅을 켠 역할의 제출이 판정을 받는다.
+    """
+    harness.config.roles["summarize"] = Role(
+        **{**harness.config.roles["summarize"].__dict__,
+           "placement": ("internal",),
+           "routing": routing(simple="m", complex="guard-m")},
+    )
+    assert not harness.evaluator.classifier_is_certified("guard-m"), "시드 없이 시작해야 한다"
+
+    outcomes = await harness.scheduler.certify_classifiers_once()
+
+    assert harness.evaluator.classifier_is_certified("guard-m"), outcomes
+    # 목은 분류 프롬프트에 형식대로 답하므로(카나리아 반향) 인증을 통과한다 —
+    # 데모가 그 성질 위에 서 있다.
+
+    response = submit(client, acme)
+    job = harness.store.get_job(ACME, response.json()["job_id"])
+    assert job.route is not None, "인증이 됐는데도 판정이 안 돌았다"
+
+
+async def test_certification_is_not_polluted_by_missing_nodes(harness):
+    """**노드가 없을 때 시도하면 "노드 없음" 이 준수율 미달로 기록된다.**
+
+    그것은 측정이 아니라 측정의 오염이고, 한번 기록되면 재시도 백오프까지
+    걸린다. 배치 가능성을 먼저 보고, 안 되면 기록 없이 건너뛴다.
+    """
+    for state in harness.cluster.nodes.values():
+        state.provider.kill()
+        state.status = "unhealthy"
+
+    outcomes = await harness.scheduler.certify_classifiers_once()
+
+    assert outcomes.get("guard-m") == "no_internal_node"
+    from app.evals import KIND_CLASSIFIER
+    assert harness.store.latest_eval_run(KIND_CLASSIFIER, "guard-m") is None, (
+        "노드 부재가 모델의 준수율 기록으로 남았다"
+    )
+
+
+async def test_a_failed_certification_backs_off(harness):
+    """미달 모델을 매 주기 다시 재면 eval 기록이 분마다 쌓인다 — 모델이 안
+    바뀌면 결과도 안 바뀐다."""
+    for state in harness.cluster.nodes.values():
+        state.provider.reply = "형식을 안 지키는 산문"
+
+    await harness.scheduler.certify_classifiers_once()
+    assert not harness.evaluator.classifier_is_certified("guard-m")
+
+    from app.evals import KIND_CLASSIFIER
+    first = harness.store.latest_eval_run(KIND_CLASSIFIER, "guard-m")
+    again = await harness.scheduler.certify_classifiers_once()
+
+    assert "guard-m" not in again, "백오프 없이 곧바로 다시 쟀다"
+    assert harness.store.latest_eval_run(KIND_CLASSIFIER, "guard-m") == first
+
+
+def test_the_production_assembly_wires_the_certifier():
+    """**프로덕션 조립이 배선하는지를 조립 그 자체로 확인한다.**
+
+    테스트 하니스만 배선하고 `cli.Assembly` 가 빠뜨리면, 이 파일 전체가 초록인
+    채로 신규 설치는 다시 미인증이다 — R-HIGH 가 정확히 그 모양이었다.
+    """
+    from app.cli import Assembly
+    from app.crypto import KeyVault
+    from app.store import SqliteStore
+    from app.config import load_config
+
+    store = SqliteStore(":memory:")
+    try:
+        assembly = Assembly(
+            load_config(ROOT / "config"), store, KeyVault(None), airgap=False,
+        )
+        assert assembly.scheduler._evaluator is assembly.evaluator
+        assert assembly.scheduler._certifier_factory == assembly.pipeline.make_certifier
+    finally:
+        store.close()

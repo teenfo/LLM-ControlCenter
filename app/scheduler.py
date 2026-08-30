@@ -24,15 +24,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import uuid
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Sequence
 
 import logging
 
-from .cluster import FAIL, WAIT, Cluster, Placement
+from .cluster import FAIL, PLACED, WAIT, Cluster, Placement
+from .pipeline import GUARD_ROLE
 from .completion import CompletionSignal
-from .config import EXTERNAL, Config, Role
+from .config import EXTERNAL, INTERNAL, Config, Role
 from .cost import CostAccountant
 from .crypto import response_aad
 from .guard import (
@@ -50,6 +52,14 @@ from .providers import BackendError
 from .store import SqliteStore, TenantScope
 
 LANE_POLL_SECONDS = 0.5
+
+#: 분류 모델 인증 루프의 주기. 인증은 기동 직후 한 번이 사실상 전부고, 이후에는
+#: "새 모델이 왔는가" 만 본다 — 짧게 돌 이유가 없다.
+CERTIFY_POLL_SECONDS = 60.0
+
+#: 완료된(기록이 남은) 인증 시도의 재시도 간격. 준수율 미달 모델을 매 주기
+#: 다시 재면 eval 기록이 분(分)마다 쌓인다 — 모델이 바뀌지 않는 한 결과도 안 바뀐다.
+CERTIFY_RETRY_SECONDS = 3600.0
 
 #: 종료 시 진행 중인 실행을 기다리는 상한. 노드가 응답하지 않으면 잡 타임아웃까지
 #: 걸릴 수 있는데, 종료가 그만큼 매달리면 오케스트레이터가 SIGKILL 을 보낸다 —
@@ -157,6 +167,8 @@ class Scheduler:
         guard: Guard | None = None,
         vault: Any = None,
         completion: CompletionSignal | None = None,
+        evaluator: Any = None,
+        certifier_factory: "Callable[[str], Any] | None" = None,
     ) -> None:
         self._config = config
         self._roles = resolver_for(config, store, resolver)
@@ -177,6 +189,11 @@ class Scheduler:
         self._completion = completion or CompletionSignal()
         self._accountant = accountant or CostAccountant(config.pricing, store, now=now)
         self._registrar = registrar
+        # 분류 모델 인증 배선. **둘 다 있어야 돈다** — 없으면 루프 자체를 안 띄우고,
+        # 그 조립은 인증을 다른 경로(테스트 시드·수동)로 책임진다.
+        self._evaluator = evaluator
+        self._certifier_factory = certifier_factory
+        self._certify_attempted: dict[str, float] = {}
         self._now = now
         self._notify = notify or (notifier.as_callable() if notifier else (lambda e, d: None))
         # 전이 판정이 필요한 알림(예산 경고 등)은 알림기가 직접 있어야 한다.
@@ -214,6 +231,8 @@ class Scheduler:
         self._tasks.append(asyncio.create_task(self._models_loop(), name="models"))
         self._tasks.append(asyncio.create_task(self._retention_loop(), name="retention"))
         self._tasks.append(asyncio.create_task(self._watch_loop(), name="watch"))
+        if self._evaluator is not None and self._certifier_factory is not None:
+            self._tasks.append(asyncio.create_task(self._certify_loop(), name="certify"))
 
     async def stop(self, *, drain_seconds: float = DRAIN_SECONDS) -> None:
         """루프를 멈추고 **진행 중인 실행은 끝나기를 기다린다.**
@@ -618,6 +637,75 @@ class Scheduler:
         self._completion.done(job.id)
 
     # -- 배경 루프 -------------------------------------------------------------
+
+    def _classifier_roles(self) -> dict[str, Role]:
+        """인증이 필요한 분류 역할 — 모델별로 하나. 가드 2단 + 라우팅 분류기."""
+        wanted: dict[str, Role] = {}
+        for name, role in self._config.roles.items():
+            if role.routing is not None:
+                classifier = self._config.roles.get(role.routing.classifier)
+                if classifier is not None:
+                    wanted.setdefault(classifier.model, classifier)
+        guard_role = self._config.roles.get(GUARD_ROLE)
+        if guard_role is not None:
+            wanted.setdefault(guard_role.model, guard_role)
+        return wanted
+
+    async def certify_classifiers_once(self) -> dict[str, str]:
+        """미인증 분류 모델의 인증을 지금 시도한다. {모델: 결과} 를 돌려준다.
+
+        **이 함수가 QA R-HIGH 의 답이다.** `certify_classifier` 를 부르는 제품
+        경로가 없어서 신규 설치·데모에서 분류 모델이 영원히 미인증이었다 —
+        라우팅은 전건 기본 모델로 갔고, README 가 약속한 데모는 그 자리에서
+        막혔다. 인증 시드는 테스트에만 있었으므로 테스트는 전부 초록이었다.
+
+        시도 전에 배치 가능성을 확인한다 — 내부 노드가 없을 때 프로브를 던지면
+        "노드 없음" 이 준수율 미달로 **기록**된다. 그것은 측정이 아니라 측정의
+        오염이고, 한번 기록되면 재시도 백오프(1시간)까지 걸린다.
+        """
+        outcomes: dict[str, str] = {}
+        if self._evaluator is None or self._certifier_factory is None:
+            return outcomes
+
+        for model, role in self._classifier_roles().items():
+            if self._evaluator.classifier_is_certified(model):
+                continue
+            last = self._certify_attempted.get(model)
+            if last is not None and self._now() - last < CERTIFY_RETRY_SECONDS:
+                continue
+
+            probe = self._cluster.place(
+                job_id=f"certify-{uuid.uuid4().hex[:12]}",
+                tenant_id="_platform", service_id="_certify",
+                role=role, placement_snapshot=role.placement,
+                allowed_boundaries=(INTERNAL,),
+            )
+            if probe.outcome != PLACED or probe.placement is None:
+                outcomes[model] = "no_internal_node"
+                continue
+            self._cluster.release(probe.placement)
+
+            certify = self._certifier_factory(role.name)
+            if certify is None:
+                continue
+            self._certify_attempted[model] = self._now()
+            report = await self._evaluator.certify_classifier(model, certify)
+            outcomes[model] = f"rate={report.rate:.2f}"
+            if not self._evaluator.classifier_is_certified(model):
+                # 미달은 사건이다 — 이 모델을 쓰는 가드 2단·라우팅이 전부 서 있다.
+                self._notify("classifier_uncertified", {
+                    "model": model, "rate": report.rate,
+                    "failures": list(report.failures),
+                })
+        return outcomes
+
+    async def _certify_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                await self.certify_classifiers_once()
+            except Exception as exc:
+                _loop_failure("certify", exc)
+            await asyncio.sleep(CERTIFY_POLL_SECONDS)
 
     async def _health_loop(self) -> None:
         interval = self._thresholds.health_probe_interval_seconds

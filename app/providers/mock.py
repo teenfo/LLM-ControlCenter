@@ -41,8 +41,14 @@ MAX_CALL_LOG = 1000
 _CANARY = re.compile(r"CANARY=([0-9a-f]{16})")
 
 
+#: 라우팅 프롬프트의 선택지 절. `pipeline._routing_prompt` 의 형식과 같은 값이지만
+#: 카나리아와 같은 이유로 **임포트하지 않는다.** 형식이 갈리면
+#: `test_the_mock_answers_the_routing_prompt_with_a_key` 가 실패한다.
+_ROUTE_CATALOG = re.compile(r"\[선택지\]\n((?:- [^:\n]+:[^\n]*\n)+)")
+
+
 def _compliant_classifier_reply(prompt: str) -> str | None:
-    """분류기 프롬프트면 **형식을 지키는 모델**처럼 답한다.
+    """분류기·라우터 프롬프트면 **형식을 지키는 모델**처럼 답한다.
 
     목은 "제어 가능한 가짜 백엔드" 다. 카나리아를 안 돌려주면 파이프라인이 그것을
     지시 이탈로 읽어 `on_classifier_error` 를 태우므로, 목으로 도는 데모와 테스트가
@@ -53,8 +59,22 @@ def _compliant_classifier_reply(prompt: str) -> str | None:
     found = _CANARY.search(prompt)
     if not found:
         return None
-    # 판정은 하지 않는다. 목이 맥락을 진짜로 읽을 수는 없고, 읽는 척하면 가드 2단이
-    # 목에서 "동작하는 것처럼" 보여 진짜 모델 없이 통과한다.
+
+    # 라우팅 프롬프트(선택지 절이 있다)에는 **키 하나를 결정론적으로** 고른다.
+    # NONE 만 내면 라우팅 데모가 판정 없는 화면이 된다 — README 가 약속하는 것은
+    # 배선(판정이 모델을 바꾸고 잡에 박힌다)의 시연이고, 그것은 키를 내야 보인다.
+    # 입력 해시로 고르므로 같은 프롬프트는 같은 라우트다 — 데모에서 매번 다른
+    # 결과가 나오면 "뭐가 바뀐 거지" 를 설명하느라 시연이 산으로 간다.
+    catalog = _ROUTE_CATALOG.search(prompt)
+    if catalog:
+        keys = [line.split(":", 1)[0][2:] for line in catalog.group(1).splitlines()]
+        material = prompt.split("[자료 시작", 1)[-1]
+        pick = keys[int(hashlib.sha256(material.encode()).hexdigest(), 16) % len(keys)]
+        return f"CANARY={found.group(1)}\n{pick}"
+
+    # 가드 분류에는 판정하지 않는다. 목이 맥락을 진짜로 읽을 수는 없고, 읽는
+    # 척하면 가드 2단이 목에서 "동작하는 것처럼" 보여 진짜 모델 없이 통과한다.
+    # 라우팅은 다르다 — 오판의 대가가 보안이 아니라 비용이라 데모에 안전하다.
     return f"CANARY={found.group(1)}\nNONE"
 
 

@@ -820,37 +820,78 @@ class Pipeline:
                 # 구조화 출력 준수율을 통과하지 못한 모델로 보안 판정을 하지 않는다.
                 raise RuntimeError(f"분류 모델 {role.model} 이 인증되지 않았다")
 
-            result = self._cluster.place(
-                job_id=f"guard-{uuid.uuid4().hex[:12]}",
-                tenant_id="_platform",
-                service_id="_guard",
-                role=role,
-                placement_snapshot=role.placement,
-                prompt=text,
-                allowed_boundaries=(INTERNAL,),
-            )
-            if result.outcome != PLACED or result.placement is None:
-                raise RuntimeError(
-                    f"분류를 실행할 내부 노드가 없다: {result.reason or result.code}"
-                )
-
-            fence, canary = self._framing.tokens(text)
-            chosen = result.placement
-            try:
-                generated = await self._cluster.provider_for(chosen.node).generate(
-                    model=chosen.model,
-                    prompt=_classification_prompt(
-                        text, rules, fence=fence, canary=canary
-                    ),
-                    system=role.system,
-                    options=role.options,
-                    timeout=role.timeout,
-                )
-            finally:
-                self._cluster.release(chosen)
-            return _parse_classification(generated.text, rules, canary=canary)
+            return await self._classify_on_cluster(role, text, rules)
 
         return classify
+
+    async def _classify_on_cluster(
+        self, role: Role, text: str, rules: Sequence[GuardRule]
+    ) -> set[str]:
+        """배치 → 울타리 프롬프트 → 생성 → 결정론 파싱.
+
+        인증 게이트는 **호출자 몫이다** — 분류기(`make_classifier`)는 게이트를
+        걸고, 인증 프로브(`make_certifier`)는 정확히 그 게이트가 없어야 한다.
+        인증은 이 경로를 지나 본 결과로 생기므로 게이트를 여기 두면 닭과 달걀이다.
+        """
+        result = self._cluster.place(
+            job_id=f"guard-{uuid.uuid4().hex[:12]}",
+            tenant_id="_platform",
+            service_id="_guard",
+            role=role,
+            placement_snapshot=role.placement,
+            prompt=text,
+            allowed_boundaries=(INTERNAL,),
+        )
+        if result.outcome != PLACED or result.placement is None:
+            raise RuntimeError(
+                f"분류를 실행할 내부 노드가 없다: {result.reason or result.code}"
+            )
+
+        fence, canary = self._framing.tokens(text)
+        chosen = result.placement
+        try:
+            generated = await self._cluster.provider_for(chosen.node).generate(
+                model=chosen.model,
+                prompt=_classification_prompt(
+                    text, rules, fence=fence, canary=canary
+                ),
+                system=role.system,
+                options=role.options,
+                timeout=role.timeout,
+            )
+        finally:
+            self._cluster.release(chosen)
+        return _parse_classification(generated.text, rules, canary=canary)
+
+    def make_certifier(
+        self, role_name: str = GUARD_ROLE
+    ) -> "Callable[[str], Awaitable[set[str]]] | None":
+        """인증 프로브 — 분류기와 같은 경로를 **인증 게이트 없이** 지난다.
+
+        `certify_classifier` 를 부르는 제품 경로가 없어서, 신규 설치·데모에서
+        분류 모델이 영원히 미인증이었다 — 라우팅은 전건 기본 모델로 갔고 가드
+        2단은 매 요청 실패로 떨어졌다(QA R-HIGH). 인증 시드는 테스트에만 있었고,
+        그래서 이 빈칸이 테스트에는 안 걸렸다.
+
+        프로브는 실제 llm 규칙으로 프롬프트를 짠다 — 인증이 재는 것은 판정
+        정확도가 아니라 **이 프롬프트 형식을 지키는가**이므로, 쓰일 형식과 다른
+        형식으로 재면 잰 것과 쓰는 것이 갈린다. llm 규칙이 하나도 없으면(그래도
+        라우팅은 이 모델을 쓴다) 가짜 맥락 하나로 형식만 검증한다.
+        """
+        role = self._config.roles.get(role_name)
+        if role is None:
+            return None
+        probe_rules = [r for r in self._config.guard_rules if r.kind == "llm"] or [
+            GuardRule(
+                id="_probe_context", kind="llm", action="audit", label="[프로브]",
+                description="인증 프로브용 맥락 — 판정 결과는 버려진다",
+            )
+        ]
+
+        async def certify_once(text: str) -> set[str]:
+            return await self._classify_on_cluster(role, text, probe_rules)
+
+        return certify_once
 
     def make_router(self) -> Callable[[Role, str], Awaitable[str | None]]:
         """라우터. **`make_classifier` 와 같은 패턴인 것이 안전 근거다.**

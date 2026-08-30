@@ -97,6 +97,10 @@ class Assembly:
             registrar=self.registrar, notifier=self.notifier,
             # 출력 축 — 스케줄러가 응답을 쓰는 유일한 지점이라 가드와 금고가 여기 온다.
             guard=self.guard, vault=vault, completion=self.completion,
+            # 분류 모델 인증 배선(QA R-HIGH). 이것이 없으면 신규 설치에서 인증을
+            # 수행할 제품 경로가 없다 — 라우팅은 전건 기본 모델, 가드 2단은 매
+            # 요청 실패였고, 인증 시드가 테스트에만 있어 테스트는 전부 초록이었다.
+            evaluator=self.evaluator, certifier_factory=self.pipeline.make_certifier,
         )
 
     def build(self, *, version: str, start_scheduler: bool):
@@ -365,6 +369,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             warnings.append(
                 f"2단 분류가 판정하지 못합니다({reason}). 맥락 규칙이 "
                 "on_classifier_error 정책으로만 처리됩니다."
+            )
+
+    # 라우팅을 켠 역할의 분류기도 같다 — 미인증이면 라우팅은 조용히 전건 기본
+    # 모델로 간다(fail-to-default). 안전하지만, 켜 놓은 관리자는 그 사실을
+    # 여기서라도 봐야 한다. 인증은 스케줄러가 기동 시 자동으로 시도한다.
+    for name, role in config.roles.items():
+        if role.routing is None:
+            continue
+        ready, reason = assembly.evaluator.classifier_ready(role.routing.classifier)
+        if not ready:
+            warnings.append(
+                f"역할 {name} 의 라우팅 분류기가 준비되지 않았습니다({reason}) — "
+                "판정 없이 전부 기본 모델로 갑니다. 스케줄러 기동 후 자동 인증을 기다리거나 "
+                "`doctor` 를 다시 실행해 보세요."
             )
 
     single_homed = assembly.cluster.single_homed_roles()
