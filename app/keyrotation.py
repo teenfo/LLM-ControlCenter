@@ -85,6 +85,19 @@ def interrupted(keys_dir: Path | str | None) -> Path | None:
     return path if path.exists() else None
 
 
+def latest_retired(keys_dir: Path | str | None) -> Path | None:
+    """가장 최근에 물러난 키 파일. 없으면 `None`.
+
+    이름 바꾸기 두 번 사이에서 죽으면 `master.key` 가 없는 채로 물러난 키와
+    무대의 키만 남는다 — 그 창에서 진단이 **양쪽을 다 열어 보고** 판정하려면
+    물러난 쪽도 찾을 수 있어야 한다(QA V1).
+    """
+    if not keys_dir:
+        return None
+    candidates = sorted(Path(keys_dir).glob(f"{RETIRED_PREFIX}*"))
+    return candidates[-1] if candidates else None
+
+
 def vault_from_file(path: Path | str) -> KeyVault | None:
     """키 파일 하나를 금고로. 못 읽거나 형식이 아니면 `None`.
 

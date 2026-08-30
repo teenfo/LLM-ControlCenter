@@ -486,3 +486,124 @@ def test_the_rename_is_fsynced_too(store, keys_dir, kek, monkeypatch):
     rotate_master_kek(store, keys_dir=keys_dir, old_vault=vault_for(kek))
 
     assert synced_dirs, "디렉터리를 fsync 하지 않았다 — 이름 변경이 안 굳는다"
+
+
+# ── QA V1 — 이름 바꾸기 두 번 사이에서 죽은 창의 진단 ───────────────────────
+#
+# 파일 교체는 두 번의 이름 바꾸기다(옛 키 → 물러남, 무대 키 → 제자리). 그 사이에서
+# 죽으면 `master.key` 가 **없다.** 예전 doctor 는 이 창에서 래핑을 아예 안 읽어
+# (`vault.enabled` 게이트) 무조건 "회전 반영 안 됨 → rm" 을 안내했고, 그 rm 이
+# DB 를 열 수 있는 유일한 키를 지운다 — 진단이 데이터 손실의 공범이 되는 경로였다.
+
+
+import os
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(scope="module")
+def crashed_between_renames(tmp_path_factory):
+    """부트스트랩 → 회전 → 두 rename 사이 상태 재구성. 모듈에서 한 번만 만든다."""
+    base = tmp_path_factory.mktemp("v1")
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    args = ["--data", str(base / "data"), "--keys", str(base / "keys")]
+
+    subprocess.run(
+        [sys.executable, "-m", "app", *args, "bootstrap"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60, env=env,
+    )
+    # 회전 전 데이터를 떠 둔다 — "백업을 복원했는데 키 디렉터리는 크래시 상태"
+    # 라는 실제 운영 시나리오(물러난 키가 여는 경우)를 만들 재료다.
+    shutil.copytree(base / "data", base / "data-pre")
+    from app.crypto import generate_master_key
+
+    rotated = subprocess.run(
+        [sys.executable, "-m", "app", *args, "rotate-kek",
+         "--new-key-env", "LCC_NEW_KEK", "--yes"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60,
+        env={**env, "LCC_NEW_KEK": generate_master_key()},
+    )
+    assert rotated.returncode == 0, rotated.stderr
+    # rename #1 은 됐고(물러난 키 존재) #2 는 안 된 상태로 되돌린다.
+    shutil.move(str(base / "keys" / KEY_NAME), str(staged_key_path(base / "keys")))
+    return base, args, env
+
+
+def doctor_output(base, args, env) -> str:
+    result = subprocess.run(
+        [sys.executable, "-m", "app", *args, "doctor"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60, env=env,
+    )
+    return result.stdout + result.stderr
+
+
+def test_doctor_never_tells_you_to_delete_the_only_working_key(crashed_between_renames):
+    """**이 창에서 rm 을 안내하면 그 rm 이 전 테넌트 원문을 지운다.**"""
+    base, args, env = crashed_between_renames
+    output = doctor_output(base, args, env)
+
+    assert "이미 **새 키**로 감싸여" in output, output
+    assert f"mv {staged_key_path(base / 'keys')}" in output
+    assert f"rm {staged_key_path(base / 'keys')}" not in output, (
+        "DB 를 열 수 있는 유일한 키를 지우라고 안내했다"
+    )
+
+
+def test_doctor_falls_back_to_the_retired_key(crashed_between_renames, tmp_path):
+    """무대의 키가 못 열면 물러난 키로 열어 보고 **그쪽을** 안내한다.
+
+    실제 운영 시나리오다: 회전 전 백업을 복원했는데 키 디렉터리는 크래시 상태다 —
+    DB 는 옛 래핑이므로 무대의 키는 못 열고 물러난 키가 연다.
+    """
+    from app.keyrotation import latest_retired
+
+    base, args, env = crashed_between_renames
+    scenario = tmp_path / "retired"
+    scenario.mkdir()
+    shutil.copytree(base / "data-pre", scenario / "data")     # 회전 전 DB
+    shutil.copytree(base / "keys", scenario / "keys")          # 크래시 상태 키
+
+    scenario_args = ["--data", str(scenario / "data"), "--keys", str(scenario / "keys")]
+    output = doctor_output(scenario, scenario_args, env)
+
+    retired = latest_retired(scenario / "keys")
+    assert retired is not None
+    assert "물러난 키" in output, output
+    assert f"mv {retired}" in output
+    assert "rm " not in output, "이 창에서의 삭제 안내는 데이터 손실이다"
+
+
+def test_doctor_refuses_to_advise_deletion_when_nothing_opens(crashed_between_renames, tmp_path):
+    """어느 키로도 못 열면 **삭제를 안내하지 않는다** — 보존과 백업 복구만."""
+    base, args, env = crashed_between_renames
+    scenario = tmp_path / "nothing"
+    shutil.copytree(base, scenario)
+    keys = scenario / "keys"
+    staged_key_path(keys).write_text("망가진 키\n", encoding="utf-8")
+    for retired in keys.glob(f"{RETIRED_PREFIX}*"):
+        retired.write_text("이것도 망가짐\n", encoding="utf-8")
+
+    scenario_args = ["--data", str(scenario / "data"), "--keys", str(keys)]
+    output = doctor_output(scenario, scenario_args, env)
+
+    assert "아무 파일도 지우지 마세요" in output, output
+    assert "rm " not in output
+
+
+def test_doctor_recovery_instruction_actually_recovers(crashed_between_renames, tmp_path):
+    """안내를 그대로 따라 하면 건강한 상태가 된다 — 안내문이 곧 절차다."""
+    base, args, env = crashed_between_renames
+    scenario = tmp_path / "recover"
+    shutil.copytree(base, scenario)
+    keys = scenario / "keys"
+    shutil.move(str(staged_key_path(keys)), str(keys / KEY_NAME))
+
+    scenario_args = ["--data", str(scenario / "data"), "--keys", str(keys)]
+    output = doctor_output(scenario, scenario_args, env)
+
+    assert "마스터 KEK 있음" in output
+    assert "중단된 KEK 회전" not in output
+    assert "열리지 않는 테넌트" not in output

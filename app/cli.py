@@ -37,6 +37,7 @@ from .guard import Guard
 from .keyrotation import (
     RotationRefused,
     interrupted as interrupted_rotation,
+    latest_retired,
     rotate_master_kek,
     vault_from_file,
 )
@@ -245,22 +246,52 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         # "DB 가 새 키로 감싸여 있다면 이렇게 하세요" 라고만 적으면, 그 판단을
         # 유출 대응 중인 운영자에게 떠넘기는 것이다. 틀리면 어떤 키로도 못 여는
         # 상태가 되므로 진단이 대신 판정한다.
+        #
+        # **`master.key` 가 없어도 판정한다.** 이름 바꾸기 두 번 사이에서 죽으면
+        # `master.key` 가 없는 창이 생기는데, 예전 코드는 래핑 읽기가
+        # `vault.enabled` 에 걸려 있어 그 창에서 래핑을 아예 안 읽었고, 그래서
+        # 무조건 "회전 반영 안 됨 → rm" 가지로 갔다 — 그 rm 이 **DB 를 열 수 있는
+        # 유일한 키**를 지운다(QA V1). 래핑은 금고 없이도 읽을 수 있다.
+        wrapped_now = wrapped if vault.enabled else store.wrapped_deks()
+        live_missing = not vault.enabled
         staged_vault = vault_from_file(stale)
-        staged_opens = bool(wrapped) and staged_vault is not None and all(
-            staged_vault.can_open(w) for w in wrapped.values()
+        staged_opens = staged_vault is not None and all(
+            staged_vault.can_open(w) for w in wrapped_now.values()
         )
-        if staged_opens:
+        if staged_opens and (wrapped_now or live_missing):
+            # 래핑이 없으면(빈 DB) 어느 키든 열므로, `master.key` 가 살아 있는 한
+            # 아래 rm 가지가 안전하다 — 그때만 이 가지를 비워 둔다.
             problems.append(
                 f"KEK 회전이 파일 교체 직전에 중단됐습니다: {stale}\n"
                 "    DB 는 이미 **새 키**로 감싸여 있습니다. 그 파일을 제자리로 옮기세요:\n"
                 f"      mv {stale} {keys_dir / 'master.key'}"
             )
-        else:
+        elif not live_missing:
             problems.append(
                 f"중단된 KEK 회전의 잔여 파일이 있습니다: {stale}\n"
                 "    DB 는 아직 **현재 키**로 감싸여 있습니다 — 회전은 반영되지 않았습니다.\n"
                 f"      rm {stale}    # 그 뒤 다시 `rotate-kek`"
             )
+        else:
+            # `master.key` 도 없고 무대의 키로도 안 열린다. 물러난 키로 열어 본다 —
+            # 여기서 무엇이든 지우라고 말하는 순간 진단이 데이터 손실의 공범이 된다.
+            retired = latest_retired(keys_dir)
+            retired_vault = vault_from_file(retired) if retired else None
+            if retired_vault is not None and all(
+                retired_vault.can_open(w) for w in wrapped_now.values()
+            ):
+                problems.append(
+                    f"KEK 회전이 중단됐고 `master.key` 가 없습니다.\n"
+                    f"    DB 는 **물러난 키**로 열립니다. 그 키를 제자리로 옮기세요:\n"
+                    f"      mv {retired} {keys_dir / 'master.key'}\n"
+                    f"    무대의 키({stale.name})는 판정이 끝날 때까지 두세요."
+                )
+            else:
+                problems.append(
+                    "KEK 회전이 중단됐고, 남아 있는 어느 키로도 DB 가 열리지 않습니다.\n"
+                    "    **아무 파일도 지우지 마세요.** 키 디렉터리를 통째로 보존한 채\n"
+                    "    백업의 키로 복구하세요: docs/runbook-key-compromise.md"
+                )
 
     # **검증을 안 돌리면 끊긴 것을 아무도 모른다.**
     #
