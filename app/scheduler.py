@@ -537,22 +537,29 @@ class Scheduler:
         verdict = await self._inspect_output(scope, text)
         sealed = self._seal_response(scope, job.id, text) if text else None
 
-        self._store.update_job(
-            scope, job.id,
-            status="ok", response=verdict.masked,
-            response_cipher=sealed.ciphertext if sealed else None,
-            response_nonce=sealed.nonce if sealed else None,
-            finished_at=self._now(), metrics=dict(metrics),
-        )
-        self._record_output_events(scope, verdict, job=job)
-        self._completion.done(job.id)
-        self._accountant.settle(
+        # **종결과 정산은 한 커밋이다.** status='ok' 를 먼저 따로 커밋하면 그
+        # 직후의 크래시가 "예약은 더는 안 세는데(status 조건) 지출은 아직 없는"
+        # 상태를 남긴다 — 예산 영구 과소 계상이고, 그 오차는 아무 데도 안 남는다
+        # (QA V3). CAS(running)에 지면 크래시 복구가 그 사이 잡을 가져간 것이다:
+        # 이 실행의 결과는 채택되지 않았으므로 지출도 완료 통지도 내지 않는다.
+        settled = self._accountant.settle(
             scope, job.id,
             provider=placement.provider, model=placement.model,
             input_tokens=input_tokens, output_tokens=output_tokens,
             node=placement.node, role=job.role, service_id=job.service_id,
             status="ok", duration_ms=duration_ms, end_user_hash=job.end_user_hash,
+            finish={
+                "status": "ok", "response": verdict.masked,
+                "response_cipher": sealed.ciphertext if sealed else None,
+                "response_nonce": sealed.nonce if sealed else None,
+                "finished_at": self._now(), "metrics": dict(metrics),
+            },
+            expect_status="running",
         )
+        if settled is None:
+            return
+        self._record_output_events(scope, verdict, job=job)
+        self._completion.done(job.id)
 
     async def _handle_failure(
         self, scope: TenantScope, job_id: str, placement: Placement,

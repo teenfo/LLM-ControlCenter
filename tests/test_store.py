@@ -861,3 +861,124 @@ def test_unreviewed_events_are_still_cleaned_on_the_job_schedule(store, clock):
     store.purge_expired(job_retention_days=30)
 
     assert store.list_filter_events(scope) == []
+
+
+# ── QA V2·V3 — 종결 뒤에 온 복구·정산이 이긴 결과를 덮지 않는다 ─────────────
+
+
+class StaleSelect:
+    """복구의 목록 읽기가 낡은 상황을 재현하는 커넥션 프록시.
+
+    실제 경합에서는 복구가 목록을 읽은 뒤 다른 프로세스가 잡을 정산한다. 타이밍으로
+    그 창을 재현하면 테스트가 깜빡이므로, **낡은 목록 자체**를 주입한다 — 복구가
+    지켜야 하는 불변식은 "목록이 낡았어도 running 이 아닌 잡은 안 건드린다" 이고,
+    그것은 타이밍이 아니라 UPDATE 의 CAS 가 지키는 성질이다.
+    """
+
+    def __init__(self, conn, stale_rows):
+        self._conn = conn
+        self._stale_rows = stale_rows
+
+    def execute(self, sql, *args):
+        if sql.startswith("SELECT id, node, attempts FROM jobs"):
+            return iter(self._stale_rows)
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_recovery_does_not_resurrect_a_settled_job(store):
+    """**이미 정산된 잡을 복구가 queued 로 되살리면 재실행·이중 청구다**(QA V2).
+
+    디스패치·취소·review 는 전부 CAS 인데 복구만 `WHERE id=?` 로 갱신하고 있었다.
+    """
+    job_id = make_job(store, ACME, status="running")
+    store.update_job(ACME, job_id, node="in-1")
+    # 다른 프로세스가 정산을 끝냈다 — usage 기록·과금 완료.
+    store.settle_job(
+        ACME, job_id,
+        job_fields={"status": "ok", "cost_usd": 1.0, "cost_reserved_usd": 0.0},
+        usage_fields={
+            "service_id": "acme-web", "job_id": job_id, "role": "summarize",
+            "model": "m", "node": "in-1", "provider": "mock",
+            "input_tokens": 10, "output_tokens": 5, "duration_ms": 100,
+            "status": "ok", "cost_usd": 1.0,
+        },
+    )
+
+    store._conn = StaleSelect(
+        store._conn, [{"id": job_id, "node": "in-1", "attempts": 0}]
+    )
+    result = store.recover_running_jobs(metered_nodes=())
+
+    job = store.get_job(ACME, job_id)
+    assert job.status == "ok", "정산된 잡이 되살아났다 — 재실행되고 두 번 청구된다"
+    assert result["requeued"] == 0, "건드리지 않은 것을 건드렸다고 센다"
+
+
+def test_recovery_does_not_resurrect_into_needs_review_either(store):
+    """과금 노드 가지도 같다 — 정산된 잡이 `needs_review` 로 넘어가면 운영자가
+    이미 끝난 잡을 심사한다."""
+    job_id = make_job(store, ACME, status="running")
+    store.update_job(ACME, job_id, node="cloud-1")
+    store.update_job(ACME, job_id, status="ok", finished_at=1.0)
+
+    store._conn = StaleSelect(
+        store._conn, [{"id": job_id, "node": "cloud-1", "attempts": 0}]
+    )
+    result = store.recover_running_jobs(metered_nodes=("cloud-1",))
+
+    assert store.get_job(ACME, job_id).status == "ok"
+    assert result["needs_review"] == 0
+
+
+def test_settlement_and_finish_are_one_transaction(store):
+    """**종결과 정산 사이에 크래시 창이 없다**(QA V3).
+
+    지출 기록이 실패하면 종결도 안 된 것이다 — 반대면 "예약은 더는 안 세는데
+    (status='ok') 지출은 없는" 상태가 남고, 예산이 영구히 과소 계상된다.
+    """
+    job_id = make_job(store, ACME, status="running")
+    store.update_job(ACME, job_id, cost_reserved_usd=5.0)
+
+    original = store._insert_usage
+    store._insert_usage = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("지출 기록 실패"))
+    with pytest.raises(RuntimeError):
+        store.settle_job(
+            ACME, job_id,
+            job_fields={"status": "ok", "cost_usd": 1.0, "cost_reserved_usd": 0.0},
+            usage_fields={}, expect_status="running",
+        )
+    store._insert_usage = original
+
+    job = store.get_job(ACME, job_id)
+    assert job.status == "running", "지출 없이 종결만 커밋됐다"
+    assert job.cost_reserved_usd == 5.0, "지출 없이 예약만 풀렸다"
+    assert store.reserved_cost(ACME) == 5.0, "예산 창에서 이 잡이 사라졌다"
+
+
+def test_a_lost_settlement_cas_writes_no_usage(store):
+    """CAS 에 진 정산은 **지출도 쓰지 않는다.**
+
+    크래시 복구가 잡을 도로 큐에 넣었다면 이 실행의 결과는 채택되지 않았다 —
+    재실행이 자기 지출을 새로 쓰므로, 둘 다 쓰면 그것이 곧 이중 청구다.
+    """
+    job_id = make_job(store, ACME, status="queued")     # 복구가 이미 되돌렸다
+
+    settled = store.settle_job(
+        ACME, job_id,
+        job_fields={"status": "ok", "cost_usd": 1.0, "cost_reserved_usd": 0.0},
+        usage_fields={
+            "service_id": "acme-web", "job_id": job_id, "role": "summarize",
+            "model": "m", "node": "in-1", "provider": "mock",
+            "input_tokens": 10, "output_tokens": 5, "duration_ms": 100,
+            "status": "ok", "cost_usd": 1.0,
+        },
+        expect_status="running",
+    )
+
+    assert settled is False
+    assert store.get_job(ACME, job_id).status == "queued"
+    rows = store._conn.execute("SELECT COUNT(*) AS n FROM usage").fetchone()
+    assert rows["n"] == 0, "채택 안 된 실행의 지출이 남았다"

@@ -769,7 +769,7 @@ class Pipeline:
         finally:
             self._cluster.release(chosen)
 
-        self._store.update_job(scope, job_id, status="ok", finished_at=self._now())
+        # 종결과 정산은 한 커밋이다 — 근거는 `scheduler._succeed` 와 같다(QA V3).
         self._accountant.settle(
             scope, job_id,
             provider=chosen.provider, model=chosen.model,
@@ -777,6 +777,8 @@ class Pipeline:
             node=chosen.node, role=role_config.name, service_id=principal.service_id,
             status="ok", duration_ms=int((self._now() - started) * 1000),
             end_user_hash=end_user_hash,
+            finish={"status": "ok", "finished_at": self._now()},
+            expect_status="running",
         )
 
         return {

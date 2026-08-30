@@ -800,3 +800,39 @@ def test_an_upgraded_database_backfills_the_estimate_for_live_jobs(tmp_path):
         assert job.input_tokens_estimate == 1_000, "백필이 안 돌았다"
     finally:
         reopened.close()
+
+
+def test_success_is_never_committed_outside_the_settlement():
+    """**성공 종결(status='ok')은 `settle` 의 `finish` 로만 쓴다**(QA V3).
+
+    `update_job(status='ok')` 를 먼저 커밋하고 정산을 따로 커밋하면, 그 사이의
+    **하드 크래시**가 "예약은 더는 안 세는데 지출은 없는" 상태를 남긴다 — 예산
+    영구 과소 계상. 라이브 프로세스의 예외는 실패 처리가 뒷정리를 하므로 이
+    결함은 예외 주입으로는 안 보이고, 크래시로만 보인다. 그래서 행동이 아니라
+    **구조**를 고정한다: 성공 종결이 정산 트랜잭션 밖에서 커밋되는 코드 형태
+    자체를 금지한다.
+    """
+    import ast
+    from pathlib import Path
+
+    offenders = []
+    for module in ("scheduler", "pipeline"):
+        source = Path(__file__).resolve().parent.parent / "app" / f"{module}.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr != "update_job":
+                continue
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == "status"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value == "ok"
+                ):
+                    offenders.append(f"app/{module}.py:{node.lineno}")
+
+    assert not offenders, (
+        f"성공 종결이 정산 밖에서 커밋된다: {offenders} — "
+        "settle(finish={'status': 'ok', ...}) 로 옮겨라"
+    )

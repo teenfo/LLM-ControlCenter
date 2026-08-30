@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from .config import Pricing
 from .store import BUDGET_WINDOW_DAYS, SqliteStore, TenantScope
@@ -208,25 +208,34 @@ class CostAccountant:
         status: str,
         duration_ms: int,
         end_user_hash: str | None = None,
-    ) -> float:
+        finish: "Mapping[str, Any] | None" = None,
+        expect_status: str | None = None,
+    ) -> float | None:
         """실제 사용량으로 정산하고 사용량 행을 남긴다.
 
         예약은 `jobs.cost_reserved_usd` 를 0 으로 만들어 해제한다 — 예약이 남아 있으면
         예산이 영원히 묶인다.
+
+        `finish` 는 종결 필드(status='ok' 와 응답 등)다 — **정산과 같은 트랜잭션에
+        실린다.** 호출자가 종결을 따로 커밋하고 정산을 여기서 커밋하면, 그 사이의
+        크래시가 "예약은 더는 안 세는데(status 조건) 지출은 아직 없는" 상태를
+        남긴다(QA V3). `expect_status` 의 CAS 에 지면 지출도 쓰지 않고 `None` 을
+        돌려준다 — 그 실행의 결과는 채택되지 않았고, 재실행이 자기 지출을 새로 쓴다.
         """
         cost = self.actual_cost(
             provider=provider, model=model,
             input_tokens=input_tokens, output_tokens=output_tokens,
         )
 
-        # **예약 해제와 지출 기록은 한 트랜잭션이다.** 따로 커밋하면 그 사이의
+        # **예약 해제·지출 기록·종결은 한 트랜잭션이다.** 따로 커밋하면 그 사이의
         # 크래시가 예약은 풀고 지출은 잃어 예산이 영구히 과소 계상된다 — 그 오차는
         # 아무 데도 안 남아서 누구도 발견하지 못한다.
-        self._store.settle_job(
+        settled = self._store.settle_job(
             scope, job_id,
             job_fields={
                 "cost_usd": cost, "cost_reserved_usd": 0.0,
                 "input_tokens": input_tokens, "output_tokens": output_tokens,
+                **dict(finish or {}),
             },
             usage_fields={
                 "service_id": service_id, "end_user_hash": end_user_hash,
@@ -235,8 +244,9 @@ class CostAccountant:
                 "output_tokens": output_tokens, "duration_ms": duration_ms,
                 "status": status, "cost_usd": cost,
             },
+            expect_status=expect_status,
         )
-        return cost
+        return cost if settled else None
 
     def release_reservation(self, scope: TenantScope, job_id: str) -> None:
         """정산 없이 예약만 푼다. 잡이 취소되거나 배치 전에 죽었을 때.

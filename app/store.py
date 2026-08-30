@@ -1288,25 +1288,46 @@ class SqliteStore:
         *,
         job_fields: Mapping[str, Any],
         usage_fields: Mapping[str, Any],
-    ) -> None:
+        expect_status: "str | Sequence[str] | None" = None,
+    ) -> bool:
         """정산을 **한 트랜잭션으로** 끝낸다.
 
         예약 해제(`jobs`)와 지출 기록(`usage`)이 별도 커밋이면 그 사이의 크래시가
         예약은 풀고 지출은 잃는다 — **예산이 영구히 과소 계상되고**, 그 오차는
         아무 데도 안 남아서 누구도 발견하지 못한다. 예약을 둔 이유 자체가
         "완료 후에야 드러나는 초과" 를 막는 것인데 여기서 되살아난다.
+
+        같은 이유로 **종결(status='ok')도 이 트랜잭션에 실린다** — 호출자가
+        종결을 따로 커밋하고 정산을 여기서 커밋하면, 그 사이의 크래시가 예약은
+        더는 안 세는데(status 조건) 지출은 아직 없는 상태를 남긴다(QA V3).
+
+        `expect_status` 는 종결의 CAS 다. 지면 **지출도 쓰지 않고** `False` 를
+        돌려준다 — 크래시 복구가 그 사이 잡을 도로 큐에 넣었다면 이 정산은
+        일어나지 않은 실행의 것이 되고, 재실행이 자기 지출을 새로 쓴다. 둘 다
+        쓰면 그것이 곧 이중 청구다.
         """
         mapped = _map_job_fields(dict(job_fields))
         with self._tx():
             if mapped:
+                extra = "id = ?"
+                expected: list[Any] = []
+                if expect_status is not None:
+                    expected = (
+                        [expect_status] if isinstance(expect_status, str)
+                        else list(expect_status)
+                    )
+                    extra += f" AND status IN ({','.join('?' * len(expected))})"
                 assignments = ", ".join(f"{k} = ?" for k in mapped)
-                where, params = self._scoped_where(scope, "id = ?")
+                where, params = self._scoped_where(scope, extra)
                 params.append(job_id)
-                self._conn.execute(
+                cursor = self._conn.execute(
                     f"UPDATE jobs SET {assignments} WHERE {where}",
-                    [*mapped.values(), *params],
+                    [*mapped.values(), *params, *expected],
                 )
+                if expect_status is not None and cursor.rowcount == 0:
+                    return False
             self._insert_usage(scope, dict(usage_fields))
+        return True
 
     def claim_queued(
         self, lane: str, *, limit: int
@@ -1389,39 +1410,47 @@ class SqliteStore:
         metered = set(metered_nodes)
         requeued = reviewed = exhausted = 0
 
-        rows = list(
-            self._conn.execute("SELECT id, node, attempts FROM jobs WHERE status='running'")
-        )
-
-        # **한 트랜잭션이다.** 절반만 복구된 상태로 기동하면 나머지는 `running` 인
-        # 채 남아 영원히 아무도 안 건드린다 — 크래시 복구가 그 자체로 사고가 된다.
+        # **한 트랜잭션이고, 세 UPDATE 전부 CAS 다.** 목록을 트랜잭션 밖에서 뜨고
+        # `WHERE id=?` 로만 갱신하면, 그 사이 다른 프로세스가 정산한 잡(`ok`,
+        # usage 기록·과금 완료)을 `queued` 로 되살려 **재실행·이중 청구**가 된다
+        # (QA V2). `_try_dispatch`·취소·review 가 전부 CAS 인데 복구만 빠져
+        # 있었다 — `AND status='running'` 이 그 창을 닫고, 진 행은 그냥 넘어간다:
+        # 이미 종결된 잡은 복구할 것이 없다.
         with self._tx():
+            rows = list(
+                self._conn.execute(
+                    "SELECT id, node, attempts FROM jobs WHERE status='running'"
+                )
+            )
             for row in rows:
                 # **재큐도 시도다.** 이 경로가 max_retries 를 안 보면, 기동할
                 # 때마다 죽는 잡이 영원히 재큐된다 — 크래시 루프에 빠진 노드가
                 # 있으면 그 잡들이 매 기동 재시도되며 계속 자원을 먹는다.
                 if max_retries is not None and row["attempts"] + 1 > max_retries:
-                    self._conn.execute(
+                    cursor = self._conn.execute(
                         "UPDATE jobs SET status='failed', error_code='max_retries', "
-                        "wait_reason='crash_recovery_exhausted', finished_at=? WHERE id=?",
+                        "wait_reason='crash_recovery_exhausted', finished_at=? "
+                        "WHERE id=? AND status='running'",
                         (self._now(), row["id"]),
                     )
-                    exhausted += 1
+                    exhausted += cursor.rowcount
                 elif row["node"] in metered:
-                    self._conn.execute(
+                    cursor = self._conn.execute(
                         "UPDATE jobs SET status='needs_review', "
                         "error_code='possible_double_execution', "
-                        "wait_reason='crash_recovery_metered', finished_at=? WHERE id=?",
+                        "wait_reason='crash_recovery_metered', finished_at=? "
+                        "WHERE id=? AND status='running'",
                         (self._now(), row["id"]),
                     )
-                    reviewed += 1
+                    reviewed += cursor.rowcount
                 else:
-                    self._conn.execute(
+                    cursor = self._conn.execute(
                         "UPDATE jobs SET status='queued', attempts=attempts+1, "
-                        "last_failed_node=node, node=NULL, started_at=NULL WHERE id=?",
+                        "last_failed_node=node, node=NULL, started_at=NULL "
+                        "WHERE id=? AND status='running'",
                         (row["id"],),
                     )
-                    requeued += 1
+                    requeued += cursor.rowcount
 
         return {"requeued": requeued, "needs_review": reviewed, "exhausted": exhausted}
 
