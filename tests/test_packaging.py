@@ -1230,3 +1230,86 @@ def test_nothing_hardcodes_the_repo_layout_for_assets():
             if re.search(r'ROOT\s*/\s*"(config|locales|static|clients)"', line):
                 offenders.append(f"{path.name}:{number}")
     assert not offenders, f"저장소 배치를 직접 조립한다: {offenders}"
+
+
+# ── QA P-1 — 커밋된 빌드 트리가 설치를 오염시켰다 ───────────────────────────
+#
+# `build/lib/**` 44개 파일이 커밋돼 있었고, 그 스냅샷은 어느 커밋과도 일치하지
+# 않는 낡은 작업본이었다. setuptools `build_py` 는 mtime 으로만 갱신을 판단하는데
+# git 체크아웃은 mtime 을 보존하지 않으므로(알파벳순으로 `build/` 가 `app/` 보다
+# 늦게 쓰인다) 소스가 "더 오래된" 것으로 판정됐다 — **`pip install .` 한 설치처는
+# 출력 가드·KEK 회전 CLI 가 빠진 앱을 받으면서 문서는 전부 구현됐다고 말했다.**
+
+
+def test_no_build_tree_is_tracked():
+    """직접 방지 장치 — 빌드 산출물이 다시 커밋되면 그 자리에서 실패한다."""
+    tracked = subprocess.run(
+        ["git", "ls-files", "build", "dist"],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+    if tracked.returncode != 0:      # git 이 없는 환경(설치본에서의 실행)은 대상 밖
+        pytest.skip("git 저장소가 아니다")
+
+    assert not tracked.stdout.strip(), (
+        f"빌드 산출물이 커밋돼 있다:\n{tracked.stdout}"
+        "낡은 스냅샷이 pip install 설치본을 오염시킨다 — git rm 하라"
+    )
+    assert "/build/" in (ROOT / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_the_wheel_content_matches_the_source(tmp_path):
+    """**휠을 실제로 빌드해 소스와 대조한다.**
+
+    pyproject 의 TOML 문자열 검사(위 `test_the_wheel_carries_the_bundled_assets`)는
+    선언을 검사할 뿐, 빌드가 그 선언대로 **지금 소스를** 담는지는 못 본다 — P-1
+    이 정확히 그 틈이었다. 여기서는 추적 중인 파일만 새 디렉터리로 복사해(깨끗한
+    체크아웃과 같은 모양) 휠을 굽고, 안의 모든 `app/*.py` 를 소스와 바이트 단위로
+    대조한다. 낡은 빌드 트리가 다시 커밋되거나, 새 모듈이 패키징 설정에서 빠지면
+    여기서 어긋난다.
+    """
+    import zipfile
+
+    listing = subprocess.run(
+        ["git", "ls-files", "-z"], capture_output=True, cwd=ROOT,
+    )
+    if listing.returncode != 0:
+        pytest.skip("git 저장소가 아니다")
+
+    checkout = tmp_path / "checkout"
+    for name in listing.stdout.decode().split("\0"):
+        if not name:
+            continue
+        target = checkout / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / name).read_bytes())
+
+    wheel_dir = tmp_path / "wheel"
+    built = subprocess.run(
+        [sys.executable, "-m", "pip", "wheel", "--no-build-isolation",
+         "--no-deps", "-w", str(wheel_dir), "."],
+        capture_output=True, text=True, cwd=checkout,
+    )
+    assert built.returncode == 0, built.stderr[-2000:]
+
+    [wheel] = wheel_dir.glob("*.whl")
+    with zipfile.ZipFile(wheel) as archive:
+        shipped = {
+            name: archive.read(name)
+            for name in archive.namelist()
+            if name.startswith("app/") and name.endswith(".py")
+        }
+
+    source_modules = {
+        f"app/{path.relative_to(ROOT / 'app')}"
+        for path in (ROOT / "app").rglob("*.py")
+    }
+    missing = sorted(source_modules - set(shipped))
+    assert not missing, f"소스에 있는 모듈이 휠에 없다: {missing}"
+
+    stale = sorted(
+        name for name, content in shipped.items()
+        if name in source_modules and content != (ROOT / name).read_bytes()
+    )
+    assert not stale, (
+        f"휠 안의 파일이 소스와 다르다(낡은 빌드 트리가 이겼다): {stale}"
+    )

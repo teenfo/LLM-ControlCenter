@@ -19,6 +19,12 @@ venv/
 /dist/
 /bundle/
 
+# setuptools 빌드 트리 — **커밋되면 설치를 오염시킨다.**
+# build_py 는 mtime 으로만 갱신을 판단하는데 git 체크아웃은 mtime 을 보존하지
+# 않으므로, 커밋된 build/lib 스냅샷이 소스보다 "새것" 으로 판정돼 `pip install .`
+# 설치본이 그 낡은 스냅샷이 된다. 실제로 출력 가드가 빠진 앱이 설치됐다(QA P-1).
+/build/
+
 # 패키징 산출물
 llm-controlcenter-airgap-*.tgz
 backups/
