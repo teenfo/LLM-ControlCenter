@@ -1074,8 +1074,14 @@ def test_an_administrative_absence_still_waits(cluster):
     assert result.outcome == WAIT, "헬스는 관리자가 되돌릴 수 있다"
 
 
-def test_airgap_and_affinity_are_administrative_not_permanent(store, clock):
-    """에어갭도 `tenant_affinity` 도 관리자가 바꿀 수 있다 — 기다릴 값이 있다."""
+def test_airgap_rejection_fails_immediately_not_after_900_seconds(store, clock):
+    """**에어갭은 프로세스 수명 동안 불변이다** — 기다려도 달라지지 않는다.
+
+    한동안 이 테스트는 "에어갭도 관리자가 바꿀 수 있다" 며 WAIT 를 단언했는데,
+    에어갭은 기동 인자·환경변수에서 오므로 도는 프로세스에서는 아무도 못 바꾼다.
+    WAIT 로 두면 소비자는 900초를 매달린 뒤 `administrative_wait_timeout` 을
+    받는다 — M6 이 없애려던 바로 그 오해 코드다(QA R-LOW4).
+    """
     config = build_config(
         nodes={"out": Node(name="out", provider="mock", data_boundary="external",
                            tags=("external",), models=("m",))},
@@ -1088,8 +1094,27 @@ def test_airgap_and_affinity_are_administrative_not_permanent(store, clock):
     result = c.place(
         job_id="j", tenant_id="acme", service_id="acme-web", role=config.roles["r"]
     )
-    assert result.outcome == WAIT
+    assert result.outcome == FAIL, "영원히 못 도는 잡을 15분 기다리게 했다"
     assert result.rejections["out"] == "airgap_external_disabled"
+
+
+def test_tenant_affinity_is_administrative_not_permanent(store, clock):
+    """`tenant_affinity` 는 관리자가 노드 갱신으로 바꿀 수 있다 — 기다릴 값이 있다."""
+    config = build_config(
+        nodes={"n": Node(name="n", provider="mock", data_boundary="internal",
+                          tags=("internal",), models=("m",),
+                          tenant_affinity=("globex",))},
+        roles={"r": Role(name="r", model="m", placement=("internal",))},
+    )
+    c = Cluster(config, store, now=clock)
+    c.nodes["n"].status = HEALTHY
+    c.nodes["n"].models = frozenset({"m"})
+
+    result = c.place(
+        job_id="j", tenant_id="acme", service_id="acme-web", role=config.roles["r"]
+    )
+    assert result.outcome == WAIT
+    assert result.rejections["n"] == "tenant_affinity"
 
 
 def test_a_permanent_reason_is_reported_even_when_the_node_is_also_down(store, clock):

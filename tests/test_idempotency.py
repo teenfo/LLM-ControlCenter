@@ -280,3 +280,41 @@ def test_the_rate_window_excludes_old_usage(harness, acme):
     harness.clock.advance(3600)
 
     assert harness.store.token_rate(ACME, window_seconds=300.0)["tokens_per_minute"] == 0.0
+
+
+# ── QA V10 — 멱등성은 정책 판정을 캐시하지 않는다 ───────────────────────────
+
+
+async def test_a_blocked_request_is_reevaluated_after_the_rule_changes(harness, client, acme):
+    """**차단 판정을 멱등성으로 캐시하면 안 되는 이유가 이 테스트다.**
+
+    차단은 그 시점의 규칙의 함수다. 판정을 캐시하면 관리자가 규칙을 완화한 뒤의
+    재시도가 옛 판정(차단)을 돌려받는다 — 같은 키의 재시도가 2단 분류를 다시
+    도는 비용은 그 정확성의 값이다(QA V10 은 의도로 확정).
+    """
+    from tests.conftest import auth
+
+    body = {
+        "role": "summarize", "prompt": "제 주민번호는 900101-1234568 입니다",
+        "wait": 0,
+    }
+    headers = {**auth(acme["service"]), "Idempotency-Key": "retry-me"}
+
+    first = client.post("/v1/generate", headers=headers, json=body)
+    assert first.status_code == 422, first.text          # 차단됐다
+
+    # 관리자가 차단 규칙을 완화했다 — 마스킹으로.
+    rules = list(harness.config.guard_rules)
+    softened = [
+        r if r.id != "kr_rrn" else __import__("dataclasses").replace(r, action="full")
+        for r in rules
+    ]
+    harness.config = __import__("dataclasses").replace(
+        harness.config, guard_rules=tuple(softened)
+    )
+    harness.guard._config = harness.config
+
+    retry = client.post("/v1/generate", headers=headers, json=body)
+    assert retry.status_code in (200, 202), (
+        f"완화 뒤의 재시도가 옛 판정을 돌려받았다: {retry.status_code} {retry.text}"
+    )

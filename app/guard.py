@@ -511,8 +511,13 @@ class Guard:
             if not pattern:
                 raise ApiError("missing_field", status=400, params={"field": "pattern"})
             try:
-                re.compile(pattern)
+                compiled = re.compile(pattern)
             except re.error:
+                raise ApiError("invalid_field", status=400, params={"field": "pattern"})
+            if compiled.search("") is not None:
+                # `\d*` 처럼 빈 문자열에 걸리는 패턴은 모든 위치에서 매치된다 —
+                # 런타임은 빈 매치를 버리지만, 저장 시점에 사람 말로 거절하는
+                # 편이 규칙을 쓴 사람에게 낫다(QA G-LOW1).
                 raise ApiError("invalid_field", status=400, params={"field": "pattern"})
         elif not raw.get("description"):
             # LLM 규칙은 설명이 곧 판정 기준이다. 비어 있으면 분류기가 물어볼 것이 없다.
@@ -762,13 +767,23 @@ class Guard:
                 return span
             return index[start], index[min(end, len(index)) - 1] + 1
 
+        # **폭 0 매치는 버린다.** `\d*` 류의 흔한 실수는 어디서나 빈 매치를
+        # 내는데, 빈 스팬 (k, k) 가 NFKC 인덱스 지도를 지나면 `index[k-1]+1` 이
+        # 뒤로 감겨 **프롬프트 전체가 라벨 하나로 치환**된다(QA G-LOW1).
+        # 유출은 아니지만 요청이 통째로 훼손된다 — 빈 매치는 어차피 아무 정보도
+        # 안 담는다.
         validator = CHECKSUMS.get(rule.checksum) if rule.checksum else None
         if validator is None:
-            return [to_source(m.span()) for m in compiled.finditer(haystack)], []
+            return [
+                to_source(m.span())
+                for m in compiled.finditer(haystack) if m.start() != m.end()
+            ], []
 
         verified: list[tuple[int, int]] = []
         unverified: list[tuple[int, int]] = []
         for match in compiled.finditer(haystack):
+            if match.start() == match.end():
+                continue
             target = verified if validator(match.group(0)) else unverified
             target.append(to_source(match.span()))
         return verified, unverified

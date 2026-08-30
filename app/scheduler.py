@@ -463,12 +463,30 @@ class Scheduler:
                 model=placement.model, prompt=prompt, system=system,
                 options=job.options, timeout=job.timeout_s,
             )
-            await self._succeed(
-                scope, job, placement, lane, started,
-                text=result.text,
-                input_tokens=result.input_tokens, output_tokens=result.output_tokens,
-                metrics=dict(result.metrics),
-            )
+            # **추론이 성공한 뒤부터는 컨트롤 플레인이다.** 출력 가드·정산의
+            # 예외를 아래 except 로 흘리면 `record_failure` 가 건강한 노드를
+            # 벌점 주고 헬스가 뒤집힌다(QA R-LOW3) — 노드는 제 일을 다 했다.
+            try:
+                await self._succeed(
+                    scope, job, placement, lane, started,
+                    text=result.text,
+                    input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                    metrics=dict(result.metrics),
+                )
+            except Exception as exc:
+                _loop_failure(f"finalize:{job_id}", exc)
+                # 소비자에게는 실패다 — 추론은 됐지만 그 결과를 안전하게 종결할
+                # 수 없었다. 재큐하지 않는 이유: 재실행은 이중 추론이고, 문제는
+                # 노드가 아니라 이쪽에 있다. 지출은 못 쓴다(정산이 죽은 것이므로)
+                # — 예약 해제가 예산이 영원히 묶이는 것만 막는다.
+                self._store.update_job(
+                    scope, job_id, expect_status="running",
+                    status="failed", error=str(exc), error_code="finalize_failed",
+                    finished_at=self._now(),
+                )
+                self._accountant.release_reservation(scope, job_id)
+                self._completion.done(job_id)
+            return
 
         except BackendError as exc:
             await self._handle_failure(scope, job_id, placement, lane, exc)
@@ -603,10 +621,13 @@ class Scheduler:
         rebindable = exc.code == "model_not_installed"
         retriable = (exc.retryable or rebindable) and attempts <= self._thresholds.max_retries
 
+        # **여기도 CAS 다**(QA R-LOW3). 취소·복구·정산이 전부 CAS 인데 실패
+        # 기록만 무조건 덮으면, 이미 종결된 잡(ok·복구가 가져간 잡)을 실패로
+        # 되돌린다 — 지면 다른 쪽의 종결이 이긴 것이므로 회계도 그쪽 몫이다.
         if retriable:
             # **재시도는 재배치를 동반한다.** 직전 실패 노드를 남겨 배치가 그 노드를 피한다.
             self._store.update_job(
-                scope, job_id,
+                scope, job_id, expect_status="running",
                 status="queued", attempts=attempts,
                 last_failed_node=placement.node, node=None, started_at=None,
                 wait_reason="retry_backoff", wait_since=self._now(),
@@ -614,11 +635,12 @@ class Scheduler:
             )
             return
 
-        self._store.update_job(
-            scope, job_id,
+        if not self._store.update_job(
+            scope, job_id, expect_status="running",
             status="failed", attempts=attempts, error=str(exc), error_code=exc.code,
             finished_at=self._now(),
-        )
+        ):
+            return
         # 실패해도 소비된 토큰은 있을 수 있다. 예약을 풀지 않으면 예산이 영원히 묶인다.
         self._accountant.release_reservation(scope, job_id)
         self._store.record_usage(

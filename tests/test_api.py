@@ -1351,3 +1351,41 @@ def test_a_lost_creation_race_is_409_not_500(harness, client):
         harness.store.create_tenant("acme", "다시", end_user_salt=b"s")
     with pytest.raises(AlreadyExists):
         harness.store.create_service(TenantScope("acme"), "acme-web", "다시")
+
+
+async def test_a_chunked_body_is_cut_at_the_limit_not_buffered_whole():
+    """**`content-length` 가 없는(청크) 요청도 상한에서 끊긴다**(QA M21 잔여).
+
+    전량을 메모리에 읽은 뒤에 재면 검사 자체가 메모리 소진 경로다. TestClient 는
+    전송 전에 제너레이터를 통째로 소비하므로 서버의 읽기를 못 재고, 그래서
+    `_body` 를 ASGI receive 수준에서 직접 잰다 — 상한을 넘는 순간 더는 receive
+    를 부르지 않아야 한다.
+    """
+    import pytest
+    from starlette.requests import Request
+
+    from app.main import MAX_BODY_BYTES, _body
+    from app.i18n import ApiError
+
+    piece = b"x" * 65536
+    total_chunks = 1 + (MAX_BODY_BYTES * 3) // len(piece)
+    served = {"n": 0}
+
+    async def receive():
+        served["n"] += 1
+        more = served["n"] < total_chunks
+        return {"type": "http.request", "body": piece, "more_body": more}
+
+    request = Request(
+        {"type": "http", "method": "POST", "headers": [], "query_string": b""},
+        receive,
+    )
+
+    with pytest.raises(ApiError) as caught:
+        await _body(request)
+
+    assert caught.value.status == 413
+    limit_chunks = MAX_BODY_BYTES // len(piece) + 2
+    assert served["n"] <= limit_chunks, (
+        f"상한을 넘고도 {served['n']}조각을 계속 읽었다 — 전량 버퍼링이다"
+    )

@@ -2341,7 +2341,17 @@ class SqliteStore:
                 "SELECT id, detail_json, prev_hash, row_hash FROM admin_audit "
                 "ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            prev_hash = (tip["row_hash"] if tip else None) or AUDIT_GENESIS
+            prev_hash = tip["row_hash"] if tip else None
+            if not prev_hash:
+                # 체인이 비어 있다(또는 체인 이전 행뿐이다). **GENESIS 가 아니라
+                # 앵커에서 잇는다** — 보존 정리가 1년 넘게 조용하던 설치처의 감사를
+                # 통째로 지우면 앵커만 남는데, 여기서 GENESIS 로 이으면 다음 검증이
+                # 앵커와 어긋나 영구 실패한다(QA V8). 지워진 구간의 끝이 앵커이고,
+                # 새 체인은 그 끝에서 이어져야 한다.
+                anchor = self._conn.execute(
+                    "SELECT value FROM meta WHERE key = ?", (AUDIT_ANCHOR_KEY,)
+                ).fetchone()
+                prev_hash = (anchor["value"] if anchor else None) or AUDIT_GENESIS
 
             merge_into = None
             if coalesce_seconds > 0 and tip is not None and tip["row_hash"]:
@@ -2407,7 +2417,7 @@ class SqliteStore:
                         "WHERE COALESCE((SELECT row_hash FROM admin_audit "
                         "ORDER BY id DESC LIMIT 1), ?) = ?",
                         (now, tenant_id, actor, action, target, detail_json, outcome,
-                         prev_hash, row_hash, AUDIT_GENESIS, prev_hash),
+                         prev_hash, row_hash, prev_hash, prev_hash),
                     )
                 if cursor.rowcount:
                     return

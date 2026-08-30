@@ -59,7 +59,13 @@ LEASE_MARGIN_SECONDS = 30.0
 #:
 #: 에어갭·`tenant_affinity`·헬스는 여기 없다 — 관리자가 되돌릴 수 있고, 되돌릴 수
 #: 있는 것을 하드 실패시키면 정비 5분에 그 티어 잡이 전멸한다(B5).
-PERMANENT_REJECTIONS = frozenset({"boundary_internal_only", "boundary_blocked_by_guard"})
+#: 잡의 생애 동안 변하지 않는 탈락 사유 — 기다려도 달라지지 않으므로 즉시 FAIL.
+#: `airgap_external_disabled` 가 여기 있다: 에어갭은 프로세스 수명 동안 불변인데
+#: WAIT 로 분류돼 900초 뒤 `administrative_wait_timeout` 이 나갔다(QA R-LOW4) —
+#: M6 이 없애려던 바로 그 오해 코드다.
+PERMANENT_REJECTIONS = frozenset({
+    "boundary_internal_only", "boundary_blocked_by_guard", "airgap_external_disabled",
+})
 
 #: 노드 등록 본문이 받는 필드. `name` 은 따로 뽑으므로 여기 없다.
 NODE_REGISTRATION_FIELDS = frozenset(
@@ -452,10 +458,12 @@ class Cluster:
         if node.data_boundary not in allowed_boundaries:
             return "boundary_blocked_by_guard"
 
-        # 아래부터는 관리자가 되돌릴 수 있는 것들이다.
+        # 에어갭은 프로세스 수명 동안 불변이다 — 관리자가 되돌릴 수 있는 것들
+        # (아래)과 달리 영구 탈락으로 분류된다(PERMANENT_REJECTIONS).
         if self._airgap and not node.is_internal:
             return "airgap_external_disabled"
 
+        # 아래부터는 관리자가 되돌릴 수 있는 것들이다.
         if not node.allows_tenant(tenant_id):
             return "tenant_affinity"
 

@@ -970,3 +970,32 @@ def test_equal_strength_overlap_keeps_the_smaller_tail():
         (5, 15, "full", "[B]", 0),
     ])
     assert merged == [(0, 15, "full", "[B]", 0)]
+
+
+async def test_a_zero_width_match_does_not_swallow_the_prompt():
+    """**`\\d*` 실수 하나가 프롬프트 전체를 라벨로 바꿨다**(QA G-LOW1).
+
+    빈 스팬 (k, k) 가 NFKC 인덱스 지도를 지나면 끝 계산이 뒤로 감긴다. 유출은
+    아니지만 요청이 통째로 훼손된다 — 빈 매치는 버린다.
+    """
+    rule = GuardRule(
+        id="oops", kind="pattern", action="full", label="[실수]", pattern=r"\d*",
+    )
+    guard = Guard(make_config((rule,)))
+    # NFKC 지도가 생기게 전각 문자를 하나 넣는다 — 감김은 지도가 있어야 난다.
+    text = "전각 Ｂ 가 있는 멀쩡한 문장입니다"
+
+    verdict = await guard.inspect(text, candidate_boundaries=("internal", "external"))
+
+    assert verdict.prompts["external"] == text, verdict.prompts["external"]
+
+
+def test_a_pattern_matching_the_empty_string_is_refused_at_save(harness):
+    """저장 시점에 사람 말로 거절한다 — 런타임 방어만 있으면 규칙을 쓴 사람은
+    자기 규칙이 조용히 아무것도 안 잡는 이유를 모른다."""
+    from app.i18n import ApiError
+
+    with pytest.raises(ApiError):
+        harness.guard.validate_rule({
+            "id": "oops", "kind": "pattern", "action": "full", "pattern": r"\d*",
+        })

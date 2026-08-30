@@ -355,13 +355,23 @@ async def _body(request: Request) -> dict[str, Any]:
             params={"size": length, "limit": str(MAX_BODY_BYTES)},
         )
 
-    raw = await request.body()
-    if len(raw) > MAX_BODY_BYTES:
-        # `content-length` 가 없거나 거짓말인 경우(청크 전송). 읽은 뒤에도 본다.
-        raise ApiError(
-            "payload_too_large", status=413,
-            params={"size": str(len(raw)), "limit": str(MAX_BODY_BYTES)},
-        )
+    # **스트림을 상한까지만 읽는다.** `content-length` 가 없는(청크 전송) 요청을
+    # `request.body()` 로 전량 읽은 뒤에 재면, 검사 자체가 메모리 소진 경로가
+    # 된다(QA M21 잔여) — 상한을 넘는 순간 끊고 나머지는 읽지 않는다.
+    # 읽은 조각은 `request._body` 에 되돌려 놓아 뒤의 `request.json()` 류가
+    # 스트림을 다시 소비하려다 죽지 않게 한다(Starlette 의 `body()` 캐시 자리다).
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > MAX_BODY_BYTES:
+            raise ApiError(
+                "payload_too_large", status=413,
+                params={"size": f">{MAX_BODY_BYTES}", "limit": str(MAX_BODY_BYTES)},
+            )
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    request._body = raw
     if not raw:
         return {}
     try:

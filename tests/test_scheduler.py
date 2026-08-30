@@ -836,3 +836,55 @@ def test_success_is_never_committed_outside_the_settlement():
         f"성공 종결이 정산 밖에서 커밋된다: {offenders} — "
         "settle(finish={'status': 'ok', ...}) 로 옮겨라"
     )
+
+
+# ── QA R-LOW3 — 실패 기록의 CAS 와 노드 오귀책 ─────────────────────────────
+
+
+async def test_a_finalize_crash_does_not_blame_the_healthy_node(parts, store):
+    """**추론이 성공한 뒤의 예외는 노드 탓이 아니다.**
+
+    출력 가드·정산의 크래시가 실패 처리로 흘러 `record_failure` 를 타면 건강한
+    노드가 벌점을 받고, 반복되면 헬스가 뒤집혀 그 노드로 가는 배치가 전부 선다 —
+    컨트롤 플레인의 버그가 노드 장애로 위장된다.
+    """
+    cluster, scheduler = parts
+    job_id = enqueue(store, ACME)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("정산이 크래시났다")
+
+    store._insert_usage = explode
+    failures_before = {n: s.consecutive_failures for n, s in cluster.nodes.items()}
+    await drain(scheduler)
+
+    job = store.get_job(ACME, job_id)
+    assert job.status == "failed"
+    assert job.error_code == "finalize_failed", job.error_code
+    for name, state in cluster.nodes.items():
+        assert state.consecutive_failures == failures_before[name], (
+            f"건강한 노드 {name} 가 컨트롤 플레인 크래시로 벌점을 받았다"
+        )
+
+
+async def test_failure_recording_does_not_overwrite_a_finalized_job(parts, store):
+    """실패 기록도 CAS 다 — 이미 종결된 잡을 실패로 되돌리면 그쪽의 회계와
+    이쪽의 회계가 겹친다."""
+    from app.providers.base import BackendError
+
+    cluster, scheduler = parts
+    job_id = enqueue(store, ACME)
+    store.update_job(ACME, job_id, status="running", node="in-1")
+    # 다른 쪽(복구·정산)이 이미 종결했다.
+    store.update_job(ACME, job_id, status="ok", finished_at=1.0)
+
+    from app.cluster import Placement
+    placement = Placement(
+        job_id=job_id, node="in-1", model="small", tier="internal", provider="mock",
+    )
+    await scheduler._handle_failure(
+        ACME, job_id, placement, "interactive",
+        BackendError("늦게 온 실패", retryable=False, code="timeout"),
+    )
+
+    assert store.get_job(ACME, job_id).status == "ok", "종결된 잡이 실패로 되돌아갔다"

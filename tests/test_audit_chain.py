@@ -518,3 +518,23 @@ def test_export_of_a_pre_chain_database_does_not_crash(tmp_path, capsys):
 
     assert cli_export(data, tmp_path / "audit.jsonl") == 0
     assert "체인 이전 구간" in capsys.readouterr().out
+
+
+def test_a_purge_that_empties_the_chain_does_not_break_verification(store, clock):
+    """**1년 넘게 조용하던 설치처의 보존 정리가 체인을 통째로 비운다**(QA V8).
+
+    빈 체인에서 새 감사가 GENESIS 로 이으면 검증이 앵커와 어긋나 영구 실패한다 —
+    새 체인은 지워진 구간의 끝(앵커)에서 이어져야 한다.
+    """
+    store.audit("admin", "old_event_1")
+    store.audit("admin", "old_event_2")
+
+    clock.advance(400 * 86400)          # 전 행이 보존(365일)을 넘겼다
+    store.purge_expired()
+    rows = store._conn.execute("SELECT COUNT(*) AS n FROM admin_audit").fetchone()
+    assert rows["n"] == 0, "전제: 체인이 통째로 비워졌다"
+
+    store.audit("admin", "fresh_event")
+
+    verdict = store.verify_audit_chain()
+    assert verdict["ok"], f"보존 정리 뒤 첫 감사가 체인을 끊었다: {verdict}"

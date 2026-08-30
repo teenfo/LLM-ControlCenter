@@ -54,6 +54,9 @@ MAX_HISTORY = 500
 
 _POOL_WORKERS = 4
 _pool_lock = threading.Lock()
+#: 채널 발송의 도달 **순서는 보장하지 않는다**(QA INFO). 워커가 여럿이라 나중
+#: 사건이 먼저 닿을 수 있다 — 상태 전이 판정과 중복 억제는 발송 전에 순서대로
+#: 끝나므로 판정 자체는 안 흔들리고, 흔들리는 것은 수신함의 표시 순서뿐이다.
 _shared_pool: futures.ThreadPoolExecutor | None = None
 
 
