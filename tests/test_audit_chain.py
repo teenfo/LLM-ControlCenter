@@ -381,3 +381,140 @@ def test_the_debt_table_does_not_overclaim():
     assert row, "부채 표에 감사 무결성 항목이 없다"
     assert "audit-export" in row, "내보내기가 필수라는 것이 안 적혀 있다"
     assert "위변조 불가" not in readme
+
+
+# ── QA V4 — 합치기가 다중 워커에서 체인을 끊는다 ────────────────────────────
+
+
+class StaleTip:
+    """팁 읽기가 낡은 상황을 재현하는 커넥션 프록시.
+
+    실제 경합: A 가 팁을 읽고 → B 가 그 팁 뒤에 새 행을 잇고 → A 가 (이제 팁이
+    아닌) 그 행을 합치기 UPDATE 로 고친다. 유일 인덱스는 INSERT 포크만 막지 이
+    UPDATE 는 못 막는다. 첫 팁 읽기에만 낡은 값을 돌려주고, 재시도부터는
+    실제 값을 준다 — 고친 코드는 재시도에서 회복해야 한다.
+    """
+
+    def __init__(self, conn, interleave):
+        self._conn = conn
+        self._interleave = interleave
+        self._armed = True
+
+    def execute(self, sql, *args):
+        result = self._conn.execute(sql, *args)
+        if self._armed and sql.startswith("SELECT id, detail_json, prev_hash, row_hash"):
+            self._armed = False
+            stale = result.fetchone()
+            self._interleave()          # B 가 이 사이에 새 행을 잇는다
+            class _One:
+                def fetchone(self_inner):
+                    return stale
+            return _One()
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_coalescing_a_stale_tip_does_not_break_the_chain(tmp_path):
+    """**합치기는 그 행이 아직 팁일 때만 성립한다** — 낡은 팁을 고치면 뒤 행의
+    앞 고리가 끊기고, 그것은 변조와 구분되지 않는다(QA V4)."""
+    from app.store import SqliteStore
+
+    path = tmp_path / "audit.db"
+    a = SqliteStore(path)
+    b = SqliteStore(path)
+    try:
+        a.audit("admin", "poll", coalesce_seconds=300)
+
+        def b_appends():
+            b.audit("admin", "delete_tenant", target="acme")
+
+        a._conn = StaleTip(a._conn, b_appends)
+        # A 의 합치기 — 낡은 팁(1행)을 고치려 든다.
+        a.audit("admin", "poll", coalesce_seconds=300)
+
+        verdict = a.verify_audit_chain()
+        assert verdict["ok"], f"체인이 끊겼다: {verdict}"
+    finally:
+        a.close(); b.close()
+
+
+def test_inserting_after_a_stale_tip_does_not_break_the_chain(tmp_path):
+    """INSERT 쪽도 같다 — 낡은 팁 해시를 앞 고리로 이으면, 그 사이 합치기로
+    바뀐 팁과 어긋난다. 유일 인덱스는 **같은** prev_hash 의 중복만 막는다."""
+    from app.store import SqliteStore
+
+    path = tmp_path / "audit2.db"
+    a = SqliteStore(path)
+    b = SqliteStore(path)
+    try:
+        a.audit("admin", "poll", coalesce_seconds=300)
+
+        def b_coalesces():
+            # B 가 같은 팁을 합치기로 고쳐 팁의 해시가 바뀐다.
+            b.audit("admin", "poll", coalesce_seconds=300)
+
+        a._conn = StaleTip(a._conn, b_coalesces)
+        a.audit("admin", "delete_tenant", target="acme")   # 낡은 해시에 잇는다
+
+        verdict = a.verify_audit_chain()
+        assert verdict["ok"], f"체인이 끊겼다: {verdict}"
+    finally:
+        a.close(); b.close()
+
+
+# ── QA V5·V9 — 내보내기 표식과 체인 이전 구간 ──────────────────────────────
+
+
+def cli_export(data_dir, out, *extra):
+    from app.cli import main as cli_main
+
+    return cli_main([
+        "--data", str(data_dir), "audit-export", "--out", str(out), *extra,
+    ])
+
+
+def test_normal_polling_after_an_export_is_not_an_alarm(tmp_path, capsys):
+    """**정상 운영(대시보드 폴링 + 내보내기)이 doctor 경보를 내면 안 된다**(QA V5).
+
+    표식이 아직 합쳐질 수 있는 팁을 가리키면, 다음 폴링의 합치기가 그 해시를
+    바꿔 "체인 재계산" 경보가 난다 — 정상을 사고로 신고하는 검증은 곧 꺼진다.
+    표식은 얼어붙은 행(뒤에 행이 생긴 행)에 둔다.
+    """
+    from app.store import SqliteStore
+
+    data = tmp_path / "data"; data.mkdir()
+    store = SqliteStore(data / "controlcenter.db")
+    store.audit("admin", "delete_tenant", target="old")          # 얼어붙을 행
+    store.audit("admin", "poll", coalesce_seconds=300)           # 살아 있는 팁
+    store.close()
+
+    assert cli_export(data, tmp_path / "audit.jsonl") == 0
+
+    store = SqliteStore(data / "controlcenter.db")
+    try:
+        # 대시보드가 계속 폴링한다 — 팁이 합쳐져 해시가 바뀐다.
+        store.audit("admin", "poll", coalesce_seconds=300)
+        assert store.audit_export_still_agrees() is True, (
+            "정상 폴링이 '체인 재계산' 경보가 됐다"
+        )
+    finally:
+        store.close()
+
+
+def test_export_of_a_pre_chain_database_does_not_crash(tmp_path, capsys):
+    """업그레이드 직후 첫 내보내기 — 전부 체인 이전(해시 NULL) 행뿐이어도
+    TypeError 없이 나간다(QA V9)."""
+    from app.store import SqliteStore
+
+    data = tmp_path / "data"; data.mkdir()
+    store = SqliteStore(data / "controlcenter.db")
+    store._conn.execute(
+        "INSERT INTO admin_audit(ts, actor, action, outcome) VALUES(1, 'a', 'old', 'ok')"
+    )
+    store._conn.commit()
+    store.close()
+
+    assert cli_export(data, tmp_path / "audit.jsonl") == 0
+    assert "체인 이전 구간" in capsys.readouterr().out

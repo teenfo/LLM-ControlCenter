@@ -939,3 +939,34 @@ async def test_ascii_identifier_context_is_still_not_matched():
     )
 
     assert verdict.prompts["external"] == text, "식별자 문맥이 오탐으로 훼손됐다"
+
+
+def test_equal_strength_overlap_keeps_the_smaller_tail():
+    """**동강도 겹침에서는 덜 남기는 쪽이 이긴다**(QA G-MED3).
+
+    시작이 빠른 규칙의 keep_tail 이 병합 스팬 전체에 적용되던 동안,
+    keep_tail=2 규칙의 값 뒷자리가 겹친 keep_tail=8 규칙의 폭만큼 노출됐다 —
+    "더 강한 등급이 이긴다" 는 보증이 동강도에서는 비어 있었다.
+    """
+    from app.guard import _coalesce
+
+    # 시작이 빠른 쪽이 keep_tail=8, 늦은 쪽이 keep_tail=2 — 옛 코드는 8 을 채택했다.
+    merged = _coalesce([
+        (0, 10, "partial", "[A]", 8),
+        (5, 15, "partial", "[B]", 2),
+    ])
+    assert merged == [(0, 15, "partial", "[A]", 2)]
+
+    # 반대 순서도 같다 — 순서가 답을 바꾸면 안 된다.
+    merged = _coalesce([
+        (0, 10, "partial", "[A]", 2),
+        (5, 15, "partial", "[B]", 8),
+    ])
+    assert [g[4] for g in merged] == [2]
+
+    # 강도가 다르면 기존 보증 그대로 — 강한 쪽의 keep_tail 을 통째로 따른다.
+    merged = _coalesce([
+        (0, 10, "partial", "[A]", 4),
+        (5, 15, "full", "[B]", 0),
+    ])
+    assert merged == [(0, 15, "full", "[B]", 0)]

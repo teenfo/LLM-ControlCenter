@@ -285,3 +285,67 @@ def test_the_contract_tells_consumers_that_credentials_are_masked(client, acme):
 
     assert "자격증명도 마스킹된다" in guide
     assert "자기 토큰을 프롬프트에 넣지 않는다" in guide
+
+
+# ── QA G-MED1·2 · G-LOW2 — 좌측 경계 · PEM 블록 · fine-grained PAT ──────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "task-management-system-v2-backup 브랜치로 배포합니다",
+        "kiosk-station-firmware-update-2026 리뷰 부탁해요",
+        "risk-assessment-matrix-final-draft 를 정리 중입니다",
+    ],
+    ids=["task", "kiosk", "risk"],
+)
+async def test_hyphenated_identifiers_are_not_secrets(guard, text):
+    """**`full` 등급의 오탐은 지우는 오탐이다** — `sk-` 에 좌측 경계가 없던
+    동안 평범한 하이픈 식별자가 `ta[시크릿]` 처럼 훼손된 채 추론으로 갔다.
+    "34건 오탐 0" 은 코퍼스에 이 부류가 없어서 참으로 보였을 뿐이다."""
+    verdict = await guard.inspect(text, candidate_boundaries=(INTERNAL, EXTERNAL))
+
+    assert verdict.prompts[EXTERNAL] == text, verdict.prompts[EXTERNAL]
+
+
+async def test_a_real_key_after_a_separator_is_still_caught(guard):
+    """경계를 세우느라 구분자 뒤의 진짜 키를 놓치면 안 된다."""
+    value = pysecrets.token_urlsafe(32)
+    text = f"백업 키: backup-sk-ant-api03-{value} 입니다"
+    verdict = await guard.inspect(text, candidate_boundaries=(INTERNAL, EXTERNAL))
+
+    assert value not in verdict.prompts[EXTERNAL]
+
+
+async def test_the_pem_body_is_masked_not_just_the_header(guard):
+    """머리말만 가리면 **실제 비밀(base64 본문)이 그대로 나간다** — 탐지됐다는
+    착시만 남는다. 블록 전체가 라벨 하나로 바뀌어야 한다."""
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "c2VjcmV0bWF0ZXJpYWxzZWNyZXRtYXRlcmlhbA==\n"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    verdict = await guard.inspect(f"서버 키 {pem} 교체 요청", candidate_boundaries=(INTERNAL, EXTERNAL))
+    masked = verdict.prompts[EXTERNAL]
+
+    assert "c2VjcmV0" not in masked, "본문이 살아 나갔다"
+    assert "END RSA" not in masked, "블록 꼬리가 남았다"
+
+
+async def test_a_truncated_pem_block_still_masks_the_header(guard):
+    """END 가 잘려 나간 붙여넣기도 머리말은 잡는다 — 블록 패턴이 전부가 되면
+    잘린 블록이 통째로 지나간다."""
+    verdict = await guard.inspect(
+        "-----BEGIN PRIVATE KEY----- 로 시작하는 파일인데요",
+        candidate_boundaries=(INTERNAL, EXTERNAL),
+    )
+
+    assert "BEGIN PRIVATE KEY" not in verdict.prompts[EXTERNAL]
+
+
+async def test_github_fine_grained_pat_is_a_secret(guard):
+    """classic(`ghp_`)만 잡던 동안 새 형식(`github_pat_`)이 통째로 지나갔다."""
+    pat = "github_pat_11ABCDEFG0123456789_" + "a" * 44
+    verdict = await guard.inspect(f"새 토큰 {pat} 발급했어요", candidate_boundaries=(INTERNAL, EXTERNAL))
+
+    assert pat not in verdict.prompts[EXTERNAL]

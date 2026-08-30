@@ -463,8 +463,14 @@ async def test_routing_failure_leaves_the_job_on_the_default_model(harness, clie
     job = harness.store.get_job(ACME, response.json()["job_id"])
 
     assert response.status_code in (200, 202), "라우팅 실패가 제출을 깨뜨렸다"
-    assert job.route is None
-    assert _routed(harness.config.roles["summarize"], job.route).model == "m"
+    # 실패는 NULL 이 아니라 센티널로 남는다 — NULL 은 "라우팅이 안 돎"(안 켠
+    # 역할·켜기 전 과거 잡)의 뜻이고, 섞으면 실패율이 과거로 오염된다.
+    from app.pipeline import ROUTE_FAILED
+
+    assert job.route == ROUTE_FAILED
+    assert _routed(harness.config.roles["summarize"], job.route).model == "m", (
+        "센티널이 기본 모델로 읽히지 않았다"
+    )
 
 
 # ── 3. 분류 실패 4종 — 전부 기본 모델 ───────────────────────────────────────
@@ -727,3 +733,123 @@ def test_the_production_assembly_wires_the_certifier():
         assert assembly.scheduler._certifier_factory == assembly.pipeline.make_certifier
     finally:
         store.close()
+
+
+# ── QA V6 · route_failures 왜곡 · R-LOW1·2 — 판정의 관측과 어휘 ─────────────
+
+
+def test_route_counts_runs_on_a_covering_index(harness):
+    """**/metrics 스크레이프마다 도는 질의가 잡 전면 스캔이면 안 된다**(QA V6).
+
+    시간이 아니라 실행 계획으로 고정한다 — `EXPLAIN` 에 임시 B-tree 가 다시
+    나타나면 실패한다.
+    """
+    executed: list[str] = []
+    real = harness.store._conn
+
+    class Recording:
+        def execute(self, sql, *args):
+            executed.append(sql)
+            return real.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    # **스토어가 실제로 내는 SQL 을 잰다** — 테스트가 자기 문자열을 재면
+    # 스토어 쪽 질의가 바뀌어도 여기는 초록이다.
+    harness.store._conn = Recording()
+    try:
+        harness.store.route_counts()
+    finally:
+        harness.store._conn = real
+    [sql] = executed
+
+    plan = " | ".join(
+        row["detail"] for row in real.execute(f"EXPLAIN QUERY PLAN {sql}")
+    )
+    assert "COVERING INDEX idx_jobs_route" in plan, plan
+    assert "TEMP B-TREE" not in plan, plan
+
+
+async def test_a_none_verdict_is_a_decision_not_a_failure(harness, client, acme):
+    """모델이 형식을 지키고 NONE 이라 답하면 — 그것은 판정이다. 실패로 세면
+    실패율이 부풀어 관리자가 멀쩡한 description 을 고치게 된다."""
+    from app.pipeline import ROUTE_NONE
+
+    harness.config.roles["summarize"] = Role(
+        **{**harness.config.roles["summarize"].__dict__,
+           "placement": ("internal",),
+           "routing": routing(simple="m", complex="guard-m")},
+    )
+    from tests.test_pipeline import certify
+    certify(harness)
+    # 목의 라우팅 응답을 눌러 NONE 을 내게 한다 — 형식(카나리아)은 지킨 채.
+    for state in harness.cluster.nodes.values():
+        state.provider.reply = None
+    import app.providers.mock as mock_mod
+    original = mock_mod._ROUTE_CATALOG
+    mock_mod._ROUTE_CATALOG = type("Never", (), {"search": staticmethod(lambda s: None)})()
+    try:
+        response = submit(client, acme)
+    finally:
+        mock_mod._ROUTE_CATALOG = original
+
+    job = harness.store.get_job(ACME, response.json()["job_id"])
+    assert job.route == ROUTE_NONE, f"NONE 판정이 {job.route!r} 로 남았다"
+
+
+def test_jobs_before_routing_was_enabled_do_not_count_as_failures(harness, acme):
+    """**켜기 전 과거 잡(route NULL)은 실패가 아니다.** NULL 로 실패를 세던
+    동안 켠 직후 실패율이 과거로 부풀었다 — 그 수치를 보고 관리자가 멀쩡한
+    description 을 고치게 된다."""
+    from app.observability import collect
+
+    # 라우팅 켜기 전의 잡 — route 는 NULL 이다.
+    harness.store.create_job(
+        ACME, service_id="acme-web", role="summarize", lane="interactive",
+        prompt_masked="옛 잡",
+    )
+
+    harness.config.roles["summarize"] = Role(
+        **{**harness.config.roles["summarize"].__dict__,
+           "routing": routing(simple="m")},
+    )
+    metrics = collect(
+        store=harness.store, cluster=harness.cluster, roles=harness.config.roles,
+    )
+
+    failures = [
+        (labels, value)
+        for metric in metrics if metric.name.endswith("_route_failures")
+        for labels, value in metric.samples if labels.get("role") == "summarize"
+    ]
+    assert all(value == 0 for _, value in failures), (
+        f"켜기 전 과거 잡이 실패로 합산됐다: {failures}"
+    )
+
+
+@pytest.mark.parametrize("key", ["복잡", "fast-lane", "_reserved", "NONE", "none"])
+def test_an_unselectable_or_reserved_route_key_is_refused(key):
+    """판정 파서는 마지막 줄의 `[A-Za-z0-9_]+` 토큰만 집는다 — 한글·붙임표 키는
+    설정은 통과하는데 **영원히 선택 불가**였다(QA R-LOW1). NONE 과 밑줄 시작은
+    센티널과 충돌한다."""
+    from app.config import _routing_from_dict
+
+    with pytest.raises(ConfigError):
+        _routing_from_dict("analyze", {
+            "classifier": "_guard_classify",
+            "routes": {key: {"model": "m", "description": "설명이 충분히 길다"}},
+        })
+
+
+def test_an_unknown_route_spec_key_is_refused():
+    """모르는 키를 묵살하면 관리자는 `timeout: 5` 가 듣는 줄 안다(QA R-LOW2)."""
+    from app.config import _routing_from_dict
+
+    with pytest.raises(ConfigError, match="모르는 키"):
+        _routing_from_dict("analyze", {
+            "classifier": "_guard_classify",
+            "routes": {"simple": {
+                "model": "m", "description": "설명이 충분히 길다", "timeout": 5,
+            }},
+        })

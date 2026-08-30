@@ -161,18 +161,31 @@ locale_packs:
         # 벤더가 정한 접두사. 정상 문서에 이 모양이 우연히 나올 확률이 사실상 0 이라
         # 체크섬 없이도 오탐이 없다 — 접두사 자체가 체크섬 노릇을 한다.
         #
+        # **접두사 왼쪽에 문자·숫자가 오면 접두사가 아니다.** 이 경계가 없던 동안
+        # task-·kiosk-·risk- 로 시작하는 평범한 하이픈 식별자가 `sk-` 에 걸려
+        # `ta[시크릿]` 처럼 훼손된 채 추론으로 갔다(QA G-MED1) — full 등급의
+        # 오탐은 지우는 오탐이라 다른 등급보다 비싸다. "34건 오탐 0" 은 코퍼스에
+        # 이 부류가 없어서 참으로 보였을 뿐이다. 붙임표·밑줄은 막지 않는다 —
+        # "key-sk-ant-…" 처럼 구분자 뒤의 진짜 키는 잡아야 한다.
+        #
+        # 마지막에서 두 번째는 GitHub fine-grained PAT(`github_pat_…`)이다 —
+        # classic 토큰(`ghp_…`)만 있던 동안 새 형식이 통째로 지나갔다(QA G-LOW2).
+        #
         # 마지막 항목은 **이 제품 자신의 서비스 토큰**이다. 설치처 개발자가 자기
         # 토큰을 프롬프트에 붙여 넣는 일이 실제로 일어나고, 그것이 경계 밖으로
         # 나가면 이 제품의 인증이 통째로 뚫린다.
-        pattern: '(?:(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{12,}|sk-(?:ant-)?[A-Za-z0-9_\-]{24,}|AIza[0-9A-Za-z_\-]{30,}|[rs]k_(?:live|test)_[A-Za-z0-9]{16,}|eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}|lcc_[0-9a-f]{8}_[A-Za-z0-9_\-]{40,})'
+        pattern: '(?<![A-Za-z0-9])(?:(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{12,}|sk-(?:ant-)?[A-Za-z0-9_\-]{24,}|AIza[0-9A-Za-z_\-]{30,}|[rs]k_(?:live|test)_[A-Za-z0-9]{16,}|eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}|github_pat_[A-Za-z0-9_]{30,}|lcc_[0-9a-f]{8}_[A-Za-z0-9_\-]{40,})'
         action: full
         label: "[시크릿]"
         description: "벤더 접두사가 붙은 API 키·토큰"
 
       - id: secret_private_key
         kind: pattern
-        # PEM 개인키 블록의 머리말. 이것이 프롬프트에 있으면 변명의 여지가 없다.
-        pattern: '-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----'
+        # PEM 개인키 **블록 전체**다. 머리말만 잡던 동안 base64 본문 — 실제
+        # 비밀 — 이 그대로 살아 나갔다(QA G-MED2): "탐지됐다" 는 착시만 남고
+        # 지켜지는 것은 없었다. END 가 없는(잘려 붙여 넣은) 블록은 머리말이라도
+        # 잡는다 — 그래서 END 쪽이 선택 그룹이다.
+        pattern: '-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z]+ )?PRIVATE KEY-----)?'
         action: full
         label: "[개인키]"
         description: "PEM 개인키"

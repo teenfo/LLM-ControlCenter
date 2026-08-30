@@ -201,6 +201,16 @@ class StoreError(RuntimeError):
     pass
 
 
+class AlreadyExists(StoreError):
+    """유일성 제약에 걸렸다 — 같은 id 가 이미 있다.
+
+    사전 조회("있는지 보고 없으면 만든다")는 다중 워커에서 진다: 두 요청이 함께
+    조회를 통과하고 늦은 INSERT 가 `IntegrityError` 로 터져 **500 으로 나갔다**
+    (QA M18). 유일성은 DB 가 지키므로, 지는 쪽을 정상 경로(409)로 만드는 것은
+    예외 번역이지 경합 처리 자체가 아니다 — 멱등성 키와 같은 원리다.
+    """
+
+
 class ScopeViolation(StoreError):
     """테넌트 스코프 없이 테넌트 데이터를 만지려 했다. 버그이지 사용자 오류가 아니다."""
 
@@ -619,6 +629,10 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
 #: 컬럼이 생긴 **뒤에** 만들어야 하는 인덱스. `_SCHEMA` 에 두면 옛 DB 에서
 #: 컬럼보다 먼저 실행돼 죽는다 — 스키마는 마이그레이션보다 앞서 돌기 때문이다.
 _POST_MIGRATION_INDEXES: tuple[str, ...] = (
+    # /metrics 스크레이프마다 도는 route_counts 를 덮는다. 부분 인덱스라
+    # 라우팅을 안 쓰는 설치처에서는 크기가 0 에 가깝다(QA V6).
+    "CREATE INDEX IF NOT EXISTS idx_jobs_route ON jobs(role, route) "
+    "WHERE route IS NOT NULL",
     # **멱등성의 강제 지점.** 애플리케이션에서 "먼저 조회하고 없으면 삽입" 하면
     # 두 워커가 동시에 조회를 통과한다 — 다중 워커가 지원 구성이므로 그 창은
     # 실제로 열린다. 유일성은 DB 가 지켜야 프로세스를 넘는다.
@@ -875,14 +889,18 @@ class SqliteStore:
         budget_usd_per_month: float | None = None,
         rate_limit_per_min: int | None = None,
     ) -> str:
-        self._conn.execute(
-            "INSERT INTO tenants(id, name, locale, end_user_salt, dek_wrapped, "
-            "budget_usd_per_month, rate_limit_per_min, created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (
-                tenant_id, name, locale, end_user_salt, dek_wrapped,
-                budget_usd_per_month, rate_limit_per_min, self._now(),
-            ),
-        )
+        try:
+            self._conn.execute(
+                "INSERT INTO tenants(id, name, locale, end_user_salt, dek_wrapped, "
+                "budget_usd_per_month, rate_limit_per_min, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    tenant_id, name, locale, end_user_salt, dek_wrapped,
+                    budget_usd_per_month, rate_limit_per_min, self._now(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # 사전 조회는 다중 워커에서 진다 — 지는 쪽을 409 로 번역한다(QA M18).
+            raise AlreadyExists(f"테넌트 {tenant_id} 는 이미 있다") from exc
         self._conn.commit()
         return tenant_id
 
@@ -904,16 +922,19 @@ class SqliteStore:
         end_user_rate_limit: int | None = None,
     ) -> str:
         self._scoped_where(scope)  # 스코프 검증
-        self._conn.execute(
-            "INSERT INTO services(id, tenant_id, name, allow_roles_json, rate_limit_per_min, "
-            "budget_usd_per_month, require_end_user, end_user_rate_limit, created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                service_id, scope.tenant_id, name, _json(list(allow_roles)),
-                rate_limit_per_min, budget_usd_per_month, int(require_end_user),
-                end_user_rate_limit, self._now(),
-            ),
-        )
+        try:
+            self._conn.execute(
+                "INSERT INTO services(id, tenant_id, name, allow_roles_json, rate_limit_per_min, "
+                "budget_usd_per_month, require_end_user, end_user_rate_limit, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    service_id, scope.tenant_id, name, _json(list(allow_roles)),
+                    rate_limit_per_min, budget_usd_per_month, int(require_end_user),
+                    end_user_rate_limit, self._now(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise AlreadyExists(f"서비스 {service_id} 는 이미 있다") from exc
         self._conn.commit()
         return service_id
 
@@ -1180,16 +1201,20 @@ class SqliteStore:
         **인메모리 카운터를 두지 않는 이유는 슬롯 장부와 같다** — 워커마다 하나씩
         생기고 재기동이면 사라진다. 잡 행이 이미 판정을 들고 있으므로 세기만 하면 된다.
 
-        라우팅을 켠 역할의 `route IS NULL` 이 곧 라우팅 실패다. 둘을 구분하는 컬럼을
-        따로 두지 않은 대가인데, 어느 역할이 라우팅을 켰는지는 설정이 알므로
-        호출자가 그 둘을 가른다.
+        `route` 가 NULL 인 행은 **아예 안 읽는다** — NULL 은 "라우팅이 안 돎"
+        (안 켠 역할, 켜기 전 과거 잡)이라 셀 것이 없고, 실패는 파이프라인이
+        `_failed` 센티널로 남기므로 여기 잡힌다. NULL 을 빼는 것이 성능이기도
+        하다: 라우팅을 안 켠 설치처의 잡 전량이 스캔에서 빠지고, 아래 부분
+        인덱스가 이 질의를 통째로 덮는다 — 이 함수는 /metrics 스크레이프마다
+        불리는데, 전면 스캔 + 임시 B-tree 였다(QA V6).
 
         **테넌트를 가로지른다.** 메트릭에 테넌트 라벨을 안 붙이는 원칙이라 합계만 낸다.
         """
         return [
             (row["role"], row["route"], int(row["n"]))
             for row in self._conn.execute(
-                "SELECT role, route, COUNT(*) AS n FROM jobs GROUP BY role, route"
+                "SELECT role, route, COUNT(*) AS n FROM jobs "
+                "WHERE route IS NOT NULL GROUP BY role, route"
             )
         ]
 
@@ -2185,8 +2210,29 @@ class SqliteStore:
         감사도 같은 커밋 안이다. 회전이 됐는데 기록이 없거나 그 반대면, 유출 대응을
         되짚는 사람이 무엇이 사실인지 판단할 근거를 잃는다. `audit()` 이 자기
         트랜잭션을 커밋하므로 마지막에 두면 래핑 교체와 기록이 함께 나간다.
+
+        **스냅샷 이후에 생긴 DEK 가 있으면 거부한다.** 회전은 DEK 집합을 먼저
+        떠서 다시 감싸는데, 그 사이 살아 있는 워커가 테넌트를 만들면 그 DEK 는
+        옛 키로 감싸인 채 남는다 — 커밋 뒤 파일 교체가 끝나면 그 테넌트만 어느
+        경로로도 못 연다(QA V7). 같은 트랜잭션 안에서 집합을 재확인하면 그 창이
+        닫힌다. 커밋 **후** 파일 교체 전의 창은 트랜잭션으로 닫을 수 없다 —
+        그쪽은 런북의 워커 정지 단계가 맡고, 어긋나면 `doctor` 가
+        "열리지 않는 테넌트" 로 지목한다.
         """
         with self._tx():
+            live = {
+                row["id"]
+                for row in self._conn.execute(
+                    "SELECT id FROM tenants "
+                    "WHERE dek_wrapped IS NOT NULL AND purged_at IS NULL"
+                )
+            }
+            appeared = sorted(live - set(rewrapped))
+            if appeared:
+                raise StoreError(
+                    f"회전 스냅샷 이후 DEK 가 생겼습니다: {', '.join(appeared)} — "
+                    "워커가 아직 돌고 있습니다. 워커를 내리고 다시 회전하세요."
+                )
             for tenant_id, wrapped in rewrapped.items():
                 self._conn.execute(
                     "UPDATE tenants SET dek_wrapped = ? "
@@ -2320,9 +2366,15 @@ class SqliteStore:
                 # 앞 고리는 그대로다 — 이 행의 자리는 안 바뀌고 내용만 바뀐다.
                 chained = merge_into["prev_hash"] or AUDIT_GENESIS
                 with self._tx():
-                    self._conn.execute(
+                    # **아직 팁이고 해시가 그대로일 때만 고친다.** 위 읽기와 이
+                    # UPDATE 사이에 다른 워커가 이 행 뒤에 새 행을 이었으면, 이
+                    # 행을 고치는 순간 그 행의 앞 고리가 끊긴다 — 유일 인덱스는
+                    # INSERT 포크만 막지 이 UPDATE 는 못 막는다(QA V4). 조건을
+                    # 문장 안에 넣으면 SQLite 의 단일 라이터 락 아래에서 원자다.
+                    cursor = self._conn.execute(
                         "UPDATE admin_audit SET ts = ?, detail_json = ?, row_hash = ? "
-                        "WHERE id = ?",
+                        "WHERE id = ? AND row_hash = ? "
+                        "AND NOT EXISTS (SELECT 1 FROM admin_audit WHERE id > ?)",
                         (
                             now, merged_json,
                             audit_row_hash(
@@ -2330,10 +2382,12 @@ class SqliteStore:
                                 action=action, target=target,
                                 detail_json=merged_json, outcome=outcome,
                             ),
-                            merge_into["id"],
+                            merge_into["id"], tip["row_hash"], merge_into["id"],
                         ),
                     )
-                return
+                if cursor.rowcount:
+                    return
+                continue    # 팁이 그 사이 바뀌었다 — 다시 읽고 새 행으로 간다
 
             row_hash = audit_row_hash(
                 prev_hash, ts=now, tenant_id=tenant_id, actor=actor, action=action,
@@ -2341,14 +2395,23 @@ class SqliteStore:
             )
             try:
                 with self._tx():
-                    self._conn.execute(
+                    # **잇는 순간에도 팁이 그대로여야 한다.** 그 사이 합치기가
+                    # 팁의 해시를 바꿨으면 여기서 이은 앞 고리는 어디에도 없는
+                    # 해시다 — 유일 인덱스는 **같은** prev_hash 의 중복만 막고
+                    # 이 경우는 못 막는다(QA V4). INSERT…SELECT 의 WHERE 가
+                    # 같은 문장 안에서 팁을 재확인한다.
+                    cursor = self._conn.execute(
                         "INSERT INTO admin_audit(ts, tenant_id, actor, action, target, "
                         "detail_json, outcome, prev_hash, row_hash) "
-                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        "SELECT ?,?,?,?,?,?,?,?,? "
+                        "WHERE COALESCE((SELECT row_hash FROM admin_audit "
+                        "ORDER BY id DESC LIMIT 1), ?) = ?",
                         (now, tenant_id, actor, action, target, detail_json, outcome,
-                         prev_hash, row_hash),
+                         prev_hash, row_hash, AUDIT_GENESIS, prev_hash),
                     )
-                return
+                if cursor.rowcount:
+                    return
+                continue    # 팁이 그 사이 바뀌었다
             except sqlite3.IntegrityError:
                 # 다른 워커가 같은 팁에 먼저 이었다. 유일 인덱스가 포크를 막아 줬으니
                 # 새 팁을 읽고 그 뒤에 붙는다. **감사 기록을 잃지 않는 것이 우선이다.**

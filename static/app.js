@@ -892,7 +892,10 @@ async function renderJobs() {
           // 라우팅을 안 켠 설치처에서 언제나 비어 있는 열이 하나 는다.
           el('span', {}, [
             j.model || '—',
-            j.route ? el('span', { class: 'hint', text: ' ← ' + j.route }) : null,
+            // 밑줄 시작은 판정 센티널(_failed/_none)이다 — 화면에는 실제 라우트만.
+            // 어느 쪽이든 기본 모델로 갔고, 실패율은 메트릭이 답한다.
+            j.route && !j.route.startsWith('_')
+              ? el('span', { class: 'hint', text: ' ← ' + j.route }) : null,
           ]),
           el('span', { class: 'mono', text: (j.prompt_masked || '').slice(0, 60) }),
           money(j.cost_usd),

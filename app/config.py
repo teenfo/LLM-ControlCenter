@@ -423,6 +423,22 @@ def _routing_from_dict(role_name: str, raw: Any) -> "RoleRouting | None":
 
     routes: dict[str, RouteSpec] = {}
     for key, spec in routes_raw.items():
+        key = str(key)
+        # **파서가 고를 수 있는 키만 받는다.** 판정 파싱은 마지막 줄에서
+        # `[A-Za-z0-9_]+` 토큰을 집으므로(어휘 교집합), 한글·붙임표 키는 설정은
+        # 통과하는데 **영원히 선택 불가**다 — 켰다고 믿는 것이 가장 나쁘다
+        # (QA R-LOW1). `NONE` 은 "해당 없음" 답과, 밑줄 시작은 판정 센티널
+        # (`_failed`·`_none`)과 충돌하므로 예약이다.
+        if not re.fullmatch(r"[A-Za-z0-9_]+", key) or key.startswith("_"):
+            raise ConfigError(
+                f"역할 {role_name}: 라우트 키 {key!r} 는 쓸 수 없다 — 영숫자·밑줄만"
+                " 가능하고(판정 파서가 그 토큰만 집는다) 밑줄 시작은 예약이다"
+            )
+        if key.upper() == "NONE":
+            raise ConfigError(
+                f"역할 {role_name}: 라우트 키 NONE 은 예약이다 — 분류기의 "
+                "'해당 없음' 답과 구분할 수 없다"
+            )
         if not isinstance(spec, Mapping):
             raise ConfigError(f"역할 {role_name}: 라우트 {key} 가 매핑이 아니다")
         present = [k for k in FORBIDDEN_ROUTE_KEYS if k in spec]
@@ -439,7 +455,15 @@ def _routing_from_dict(role_name: str, raw: Any) -> "RoleRouting | None":
                 f"역할 {role_name}: 라우트 {key} 에 description 이 없다 — "
                 "분류기가 무엇을 보고 이 라우트를 고르는지가 그 문장이다"
             )
-        routes[str(key)] = RouteSpec(
+        unknown = set(spec) - {"model", "description", "tier_models"}
+        if unknown:
+            # 모르는 키를 묵살하면 관리자는 `timeout: 5` 가 듣는 줄 안다 —
+            # 노드 등록이 모르는 키를 거부하는 것과 같은 이유다(QA R-LOW2).
+            raise ConfigError(
+                f"역할 {role_name}: 라우트 {key} 의 모르는 키 {sorted(unknown)} — "
+                "라우트가 받는 것은 model·description·tier_models 뿐이다"
+            )
+        routes[key] = RouteSpec(
             model=str(spec["model"]),
             description=str(spec["description"]),
             tier_models=spec.get("tier_models") or {},

@@ -49,6 +49,14 @@ MAX_POLL_INTERVAL = 0.5
 #: 2단 분류를 수행하는 역할. `internal_only` 이므로 경계 밖으로 나갈 수 없다.
 GUARD_ROLE = "_guard_classify"
 
+#: 라우팅 판정의 센티널. **밑줄로 시작하는 라우트 키는 설정 검증이 거부하므로**
+#: 실제 어휘와 충돌할 수 없다. `_routed` 는 모르는 키를 기본 모델로 읽으므로
+#: 실행 의미는 배선 이전과 같다 — 이 값들의 유일한 소비자는 관측이다:
+#: NULL(라우팅 안 돎)과 "판정 실패", "정당한 해당 없음" 을 갈라야
+#: `route_failures` 가 라우팅 켜기 전 과거 잡과 NONE 판정으로 부풀지 않는다.
+ROUTE_FAILED = "_failed"
+ROUTE_NONE = "_none"
+
 #: 소비자에게 보이지 않는 역할의 접두사. 가드 분류처럼 시스템이 자기 자신을 위해
 #: 쓰는 역할이며, 토큰의 `allow_roles` 에 `*` 가 있어도 노출되지 않는다.
 INTERNAL_ROLE_PREFIX = "_"
@@ -213,11 +221,14 @@ class Pipeline:
         if self._router is None:
             self._router = self.make_router()
         try:
-            return await self._router(role, masked_text)
+            decided = await self._router(role, masked_text)
         except Exception:
             # **여기서 예외가 새면 라우팅이 제출을 깨뜨린다.** 라우팅은 최적화지
             # 관문이 아니므로, 무슨 일이 나든 기본 모델로 간다.
-            return None
+            decided = None
+        # 라우팅을 **켰는데** 판정이 없으면 실패다 — NULL 로 두면 "라우팅을 안 켠
+        # 시절의 잡" 과 구분되지 않아 실패율이 과거로 오염된다(QA route_failures).
+        return decided if decided is not None else ROUTE_FAILED
 
     def _record_guard_events(
         self,
@@ -961,7 +972,20 @@ class Pipeline:
             finally:
                 self._cluster.release(chosen)
 
-            return _parse_route(generated.text, routing.routes, canary=canary)
+            decided = _parse_route(generated.text, routing.routes, canary=canary)
+            if decided is not None:
+                return decided
+            # **"해당 없음" 은 실패가 아니라 판정이다.** 형식을 지킨(카나리아가
+            # 있는) NONE 답은 모델이 "어느 라우트도 아니다" 라고 정한 것이고,
+            # 실행 결과는 실패와 같아도(기본 모델) 관측에서는 갈라야 한다 —
+            # 섞으면 실패율이 부풀어 관리자가 멀쩡한 description 을 고치게 된다.
+            lines = [l for l in generated.text.splitlines() if l.strip()]
+            if (
+                canary and f"{CANARY_MARK}{canary}" in generated.text
+                and lines and lines[-1].strip() == "NONE"
+            ):
+                return ROUTE_NONE
+            return None
 
         return route
 

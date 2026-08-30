@@ -255,11 +255,13 @@ def collect(
     if roles is not None:
         routed_roles = {name for name, role in roles.items() if role.routing is not None}
         if routed_roles:
+            from .pipeline import ROUTE_FAILED, ROUTE_NONE
+
             counts = store.route_counts()
             decisions = [
                 ({"role": role, "route": route}, float(n))
                 for role, route, n in sorted(counts, key=lambda row: (row[0], row[1] or ""))
-                if route and role in routed_roles
+                if route and not route.startswith("_") and role in routed_roles
             ]
             if decisions:
                 gauge(
@@ -267,16 +269,26 @@ def collect(
                     "라우트별 배치 건수(전 테넌트 합계)",
                     decisions,
                 )
-            # **라우팅을 켠 역할의 `route` 없음 = 분류가 답을 못 준 것이다.**
-            # 이것이 0 이 아니라고 고장은 아니다 — fail-to-default 라 결과는 정상이고,
-            # 계속 높으면 `description` 을 고치라는 신호다.
+            # **NULL 이 아니라 센티널을 센다.** NULL 로 실패를 세던 동안,
+            # 라우팅을 켜기 전의 과거 잡과 정당한 "해당 없음" 판정이 전부
+            # 실패로 합산돼 켠 직후 실패율이 부풀었다(QA route_failures 왜곡) —
+            # 그 수치를 보고 관리자가 멀쩡한 description 을 고치게 된다.
             gauge(
                 "route_failures",
-                "라우팅을 켠 역할인데 라우트가 안 정해진 건수(기본 모델로 갔다)",
+                "판정이 실패한 건수(기본 모델로 갔다) — 계속 높으면 description 을 고치라는 신호",
                 [
                     ({"role": role}, float(n))
                     for role, route, n in sorted(counts)
-                    if route is None and role in routed_roles
+                    if route == ROUTE_FAILED and role in routed_roles
+                ],
+            )
+            gauge(
+                "route_none",
+                "판정이 '해당 없음'인 건수(기본 모델로 갔다) — 실패가 아니라 판정이다",
+                [
+                    ({"role": role}, float(n))
+                    for role, route, n in sorted(counts)
+                    if route == ROUTE_NONE and role in routed_roles
                 ],
             )
 

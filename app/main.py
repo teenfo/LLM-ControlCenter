@@ -80,7 +80,7 @@ from .pipeline import (
     is_public_role,
 )
 from .scheduler import Scheduler
-from .store import PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
+from .store import AlreadyExists, PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
 
 VERSION = "0.1.0"
 
@@ -849,14 +849,19 @@ async def tenant_services(request: Request) -> Response:
     if ctx.store.get_service(scope, service_id) is not None:
         # PK 충돌이 500 으로 나가면 소비자는 "서버가 고장났다" 로 읽고 재시도한다.
         raise ApiError("already_exists", status=409, params={"id": service_id})
-    ctx.store.create_service(
-        scope, service_id, str(body.get("name") or service_id),
-        allow_roles=allow,
-        rate_limit_per_min=body.get("rate_limit_per_min"),
-        budget_usd_per_month=body.get("budget_usd_per_month"),
-        require_end_user=bool(body.get("require_end_user", False)),
-        end_user_rate_limit=body.get("end_user_rate_limit"),
-    )
+    try:
+        ctx.store.create_service(
+            scope, service_id, str(body.get("name") or service_id),
+            allow_roles=allow,
+            rate_limit_per_min=body.get("rate_limit_per_min"),
+            budget_usd_per_month=body.get("budget_usd_per_month"),
+            require_end_user=bool(body.get("require_end_user", False)),
+            end_user_rate_limit=body.get("end_user_rate_limit"),
+        )
+    except AlreadyExists:
+        # 위 사전 조회는 다중 워커에서 진다 — 두 요청이 함께 조회를 통과하면
+        # 늦은 INSERT 가 여기로 온다. DB 의 판정도 같은 409 다(QA M18).
+        raise ApiError("already_exists", status=409, params={"id": service_id})
     ctx.store.audit(
         principal.token_id, "create_service", tenant_id=scope.tenant_id,
         target=service_id, detail={"allow_roles": allow},
@@ -1384,12 +1389,16 @@ async def platform_tenants(request: Request) -> Response:
 
     if ctx.store.get_tenant(tenant_id) is not None:
         raise ApiError("already_exists", status=409, params={"id": tenant_id})
-    ctx.store.create_tenant(
-        tenant_id, str(body.get("name") or tenant_id), locale=locale,
-        end_user_salt=new_salt(), dek_wrapped=ctx.vault.create_dek(),
-        budget_usd_per_month=body.get("budget_usd_per_month"),
-        rate_limit_per_min=body.get("rate_limit_per_min"),
-    )
+    try:
+        ctx.store.create_tenant(
+            tenant_id, str(body.get("name") or tenant_id), locale=locale,
+            end_user_salt=new_salt(), dek_wrapped=ctx.vault.create_dek(),
+            budget_usd_per_month=body.get("budget_usd_per_month"),
+            rate_limit_per_min=body.get("rate_limit_per_min"),
+        )
+    except AlreadyExists:
+        # 사전 조회를 함께 통과한 두 요청 중 늦은 쪽이다(QA M18).
+        raise ApiError("already_exists", status=409, params={"id": tenant_id})
     ctx.store.audit(
         principal.token_id, "create_tenant", tenant_id=tenant_id,
         detail={"locale": locale, "guard_locale_pack": guard_pack_for(locale)},

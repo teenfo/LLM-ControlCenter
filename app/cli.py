@@ -442,6 +442,11 @@ def cmd_rotate_kek(args: argparse.Namespace) -> int:
             print(f"  키 디렉터리  {keys_dir}")
             print("  저장된 프롬프트·응답 암호문은 재암호화하지 않습니다.")
             print("  옛 키는 지우지 않고 밀어 둡니다 — 서비스 확인 뒤 직접 파기하세요.")
+            # QA V7 — 살아 있는 워커가 회전 중에 DEK 를 만들면 그 테넌트는 옛
+            # 키로 감싸인 채 남는다. 커밋 전 창은 DB 가 거부하지만, 커밋과 파일
+            # 교체 사이의 창은 절차로만 닫힌다.
+            print("  ⚠ 워커를 전부 내린 상태에서 돌리세요 — 회전 중에 생긴 테넌트는")
+            print("    옛 키로 감싸여, 교체 뒤 어느 키로도 열리지 않습니다.")
             if input("진행할까요? [y/N] ").strip().lower() not in ("y", "yes"):
                 print("취소했습니다. 아무것도 바뀌지 않았습니다.")
                 return 1
@@ -511,12 +516,24 @@ def cmd_audit_export(args: argparse.Namespace) -> int:
             for row in rows:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-        store.record_audit_export(tip=rows[-1]["row_hash"], last_id=rows[-1]["id"])
+        # **표식은 얼어붙은 행에 둔다.** 마지막으로 내보낸 행이 아직 살아 있는
+        # 팁이면(대시보드 폴링의 합치기 대상일 수 있다) 정상 운영의 다음 합치기가
+        # 그 해시를 바꾼다 — 표식이 그 행을 가리키면 doctor 가 "체인 재계산" 경보를
+        # 낸다(QA V5). 정상을 사고로 신고하는 검증은 곧 꺼진다. 뒤에 행이 생긴
+        # 행은 다시 안 바뀐다(합치기는 팁에만 성립한다 — `audit()` 의 가드가
+        # 강제한다). 그래서 팁이 아닌 마지막 행을 표식으로 잡고, 그런 행이
+        # 없으면 이전 표식을 유지한다.
+        live_tip = store.audit_chain_tip()
+        frozen = [r for r in rows if r["row_hash"] and r["row_hash"] != live_tip]
+        marker = frozen[-1]["row_hash"] if frozen else previous.get("tip")
+        store.record_audit_export(tip=marker, last_id=rows[-1]["id"])
     finally:
         store.close()
 
     print(f"  {len(rows)}행을 {target} 에 {'썼습니다' if args.full else '이어 붙였습니다'}")
-    print(f"  마지막 id {rows[-1]['id']} · 팁 {rows[-1]['row_hash'][:16]}…")
+    # 체인 도입 이전 행만 있으면 해시가 없다(QA V9) — 그때도 요약은 나가야 한다.
+    tip_hash = rows[-1]["row_hash"]
+    print(f"  마지막 id {rows[-1]['id']} · 팁 {tip_hash[:16] + '…' if tip_hash else '(체인 이전 구간)'}")
     print(
         "\n  이 파일을 **다른 저장소로** 옮기세요. 같은 호스트에 두면 DB 를 고칠 수 있는\n"
         "  사람이 이 파일도 고칠 수 있어서 대조의 의미가 없습니다."

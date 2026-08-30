@@ -1330,3 +1330,24 @@ def test_the_contract_limit_is_separate_from_the_submit_limit(harness, client):
         headers=auth(tokens["service"]),
     )
     assert response.status_code == 200
+
+
+# ── QA M18 잔여 — 동시 중복 생성이 500 이었다 ───────────────────────────────
+
+
+def test_a_lost_creation_race_is_409_not_500(harness, client):
+    """사전 조회("있는지 보고 만든다")는 다중 워커에서 진다 — 두 요청이 함께
+    조회를 통과하면 늦은 INSERT 가 `IntegrityError` 로 터져 500 으로 나갔다.
+    경합 자체는 재현하지 않는다: 그 창을 지나온 상태(조회는 비었는데 INSERT 가
+    지는)를 스토어 수준에서 만들고, DB 의 판정이 409 로 번역되는지 본다.
+    """
+    import pytest
+
+    from app.store import AlreadyExists
+
+    seed_tenant(harness, "acme")
+
+    with pytest.raises(AlreadyExists):
+        harness.store.create_tenant("acme", "다시", end_user_salt=b"s")
+    with pytest.raises(AlreadyExists):
+        harness.store.create_service(TenantScope("acme"), "acme-web", "다시")

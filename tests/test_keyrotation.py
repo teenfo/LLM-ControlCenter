@@ -607,3 +607,35 @@ def test_doctor_recovery_instruction_actually_recovers(crashed_between_renames, 
     assert "마스터 KEK 있음" in output
     assert "중단된 KEK 회전" not in output
     assert "열리지 않는 테넌트" not in output
+
+
+# ── QA V7 — 회전 중 워커가 만든 DEK ─────────────────────────────────────────
+
+
+def test_a_dek_created_after_the_snapshot_refuses_the_rotation(store, keys_dir, kek):
+    """**스냅샷 이후에 생긴 DEK 가 있으면 커밋을 거부한다.**
+
+    살아 있는 워커가 회전 중에 테넌트를 만들면 그 DEK 는 옛 키로 감싸인 채
+    남고, 파일 교체 뒤 그 테넌트만 어느 키로도 못 연다. 트랜잭션 안의 집합
+    재확인이 커밋 전 창을 닫는다 — 커밋 후 창은 런북의 워커 정지 단계 몫이다.
+    """
+    from app.store import StoreError
+
+    real_replace = store.replace_wrapped_deks
+
+    def worker_interferes(rewrapped, *, actor):
+        # 재래핑과 커밋 사이 — 워커가 테넌트를 만든다.
+        store.create_tenant(
+            "newcomer", "새 테넌트", end_user_salt="s",
+            dek_wrapped=vault_for(kek).create_dek(),
+        )
+        return real_replace(rewrapped, actor=actor)
+
+    store.replace_wrapped_deks = worker_interferes
+    with pytest.raises(StoreError, match="워커"):
+        rotate_master_kek(store, keys_dir=keys_dir, old_vault=vault_for(kek))
+
+    # 아무것도 안 바뀌었다 — 옛 키가 전부를 연다. 다시 회전하면 된다.
+    store.replace_wrapped_deks = real_replace
+    recovered = vault_for(kek)
+    assert all(recovered.can_open(w) for w in store.wrapped_deks().values())

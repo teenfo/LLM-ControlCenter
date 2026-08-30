@@ -850,6 +850,12 @@ def _coalesce(
                 # 더 강한 등급이 이긴다. 라벨과 keep_tail 도 그 등급을 따라간다 —
                 # `full` 이 이겼는데 `partial` 의 keep_tail 이 남으면 뒷자리가 샌다.
                 group[2], group[3], group[4] = action, label, keep_tail
+            elif ACTION_STRENGTH.get(action, 0) == ACTION_STRENGTH.get(group[2], 0):
+                # **동강도에서는 덜 남기는 쪽이 이긴다.** 시작이 빠른 규칙의
+                # keep_tail 이 병합 스팬 전체에 적용되던 동안, keep_tail=2 규칙의
+                # 값 뒷자리가 겹친 keep_tail=8 규칙의 폭만큼 노출됐다(QA G-MED3) —
+                # "더 강한 등급이 이긴다" 는 보증이 동강도에서는 비어 있었다.
+                group[4] = min(group[4], keep_tail)
         else:
             merged.append([start, end, action, label, keep_tail])
 
