@@ -33,6 +33,14 @@ settings:
 # 로케일 팩 — i18n 의 진짜 영향은 번역이 아니라 이것이다.
 # 개인정보의 "형태" 자체가 나라마다 다르므로, 팩을 안 켜면 그 나라 PII 는 안 잡힌다.
 # 안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.
+#
+# **숫자형 규칙의 경계는 `\b` 가 아니라 `(?<![A-Za-z0-9_-])…(?![A-Za-z0-9_-])` 다.**
+# 유니코드 모드에서 한글·가나·한자도 단어 문자라, `\b` 는 숫자 뒤에 조사가 바로
+# 붙는 **가장 자연스러운 한국어 표기**에서 성립하지 않는다 — "900101-1234568입니다"
+# 가 마스킹 없이 통과했다(QA G-HIGH). 정답셋이 전부 조사 앞에 공백을 넣은 표본이라
+# 이 미탐이 커버리지 장치에도 안 걸렸다. ASCII 문자·숫자·붙임표만 경계 위반으로
+# 보면: 조사·구두점·공백은 경계가 되고, "v2-4111…" 같은 식별자 문맥은 `\b` 때와
+# 같이 안 잡히며, 더 긴 숫자열의 조각을 잡는 일도 없다.
 locale_packs:
 
   common:
@@ -40,7 +48,7 @@ locale_packs:
     rules:
       - id: credit_card
         kind: pattern
-        pattern: '\b(?:\d[ -]?){12,18}\d\b'
+        pattern: '(?<![A-Za-z0-9_-])(?:\d[ -]?){12,18}\d(?![A-Za-z0-9_-])'
         checksum: luhn               # 체크섬이 없으면 숫자 나열이 전부 카드가 된다
         action: full
         label: "[카드번호]"
@@ -55,7 +63,7 @@ locale_packs:
         kind: pattern
         # IBAN 은 관례상 4자리씩 띄어 쓴다. 붙여쓴 형태만 잡으면 실제 문서의 대부분을
         # 놓친다 — 구분자를 허용하고 체크섬이 비영숫자를 걷어낸다.
-        pattern: '\b[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]){11,30}\b'
+        pattern: '(?<![A-Za-z0-9_-])[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]){11,30}(?![A-Za-z0-9_-])'
         checksum: iban_mod97
         action: full
         label: "[계좌번호]"
@@ -195,7 +203,7 @@ locale_packs:
         kind: pattern
         # 7번째 자리: 1-4 내국인, 5-8 외국인등록번호. 1-4 만 보면 외국인등록번호가
         # 통째로 빠진다 — 그것도 이 나라에서 개인을 특정하는 번호다.
-        pattern: '\b\d{6}[-\s]?[1-8]\d{6}\b'
+        pattern: '(?<![A-Za-z0-9_-])\d{6}[-\s]?[1-8]\d{6}(?![A-Za-z0-9_-])'
         checksum: kr_rrn             # 체크섬 없이는 13자리 숫자가 전부 걸린다
         # **2020-10 부여체계 개편으로 뒷자리가 임의번호가 됐다.**
         # 그 이후 발급·재발급된 번호는 검증식이 성립하지 않아 약 90% 가
@@ -212,21 +220,21 @@ locale_packs:
 
       - id: kr_biz_no
         kind: pattern
-        pattern: '\b\d{3}-?\d{2}-?\d{5}\b'
+        pattern: '(?<![A-Za-z0-9_-])\d{3}-?\d{2}-?\d{5}(?![A-Za-z0-9_-])'
         checksum: kr_biz
         action: full
         label: "[사업자등록번호]"
 
       - id: kr_phone
         kind: pattern
-        pattern: '\b01[016789][-\s]?\d{3,4}[-\s]?\d{4}\b'
+        pattern: '(?<![A-Za-z0-9_-])01[016789][-\s]?\d{3,4}[-\s]?\d{4}(?![A-Za-z0-9_-])'
         action: partial
         keep_tail: 4
         label: "[휴대폰]"
 
       - id: kr_passport
         kind: pattern
-        pattern: '\b[MSRO]\d{8}\b'
+        pattern: '(?<![A-Za-z0-9_-])[MSRO]\d{8}(?![A-Za-z0-9_-])'
         action: audit
         label: "[여권번호]"
 
@@ -234,19 +242,19 @@ locale_packs:
     rules:
       - id: us_ssn
         kind: pattern
-        pattern: '\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b'
+        pattern: '(?<![A-Za-z0-9_-])(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?![A-Za-z0-9_-])'
         action: full
         label: "[SSN]"
 
       - id: us_ein
         kind: pattern
-        pattern: '\b\d{2}-\d{7}\b'
+        pattern: '(?<![A-Za-z0-9_-])\d{2}-\d{7}(?![A-Za-z0-9_-])'
         action: audit
         label: "[EIN]"
 
       - id: us_phone
         kind: pattern
-        pattern: '\b(?:\+1[-\s]?)?\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4}\b'
+        pattern: '(?<![A-Za-z0-9_-])(?:\+1[-\s]?)?\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4}(?![A-Za-z0-9_-])'
         action: partial
         keep_tail: 4
         label: "[PHONE]"
@@ -255,14 +263,14 @@ locale_packs:
     rules:
       - id: jp_mynumber
         kind: pattern
-        pattern: '\b\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
+        pattern: '(?<![A-Za-z0-9_-])\d{4}[-\s]?\d{4}[-\s]?\d{4}(?![A-Za-z0-9_-])'
         checksum: jp_mynumber
         action: full
         label: "[マイナンバー]"
 
       - id: jp_phone
         kind: pattern
-        pattern: '\b0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}\b'
+        pattern: '(?<![A-Za-z0-9_-])0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}(?![A-Za-z0-9_-])'
         action: partial
         keep_tail: 4
         label: "[電話番号]"

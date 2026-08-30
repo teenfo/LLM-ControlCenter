@@ -886,3 +886,56 @@ def test_an_empty_prompt_survives_normalization():
     from app.guard import normalize_for_match
 
     assert normalize_for_match("") == ("", None)
+
+
+# ── QA G-HIGH — 조사 밀착 표기에서 PII 가 통과했다 ──────────────────────────
+#
+# 유니코드 모드에서 한글도 단어 문자라 `\b` 는 "…-1234568입니다" 에서 성립하지
+# 않는다. 숫자 뒤에 조사가 바로 붙는 것이 **가장 자연스러운 한국어 표기**이고,
+# 정답셋이 전부 조사 앞에 공백을 넣은 표본이라 이 미탐이 안 걸렸다 — 코퍼스
+# 편향이 결함을 가린 사례다. 여기서는 번들 설정 그대로, 탐지가 아니라
+# **밖으로 나가는 텍스트**를 본다.
+
+
+@pytest.mark.parametrize(
+    "text, secret, locale",
+    [
+        ("제 주민번호는 900101-1234568입니다.", "900101-1234568", "ko_KR"),
+        ("전화번호 010-1234-5678로 연락주세요", "010-1234-567", "ko_KR"),  # keep_tail=4 는 남는다
+        ("카드번호 4111-1111-1111-1111입니다", "4111-1111-1111-1111", "ko_KR"),
+        ("사업자번호 123-45-67891입니다", "123-45-67891", "ko_KR"),
+        ("マイナンバーは1234-5678-9018です", "1234-5678-9018", "ja_JP"),
+    ],
+    ids=["주민번호", "휴대폰", "카드", "사업자", "마이넘버"],
+)
+async def test_particle_attached_pii_is_masked_with_the_shipped_rules(text, secret, locale):
+    """로케일을 하나만 켠다 — 팩을 겹쳐 켜면 다른 팩의 규칙이 우연히 짧은 구간을
+    잡아(옛 `\b` 도 붙임표 앞에서는 성립한다) 이 미탐을 가릴 수 있다. 실제로
+    ja 팩의 부분 매칭이 카드·휴대폰 유출을 가리는 것을 확인했다."""
+    from app.config import load_config
+    from app.guard import Guard
+
+    guard = Guard(load_config(REPO_CONFIG))
+    verdict = await guard.inspect(
+        text, candidate_boundaries=("internal", "external"), locales=(locale,),
+    )
+
+    for boundary, masked in verdict.prompts.items():
+        assert secret not in masked, (
+            f"{boundary} 로 나가는 텍스트에 원문이 남았다: {masked!r}"
+        )
+
+
+async def test_ascii_identifier_context_is_still_not_matched():
+    """경계 클래스가 지키는 다른 절반 — `\\b` 시절에 안 잡히던 식별자 문맥은
+    여전히 안 잡는다. 조사를 고치느라 여기가 새 오탐이 되면 안 된다."""
+    from app.config import load_config
+    from app.guard import Guard
+
+    guard = Guard(load_config(REPO_CONFIG))
+    text = "빌드 태그 v2-4111-1111-1111-1111x 로 배포합니다"
+    verdict = await guard.inspect(
+        text, candidate_boundaries=("internal", "external"), locales=("ko_KR",)
+    )
+
+    assert verdict.prompts["external"] == text, "식별자 문맥이 오탐으로 훼손됐다"
