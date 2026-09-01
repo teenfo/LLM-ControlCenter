@@ -1,6 +1,7 @@
 # 아키텍처 결정
 
-이 문서는 **무엇을 만드는가**와 **왜 그렇게 만들었는가**를 정한다.
+이 문서는 **왜 그렇게 만들었는가**를 정한다. **무엇이 되는가**는
+[`feature-spec.md`](feature-spec.md) 가 기능 단위로 적는다 — 표면·구현 위치·계약·고정 테스트까지.
 설계의 출발점이 된 이전 시스템(`hosub-mcp` 의 `llm-gateway`) 정리는
 [`reference/llm-platform-overview.md`](reference/llm-platform-overview.md) 에 있고,
 아래의 모든 "§n" 은 그 문서의 절 번호다.

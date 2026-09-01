@@ -222,7 +222,8 @@ LCC_AIRGAP=1 docker compose up -d
 
 | 문서 | 내용 |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | 모듈 구성과 요청 흐름 — **현재 동작의 설명서** |
+| [docs/feature-spec.md](docs/feature-spec.md) | **지금 구현된 기능 명세** — 기능마다 표면·구현 위치·계약·고정 테스트·상태 |
+| [docs/architecture.md](docs/architecture.md) | 모듈 구성과 요청 흐름 — **왜 그렇게 만들었는가** |
 | [docs/design-decisions.md](docs/design-decisions.md) | 설계 감사 항목의 **판정** — 채택·보류·기각과 해제 조건 |
 | [docs/qa-audit-response.md](docs/qa-audit-response.md) | QA 감사(25건) **개선 결과 회신** — 항목별 조치·커밋·재발 방지 장치 |
 | [docs/plan.md](docs/plan.md) | 착수 시점의 계획서 + **구현하면서 달라진 것** |
