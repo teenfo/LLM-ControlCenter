@@ -373,6 +373,88 @@ GET /v1/meta   (플러그인 토큰)
 
 ---
 
+## 5-c. 실제 서버의 어디에 놓이나
+
+배포 형태마다 다르다. 이 저장소는 **이 차이로 이미 한 번 깨진 적이 있다** —
+`cli_paths.py` 독스트링에 그 기록이 있다("`pip install .` 로 설치한 것은 기동조차 못 했다").
+
+### 형태별 경로 (실측)
+
+| 배포 형태 | 플러그인 경로 | 근거 |
+|---|---|---|
+| **Docker / compose** (문서화된 운영 형태) | 컨테이너 `/data/plugins/<id>/<version>/` | `Dockerfile`: `ENV LCC_DATA_DIR=/data` · `VOLUME ["/data","/keys"]` |
+| 저장소 체크아웃 (개발) | `<repo>/data/plugins/...` | `DEFAULT_DATA_DIR = ROOT/"data"`, `ROOT` = 저장소 루트 |
+| `pip install` + systemd | `$LCC_DATA_DIR/plugins/...` — **반드시 지정해야 한다** | 미지정 시 `<site-packages>/data` 로 떨어진다 |
+
+호스트에서 본 도커 경로는 **네임드 볼륨**이다. `compose.yml` 의 `name: llm-controlcenter` +
+`volumes: lcc-data` 이므로:
+
+```
+/var/lib/docker/volumes/llm-controlcenter_lcc-data/_data/plugins/<id>/<version>/
+```
+
+컨테이너는 uid 10001 (`llmcc`) 로 돈다. `Dockerfile` 이 `/data` 를 그 uid 로 chown 하므로
+하위 디렉터리는 그냥 만들면 된다.
+
+> **휠 설치 형태의 기본값은 잘못됐다.** `LCC_DATA_DIR` 을 안 주면 데이터가
+> `<site-packages>/data` 로 간다 — 흔히 root 소유이고, 업그레이드하면 날아간다.
+> `deployment.md` 는 도커 형태만 다루므로 이 값이 문서에 없다. 플러그인과 무관하게
+> 짚어 둘 것이고, 플러그인이 들어오면 **파일이 사라지는 방식으로** 문제가 커진다.
+
+### 놓을 수 없는 곳들 — 이유가 각각 다르다
+
+| 후보 | 왜 안 되나 |
+|---|---|
+| `/app/config/` | compose 가 **읽기 전용**으로 마운트한다 (`./config:/app/config:ro`) |
+| `/app/app/` (패키지 옆) | 이미지 레이어다. 컨테이너를 다시 만들면 사라진다 |
+| `/keys/` | KEK 전용이고 **백업 볼륨과 일부러 분리된 곳**이다. 플러그인을 거기 두면 그 분리의 의미가 없어진다 |
+| `<site-packages>/` | 업그레이드가 곧 삭제다 |
+
+### 디렉터리는 하나로 부족하다 — 셋으로 나눈다
+
+```
+/data/plugins/<id>/<version>/     ① 설치본 — 컨트롤 플레인만 쓴다
+/data/plugins/_bundles/<id>-<version>.lccp
+                                  ② 원본 번들 보관 — 복원·재설치·해시 대조용
+/plugins-inbox/                   ③ 반입함 — 운영자가 파일을 떨구는 곳 (bind, ro)
+```
+
+**③ 을 ① 과 분리하는 이유.** 네임드 볼륨은 호스트에서 파일을 떨구기 불편하다. 에어갭에서
+"파일 복사로 설치"(§5-b 세 번째 경로)를 쓰려면 bind 마운트가 필요한데, **설치본 디렉터리
+자체를 bind 로 열면 안 된다** — 운영자가 푼 내용을 직접 고칠 수 있게 되고 그러면
+`bundle_sha256` 대조가 상시 실패한다. 반입함은 읽기 전용으로 붙이고, 거기 있는 번들은
+**같은 설치 함수를 지나** ① 로 들어간다.
+
+```yaml
+# compose.yml 에 더할 것
+volumes:
+  - lcc-data:/data
+  - ./plugins-inbox:/plugins-inbox:ro     # 운영자가 .lccp 를 여기 떨군다
+```
+
+### 백업이 플러그인을 안 담는다 — 실측
+
+`app/backup.py:snapshot()` 은 `sqlite3.backup` 으로 **DB 만** 뜬다. 디스크의 플러그인
+payload 는 백업에 없다. 그대로 두면 복원 후 이렇게 된다.
+
+> `plugins` 행은 살아났는데 `/data/plugins/<id>/<version>/` 에 파일이 없다.
+
+이건 DATA-6 이 지키는 원칙("백업에 암호문·KEK 미포함")과 충돌하지 않는다 — 플러그인 번들은
+비밀이 아니다. 선택지는 셋이고 결정이 필요하다(§8).
+
+| 안 | 대가 |
+|---|---|
+| (a) 백업에 payload 를 포함 | 백업이 커진다. DB 스냅샷 하나라는 단순함이 깨진다 |
+| (b) 복원 후 재설치 · `doctor` 가 짚어 준다 | 복원이 한 단계 늘어난다 |
+| (c) 원본 번들(②)만 따로 보관하고 복원 절차가 그것으로 되푼다 | ② 를 유지해야 한다 |
+
+**(b)+(c) 가 이 제품 결에 맞다.** `bundle_sha256` 이 이미 대조 수단이므로 `doctor` 가
+"행은 있는데 파일이 없다 / 해시가 다르다" 를 사람 말로 짚고, ② 에서 되푸는 것을 안내한다.
+`doctor` 가 복구 지시를 하고 그 지시가 실제로 복구시키는 것은 이 저장소의 확립된 패턴이다
+(`test_doctor_recovery_instruction_actually_recovers`).
+
+---
+
 ## 6. active / inactive 의 두 층
 
 앞문 모델에서 토글은 **두 개의 서로 다른 것**을 뜻하고, 둘 다 필요하다.
@@ -426,6 +508,7 @@ GET /v1/meta   (플러그인 토큰)
 | 7 | 플러그인이 자기 DB 테이블을 갖나 | **못 갖는다.** 가지면 백업·파기·내보내기가 플러그인을 알아야 한다 |
 | 8 | 패널에 임의 JS 를 허용할까 | 1단계 **선언형만** |
 | 9 | 플러그인이 관리 API(`/v1/admin/*`)를 쓸 수 있나 | **1단계는 못 쓴다.** 쓰게 하려면 토큰이 관리자 등급이어야 하는데 그건 등급이 다른 이야기다 |
+| 10 | 플러그인 payload 를 백업에 담나 | **안 담는다.** 원본 번들을 보관하고 `doctor` 가 되푸는 것을 안내 (§5-c) |
 
 ---
 
