@@ -154,6 +154,18 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "platform_guard_baseline": ("베이스라인 가드 규칙과 로케일 팩 현황.", "platform_admin", False),
     "platform_grace_mode": ("가드 유예 모드 해제·재설정. 끄는 것이 정상 상태다.", "platform_admin", False),
     "platform_evals": ("가드 회귀 평가 실행·이력.", "platform_admin", False),
+    "platform_plugins": (
+        "플러그인 목록·설치. 설치는 서비스 생성 + 토큰 발급이고, **켜지지는 않는다.**",
+        "platform_admin", False,
+    ),
+    "platform_plugin_activate": (
+        "플러그인 활성·비활성. 실체는 그 플러그인이 쓰는 서비스의 `status` 다.",
+        "platform_admin", False,
+    ),
+    "platform_plugin_delete": (
+        "플러그인 제거. **서비스 행은 남긴다** — 사용량·감사가 이름을 잃지 않게.",
+        "platform_admin", False,
+    ),
     "platform_diagnostics": ("진단 번들 — 비밀은 마스킹, 프롬프트 본문은 미포함.", "platform_admin", False),
     "platform_notifications": ("알림 채널 현황과 테스트 발송.", "platform_admin", False),
     "metrics": ("Prometheus/OpenMetrics 노출. 테넌트 이름은 라벨에 없다.", "platform_admin", False),

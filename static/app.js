@@ -140,7 +140,12 @@ async function api(path, options) {
   const opts = Object.assign({ headers: {} }, options || {});
   opts.headers = Object.assign(
     { Authorization: 'Bearer ' + state.token }, opts.headers);
-  if (opts.body !== undefined && typeof opts.body !== 'string') {
+  const binary = opts.body instanceof ArrayBuffer || ArrayBuffer.isView(opts.body);
+  if (binary) {
+    // 플러그인 번들은 raw body 로 올린다 — 멀티파트를 받으려면 서버에
+    // `python-multipart` 가 필요하고 그건 6번째 의존성이다.
+    opts.headers['Content-Type'] = 'application/octet-stream';
+  } else if (opts.body !== undefined && typeof opts.body !== 'string') {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(opts.body);
   }
@@ -210,6 +215,7 @@ function tabsFor(session) {
       { id: 'models', label: t('ui.models'), render: renderModels },
       { id: 'baseline', label: t('ui.baseline'), render: renderBaseline },
       { id: 'notify', label: t('ui.notifications'), render: renderNotifications },
+      { id: 'plugins', label: t('ui.plugins'), render: renderPlugins },
     );
   }
   if (session.is_tenant_admin) {
@@ -657,6 +663,73 @@ async function renderNotifications() {
         [when(n.ts), n.event, JSON.stringify(n.detail)]))),
   ];
 }
+
+/** 플러그인 — 설치·활성·제거.
+ *
+ * 활성 여부는 서버가 그 플러그인의 **서비스 status 에서 파생해서** 준다. 화면이
+ * 자체 상태를 들고 있지 않으므로 여기서 표시와 실제가 갈릴 수 없다.
+ */
+async function renderPlugins() {
+  const data = await api('/v1/platform/plugins');
+  renderBanners(data.trusted_keys ? [] : [[t('ui.plugin_no_trust_key'), 'bad']]);
+
+  const picker = el('input', { type: 'file', accept: '.lccp,.zip' });
+  const install = el('button', {
+    text: t('ui.plugin_install'),
+    onclick: async () => {
+      const file = picker.files && picker.files[0];
+      if (!file) return;
+      try {
+        const created = await api('/v1/platform/plugins', {
+          method: 'POST', body: await file.arrayBuffer(),
+        });
+        // 토큰 원값은 이 응답이 마지막이다. 갱신으로 지워지기 전에 띄운다.
+        window.alert(
+          t('ui.plugin_installed_inactive') + '\n\n'
+          + t('ui.plugin_token_once') + '\n' + created.token);
+        refresh();
+      } catch (err) { showError(err); }
+    },
+  });
+
+  const rows = (data.plugins || []).map((p) => [
+    p.name + ' ' + p.version,
+    p.signature,
+    p.active ? t('ui.plugin_active') : t('ui.plugin_inactive'),
+    (p.allow_roles || []).join(', '),
+    p.files_present ? '' : t('ui.plugin_missing_files'),
+    el('div', { class: 'row' }, [
+      el('button', {
+        text: p.active ? t('ui.plugin_deactivate') : t('ui.plugin_activate'),
+        onclick: async () => {
+          try {
+            await api('/v1/platform/plugins/' + encodeURIComponent(p.id) + '/activate',
+              { method: 'POST', body: { active: !p.active } });
+            refresh();
+          } catch (err) { showError(err); }
+        },
+      }),
+      el('button', {
+        text: t('ui.plugin_remove'),
+        onclick: async () => {
+          if (!window.confirm(p.id)) return;
+          try {
+            await api('/v1/platform/plugins/' + encodeURIComponent(p.id), { method: 'DELETE' });
+            refresh();
+          } catch (err) { showError(err); }
+        },
+      }),
+    ]),
+  ]);
+
+  return [
+    card(t('ui.plugin_install'), [el('div', { class: 'row' }, [picker, install])]),
+    card(t('ui.plugins'), rows.length
+      ? [table([t('ui.plugin'), t('ui.plugin_signature'), '', '', '', ''], rows)]
+      : [el('p', { class: 'muted', text: t('ui.plugin_none') })]),
+  ];
+}
+
 
 /** 진단 번들 등을 파일로. 서버가 이미 비밀을 마스킹해서 준다. */
 async function downloadJson(path, filename) {

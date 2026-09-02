@@ -63,11 +63,20 @@ DEFAULT_KEYS_DIR = Path(os.environ.get("LCC_KEYS_DIR", ROOT / "keys"))
 class Assembly:
     """조립된 부품 한 벌. `build_app` 에 그대로 넘긴다."""
 
-    def __init__(self, config: Config, store: SqliteStore, vault: KeyVault, *, airgap: bool):
+    def __init__(
+        self, config: Config, store: SqliteStore, vault: KeyVault, *, airgap: bool,
+        data_dir: Path | None = None, keys_dir: Path | None = None,
+    ):
         self.config = config
         self.store = store
         self.vault = vault
         self.airgap = airgap
+        # **플러그인 경로는 여기서 정해져야 한다.** 기본값에 맡기면 cwd 상대 경로가
+        # 되고, 도커에서는 WORKDIR(`/app`)에 써서 설치본이 이미지 레이어로 들어간다
+        # — 컨테이너를 다시 만들면 조용히 사라진다.
+        self.data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
+        # 신뢰 키는 **키 볼륨**에 둔다. 백업 대상 볼륨과 일부러 분리된 곳이다.
+        self.keys_dir = Path(keys_dir) if keys_dir else DEFAULT_KEYS_DIR
 
         self.translator = Translator.from_dir(bundled("locales"))
         self.accountant = CostAccountant(config.pricing, store)
@@ -112,6 +121,7 @@ class Assembly:
             vault=self.vault, evaluator=self.evaluator, registrar=self.registrar,
             accountant=self.accountant, notifier=self.notifier, airgap=self.airgap,
             version=version, start_scheduler=start_scheduler,
+            data_dir=self.data_dir, plugin_trust_dir=self.keys_dir / "plugin-trust",
         )
 
 
@@ -138,7 +148,10 @@ def assemble(
     vault = KeyVault(load_master_key_from(keys_dir))
 
     result = bootstrap(store, vault, master_key=master_key, master_key_path=key_path)
-    return Assembly(config, store, vault, airgap=airgap), result
+    assembly = Assembly(
+        config, store, vault, airgap=airgap, data_dir=data_dir, keys_dir=keys_dir,
+    )
+    return assembly, result
 
 
 # ── 명령 ────────────────────────────────────────────────────────────────────
@@ -350,7 +363,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "원문을 보관하지 않습니다. 필요하면 마스터 KEK 를 설정하세요."
         )
 
-    assembly = Assembly(config, store, vault, airgap=_airgap_from_env())
+    assembly = Assembly(
+        config, store, vault, airgap=_airgap_from_env(),
+        data_dir=data_dir, keys_dir=keys_dir,
+    )
     if args.probe:
         import asyncio
 

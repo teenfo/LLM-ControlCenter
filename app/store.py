@@ -100,6 +100,9 @@ JOB_STATUSES = (
 
 TERMINAL_STATUSES = frozenset({"ok", "failed", "cancelled", "blocked", "needs_review"})
 
+#: 서비스 상태. `active` 가 아니면 `pipeline` 이 제출을 거부한다.
+SERVICE_STATUSES = ("active", "inactive")
+
 #: 보존 정리가 지우는 상태. `TERMINAL_STATUSES` 에서 파생시켜 **목록을 두 벌 두지
 #: 않는다** — 하드코딩된 목록에 `needs_review` 가 빠져 그 잡들이 영원히 쌓이고 있었다.
 RETAINABLE_STATUSES = TERMINAL_STATUSES
@@ -275,6 +278,30 @@ CREATE TABLE IF NOT EXISTS services (
     created_at           REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_services_tenant ON services(tenant_id);
+
+-- 설치된 플러그인. **`nodes` 와 같은 성격이다** — 파일이 아니라 이 표가 권위이고,
+-- 디스크의 payload 는 이 행이 가리키는 것일 뿐이다.
+--
+-- **`active` 컬럼을 두지 않는다.** 플러그인의 활성 여부는 그 플러그인이 쓰는
+-- `services.status` 다. 토글을 여기 따로 두면 강제 지점이 둘이 되고, 둘은 반드시
+-- 어긋난다 — 그때 "껐는데 왜 도느냐" 가 된다. 강제는 `pipeline` 의 제출 경로
+-- 한 곳에서만 일어나야 한다.
+CREATE TABLE IF NOT EXISTS plugins (
+    id              TEXT PRIMARY KEY,
+    version         TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    kind            TEXT NOT NULL,          -- external (지금은 이것뿐)
+    tenant_id       TEXT NOT NULL,          -- 플러그인의 서비스가 사는 테넌트
+    service_id      TEXT NOT NULL,          -- 이 플러그인이 앞문을 지날 때 쓰는 신원
+    endpoint        TEXT,                   -- external: 운영자가 띄운 곳. 표시용
+    manifest_json   TEXT NOT NULL,          -- 검증을 통과한 매니페스트 원본
+    bundle_sha256   TEXT NOT NULL,          -- 업로드된 번들 바이트의 해시
+    signature_state TEXT NOT NULL,          -- signed | unsigned | invalid
+    last_error      TEXT,
+    installed_by    TEXT,
+    installed_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plugins_service ON plugins(tenant_id, service_id);
 
 CREATE TABLE IF NOT EXISTS tokens (
     id           TEXT PRIMARY KEY,
@@ -942,6 +969,27 @@ class SqliteStore:
         where, params = self._scoped_where(scope, "id = ?")
         params.append(service_id)
         return self._conn.execute(f"SELECT * FROM services WHERE {where}", params).fetchone()
+
+    def set_service_status(self, scope: TenantScope, service_id: str, status: str) -> bool:
+        """서비스를 켜고 끈다. **이것이 플러그인 토글의 실체다.**
+
+        `services.status` 는 스키마에도 있고 `pipeline` 의 제출 경로에서 강제되고도
+        있었는데(`status != "active"` → 401), **바꾸는 경로가 없었다.** 생성 시점에
+        박히고 그 뒤로 아무도 못 건드리는 잠긴 스위치였다.
+
+        새 강제 지점을 만들지 않는 것이 요점이다 — 플러그인을 끈다는 것은 그
+        플러그인의 서비스를 끄는 것이고, 그 판정은 이미 있는 초크포인트 한 곳에서만
+        일어난다.
+        """
+        if status not in SERVICE_STATUSES:
+            raise ValueError(f"알 수 없는 서비스 상태: {status}")
+        where, params = self._scoped_where(scope, "id = ?")
+        params.append(service_id)
+        with self._tx():
+            cursor = self._conn.execute(
+                f"UPDATE services SET status = ? WHERE {where}", [status, *params]
+            )
+        return cursor.rowcount > 0
 
     def list_services(self, scope: TenantScope) -> list[sqlite3.Row]:
         where, params = self._scoped_where(scope)
@@ -2092,6 +2140,48 @@ class SqliteStore:
 
     def delete_node(self, name: str) -> bool:
         cur = self._conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # -- 플러그인 -------------------------------------------------------------
+    #
+    # `nodes` 와 같은 모델이다. **이 표가 권위이고 디스크는 payload 다.** 스캔을
+    # 권위로 삼으면 파일 하나가 지워졌을 때 플러그인이 조용히 사라진다.
+
+    def save_plugin(self, row: Mapping[str, Any]) -> None:
+        """설치된 플러그인을 기록한다. 같은 id 의 재설치는 덮어쓴다(업그레이드)."""
+        self._conn.execute(
+            "INSERT INTO plugins(id, version, name, kind, tenant_id, service_id, endpoint, "
+            "manifest_json, bundle_sha256, signature_state, last_error, installed_by, installed_at) "
+            "VALUES(:id, :version, :name, :kind, :tenant_id, :service_id, :endpoint, "
+            ":manifest_json, :bundle_sha256, :signature_state, :last_error, :installed_by, :installed_at) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "version=excluded.version, name=excluded.name, kind=excluded.kind, "
+            "endpoint=excluded.endpoint, manifest_json=excluded.manifest_json, "
+            "bundle_sha256=excluded.bundle_sha256, signature_state=excluded.signature_state, "
+            "last_error=excluded.last_error, installed_by=excluded.installed_by, "
+            "installed_at=excluded.installed_at",
+            dict(row),
+        )
+        self._conn.commit()
+
+    def get_plugin(self, plugin_id: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM plugins WHERE id = ?", (plugin_id,)
+        ).fetchone()
+
+    def list_plugins(self) -> list[sqlite3.Row]:
+        return list(self._conn.execute("SELECT * FROM plugins ORDER BY id"))
+
+    def set_plugin_error(self, plugin_id: str, error: str | None) -> None:
+        """활성인데 안 도는 이유를 적어 둔다. **깨진 하나가 나머지를 막지 않는다.**"""
+        self._conn.execute(
+            "UPDATE plugins SET last_error = ? WHERE id = ?", (error, plugin_id)
+        )
+        self._conn.commit()
+
+    def delete_plugin(self, plugin_id: str) -> bool:
+        cur = self._conn.execute("DELETE FROM plugins WHERE id = ?", (plugin_id,))
         self._conn.commit()
         return cur.rowcount > 0
 

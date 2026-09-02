@@ -165,5 +165,19 @@
   "ui.diagnostics": "Diagnostic bundle",
   "ui.download": "Download",
   "ui.grace_mode": "Guard grace mode — blocking rules are downgraded to audit and do not block.",
-  "ui.grace_mode_off": "End grace mode"
+  "ui.grace_mode_off": "End grace mode",
+  "ui.plugins": "Plugins",
+  "ui.plugin": "Plugin",
+  "ui.plugin_install": "Install bundle (.lccp)",
+  "ui.plugin_activate": "Activate",
+  "ui.plugin_deactivate": "Deactivate",
+  "ui.plugin_remove": "Remove",
+  "ui.plugin_active": "Active",
+  "ui.plugin_inactive": "Inactive",
+  "ui.plugin_signature": "Signature",
+  "ui.plugin_token_once": "This token is shown once. Put it in the plugin's configuration",
+  "ui.plugin_installed_inactive": "Installed. Turning it on is a separate decision",
+  "ui.plugin_no_trust_key": "No trust keys — signed bundles cannot be installed",
+  "ui.plugin_missing_files": "Payload files are missing",
+  "ui.plugin_none": "No plugins installed"
 }

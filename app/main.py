@@ -32,7 +32,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from . import meta as meta_mod
-from .bootstrap import GRACE_KEY
+from .bootstrap import GRACE_KEY, PLATFORM_TENANT
 from .auth import (
     ROLE_SERVICE,
     Principal,
@@ -72,6 +72,7 @@ from .identity import new_salt
 from .models import ModelRegistrar
 from .notify import Notifier, channels_from_env
 from .observability import collect, diagnostic_bundle, render_metrics
+from . import plugins as plugin_mod
 from .pipeline import (
     GUARD_ROLE,
     MAX_WAIT_SECONDS,
@@ -151,6 +152,12 @@ class AppContext:
     now: Callable[[], float] = time.time
     static_dir: Path = STATIC_DIR
     client_dir: Path = CLIENT_DIR
+    #: 플러그인 설치본이 사는 곳. `config/` 는 읽기 전용 마운트라 쓸 수 없다.
+    data_dir: Path = Path("data")
+    #: 번들 서명을 검증할 공개 키들. **번들 안의 키로 번들을 검증하지 않는다.**
+    plugin_trust_dir: Path = Path("keys/plugin-trust")
+    #: 플러그인의 서비스가 사는 테넌트. 1단계는 플랫폼 전용이다.
+    plugin_tenant: str = PLATFORM_TENANT
 
     def limits_for_principal(self, tenant: Any, service: Any) -> dict[str, Any]:
         limits = limits_for(tenant, service)
@@ -184,6 +191,8 @@ def build_app(
     now: Callable[[], float] = time.time,
     static_dir: Path | None = None,
     client_dir: Path | None = None,
+    data_dir: Path | None = None,
+    plugin_trust_dir: Path | None = None,
     start_scheduler: bool = False,
 ) -> Starlette:
     """앱을 조립한다. 부품을 안 주면 기본값으로 만든다.
@@ -226,6 +235,11 @@ def build_app(
         accountant=accountant, evaluator=evaluator, registrar=registrar,
         notifier=notifier, scheduler=scheduler, version=version, airgap=airgap, now=now,
         static_dir=static_dir or STATIC_DIR, client_dir=client_dir or CLIENT_DIR,
+        data_dir=Path(data_dir) if data_dir else Path("data"),
+        plugin_trust_dir=(
+            Path(plugin_trust_dir) if plugin_trust_dir
+            else (Path(data_dir) if data_dir else Path("data")).parent / "keys" / "plugin-trust"
+        ),
     )
 
     # 스케줄러 수명주기. Starlette 이 `add_event_handler` 를 뺐으므로 lifespan 을 쓴다.
@@ -1683,6 +1697,70 @@ async def metrics(request: Request) -> Response:
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+async def platform_plugins(request: Request) -> Response:
+    """플러그인 목록과 설치.
+
+    **업로드가 raw body 인 이유**는 의존성이다. 멀티파트를 받으려면
+    `python-multipart` 가 필요하고 그건 6번째 의존성이다 — 이 제품이 5개를 지키는
+    것은 설치처의 보안 검토 표면을 좁게 유지하기 위해서다.
+    """
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        return _ok(request, {
+            "plugins": plugin_mod.snapshot(ctx.store, data_dir=ctx.data_dir),
+            "trust_dir": str(ctx.plugin_trust_dir),
+            "trusted_keys": len(plugin_mod.load_trusted_keys(ctx.plugin_trust_dir)),
+        })
+
+    bundle = await request.body()
+    try:
+        result = plugin_mod.install(
+            ctx.store, bundle, actor=principal.token_id, data_dir=ctx.data_dir,
+            trust_dir=ctx.plugin_trust_dir, tenant_id=ctx.plugin_tenant,
+            host_version=ctx.version, now=ctx.now,
+        )
+    except plugin_mod.PluginError as exc:
+        # 거부 사유는 사람이 읽고 고칠 수 있어야 한다 — 코드만 던지면 못 고친다.
+        raise ApiError("plugin_rejected", status=400, params={"reason": str(exc)}) from exc
+
+    # 설치는 켜는 것이 아니다. 토큰 원값은 **이 응답이 마지막이다.**
+    return _ok(request, {
+        "id": result.plugin_id,
+        "version": result.version,
+        "service_id": result.service_id,
+        "signature": result.signature_state,
+        "upgraded": result.upgraded,
+        "active": False,
+        "token": result.token,
+    }, status=201)
+
+
+async def platform_plugin_activate(request: Request) -> Response:
+    """플러그인을 켜고 끈다.
+
+    **실체는 그 플러그인이 쓰는 `services.status` 다.** 별도 플래그를 두지 않으므로
+    여기서 상태가 갈릴 수 없고, 강제는 `pipeline` 의 제출 경로 한 곳에서만 일어난다.
+    """
+    ctx, principal = _platform_admin(request)
+    plugin_id = request.path_params["plugin_id"]
+    body = await _body(request)
+    active = bool(body.get("active", True))
+    if not plugin_mod.set_active(ctx.store, plugin_id, active, actor=principal.token_id):
+        raise ApiError("not_found", status=404)
+    return _ok(request, {"id": plugin_id, "active": active})
+
+
+async def platform_plugin_delete(request: Request) -> Response:
+    """플러그인을 지운다. **서비스 행은 남긴다** — 사용량·감사가 이름을 잃지 않게."""
+    ctx, principal = _platform_admin(request)
+    plugin_id = request.path_params["plugin_id"]
+    if not plugin_mod.uninstall(
+        ctx.store, plugin_id, actor=principal.token_id, data_dir=ctx.data_dir
+    ):
+        raise ApiError("not_found", status=404)
+    return _ok(request, {"id": plugin_id, "removed": True})
+
+
 async def platform_diagnostics(request: Request) -> Response:
     """진단 번들.
 
@@ -1810,6 +1888,12 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["POST"], name="platform_grace_mode"),
         Route(f"{v}/platform/evals", platform_evals,
               methods=["GET", "POST"], name="platform_evals"),
+        Route(f"{v}/platform/plugins", platform_plugins,
+              methods=["GET", "POST"], name="platform_plugins"),
+        Route(f"{v}/platform/plugins/{{plugin_id}}/activate", platform_plugin_activate,
+              methods=["POST"], name="platform_plugin_activate"),
+        Route(f"{v}/platform/plugins/{{plugin_id}}", platform_plugin_delete,
+              methods=["DELETE"], name="platform_plugin_delete"),
         Route(f"{v}/platform/diagnostics", platform_diagnostics, name="platform_diagnostics"),
         Route(f"{v}/platform/notifications", platform_notifications,
               methods=["GET", "POST"], name="platform_notifications"),

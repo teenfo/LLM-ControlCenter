@@ -165,5 +165,19 @@
   "ui.diagnostics": "진단 번들",
   "ui.download": "내려받기",
   "ui.grace_mode": "가드 유예 모드 — 차단 규칙이 audit 로 낮춰져 실제로 막지 않습니다.",
-  "ui.grace_mode_off": "유예 해제"
+  "ui.grace_mode_off": "유예 해제",
+  "ui.plugins": "플러그인",
+  "ui.plugin": "플러그인",
+  "ui.plugin_install": "번들 설치 (.lccp)",
+  "ui.plugin_activate": "켜기",
+  "ui.plugin_deactivate": "끄기",
+  "ui.plugin_remove": "제거",
+  "ui.plugin_active": "동작 중",
+  "ui.plugin_inactive": "꺼짐",
+  "ui.plugin_signature": "서명",
+  "ui.plugin_token_once": "이 토큰은 지금 한 번만 보입니다. 플러그인 설정에 넣으세요",
+  "ui.plugin_installed_inactive": "설치됐습니다. 켜는 것은 별도 결정입니다",
+  "ui.plugin_no_trust_key": "신뢰 키가 없습니다 — 서명된 번들을 설치할 수 없습니다",
+  "ui.plugin_missing_files": "설치본 파일이 없습니다",
+  "ui.plugin_none": "설치된 플러그인이 없습니다"
 }

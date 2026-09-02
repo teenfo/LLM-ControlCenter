@@ -425,6 +425,8 @@ HTTP (Starlette)                                              main.py · meta.py
 배경        레인 루프 · 헬스 · 모델 설치 · 보존 · 감시         scheduler.py · models.py
 완료 통지    인프로세스 이벤트 — 폴링을 줄이되 없애지 않는다     completion.py
 운영        알림 · 메트릭 · 구조화 로그 · 진단 번들            notify.py · observability.py
+플러그인    앞문(`/v1/*`)으로 지나는 소비자. 설치가 곧 서비스     plugins.py
+            등록이고 토글은 그 서비스의 `status` 다
 측정        부하 측정 — 추정치를 설치처의 사실로 바꾼다        loadtest.py
 설치        부트스트랩 · CLI · 백업 스냅샷 · 복원              bootstrap.py · cli.py ·
                                                               backup.py · restore.py ·

@@ -1107,7 +1107,99 @@
 
 ---
 
-## 12. 하기로 했지만 아직 없는 것
+## 12. 플러그인
+
+주 모듈: `plugins.py` · 배경: [plugin-exploration.md](plugin-exploration.md)
+
+플러그인은 **앞문으로 지나는 소비자**다. LLM 을 쓸 때 `POST /v1/generate` 를 지나므로
+가드·경계·레이트리밋·예산·사용량 집계·감사가 배선 없이 붙는다. 지금 지원하는 실행
+형태는 `external` 하나 — **컨트롤 플레인이 프로세스를 띄우지 않는다.**
+
+### PLUGIN-1  번들 포맷과 서명 검증
+정의   `.lccp`(zip) + `plugin.toml` + `MANIFEST.sha256` + Ed25519 `SIGNATURE`. 서명 하나가 번들 전체를 고정한다.
+표면   `POST /v1/platform/plugins` (raw body) · `keys/plugin-trust/*.pub`
+구현   app/plugins.py:build_bundle · verify_bundle · load_trusted_keys · checksum_block
+계약   서명은 `MANIFEST.sha256` 한 장에 걸리고 그 한 장이 나머지 파일 해시를 든다
+       목록에 없는 파일이 끼어들어도 잡힌다 · 신뢰 목록 밖 키의 서명은 서명이 아니다
+       **무서명과 변조는 다른 사건이다** — `unsigned` 와 `invalid` 를 섞지 않는다
+       깨진 신뢰 키 하나가 나머지 키를 막지 않는다 · 새 의존성 0(cryptography 재사용)
+고정   test_plugins.py::test_a_signed_bundle_verifies
+       test_plugins.py::test_tampering_with_a_signed_bundle_is_detected
+       test_plugins.py::test_an_extra_file_not_in_the_checksums_is_detected
+       test_plugins.py::test_a_signature_from_an_untrusted_key_is_invalid
+상태   구현됨
+
+### PLUGIN-2  안전한 압축 해제
+정의   경로 순회·심볼릭 링크·zip bomb 을 **풀기 전에** 막는다.
+표면   설치 경로 내부 동작
+구현   app/plugins.py:safe_names · install
+계약   절대 경로·상위 디렉터리 참조·심볼릭 링크 항목은 거부한다
+       링크 하나면 번들이 `/keys/master.key` 를 읽어 간다 · 해제 크기와 항목 수에 상한
+       해제하고 나서 재는 것은 늦다 — 이미 디스크를 채운 뒤다
+고정   test_plugins.py::test_a_path_traversal_entry_is_refused
+       test_plugins.py::test_a_symlink_entry_is_refused
+       test_plugins.py::test_a_zip_bomb_is_refused_before_extraction
+       test_plugins.py::test_too_many_files_is_refused
+상태   구현됨
+
+### PLUGIN-3  설치 = 서비스 등록 + 토큰 발급
+정의   매니페스트 `[service]` 절이 그대로 `create_service()` 인자가 되고, 서비스 토큰이 한 번 발급된다.
+표면   `POST /v1/platform/plugins` · `plugin.toml` 의 `[plugin]` `[service]` `[run]`
+구현   app/plugins.py:install · parse_manifest · host_satisfies · app/plugins.py:plugin_root
+계약   **권한 모델을 새로 만들지 않는다** — 관리자가 읽는 문장과 DB 값과 강제되는 것이 같다
+       설치는 켜는 것이 아니다(항상 inactive 로 착지) · 업그레이드도 inactive 로 착지한다
+       재설치는 토큰을 재발급하지 않는다 — 갈아 치우면 도는 플러그인이 조용히 죽는다
+       설치본은 데이터 디렉터리로 간다(`config/` 는 읽기 전용 마운트)
+       내부(밑줄) 역할은 요청할 수 없다 · 호스트 버전 범위를 못 맞추면 거부한다
+       거부 사유는 사람이 읽고 고칠 수 있는 문장이다
+고정   test_plugins.py::test_installing_creates_a_service_and_a_token
+       test_plugins.py::test_a_freshly_installed_plugin_is_not_active
+       test_plugins.py::test_reinstalling_does_not_reissue_the_token
+       test_plugins.py::test_the_payload_lands_under_the_data_dir
+       test_plugins.py::test_an_internal_role_cannot_be_requested
+상태   구현됨
+
+### PLUGIN-4  활성 · 비활성
+정의   플러그인을 켜고 끈다. **실체는 그 플러그인이 쓰는 `services.status` 다.**
+표면   `POST /v1/platform/plugins/{plugin_id}/activate`
+구현   app/plugins.py:set_active · app/store.py:set_service_status · app/pipeline.py 제출 경로
+계약   **토글을 두 곳에 두지 않는다** — `plugins` 테이블에 `active` 컬럼이 없다
+       강제는 `pipeline` 의 제출 경로 한 곳뿐이다 — 비활성이면 그 토큰으로 401
+       선언하지 않은 역할은 활성 상태에서도 막힌다(AUTH-6)
+고정   test_plugins.py::test_deactivating_a_plugin_stops_its_token_at_the_pipeline
+       test_plugins.py::test_the_toggle_is_the_service_status
+       test_plugins.py::test_the_plugins_table_has_no_active_column
+       test_plugins.py::test_a_plugin_cannot_use_a_role_it_did_not_declare
+상태   구현됨
+
+### PLUGIN-5  제거
+정의   플러그인 행과 설치본을 지운다. **서비스 행은 남긴다.**
+표면   `DELETE /v1/platform/plugins/{plugin_id}`
+구현   app/plugins.py:uninstall
+계약   서비스를 지우면 그 서비스로 집계된 사용량·감사가 이름을 잃는다
+       대신 `inactive` 로 내려 둔다 — 과거는 읽히고 미래는 막힌다
+고정   test_plugins.py::test_uninstalling_keeps_the_service_row
+       test_plugins.py::test_uninstalling_removes_the_payload
+상태   구현됨
+
+### PLUGIN-6  목록과 상태
+정의   설치된 플러그인, 서명 상태, 활성 여부, 디스크에 파일이 있는지를 한 번에 본다.
+표면   `GET /v1/platform/plugins` · 관제 UI 플러그인 탭 (설치·토글·제거)
+구현   app/plugins.py:snapshot · app/store.py:list_plugins
+계약   **활성 여부의 출처는 서비스 하나뿐이다**(파생값이지 저장값이 아니다)
+       행은 있는데 파일이 없는 상태가 드러난다 — 백업은 DB 만 뜨므로 복원 뒤가 그렇다
+       플랫폼 관리자 전용이다
+고정   test_plugins.py::test_the_snapshot_shows_missing_files
+       test_plugins.py::test_the_routes_need_platform_admin
+       test_plugins.py::test_install_activate_and_deactivate_over_http
+       test_plugins.py::test_the_lifecycle_is_audited
+계약   화면이 자체 상태를 들고 있지 않다 — 활성 여부는 서버가 서비스에서 파생해 준다
+       번들 업로드는 raw body 다(멀티파트는 6번째 의존성)
+상태   부분 — `external` 외 실행 형태 없음. 이벤트·스케줄 트리거 없음
+
+---
+
+## 13. 하기로 했지만 아직 없는 것
 
 여기 있는 항목은 **구현이 없습니다.** 표면도 구현 위치도 없으므로 그 칸을 비웁니다.
 ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하기 때문입니다.
@@ -1261,6 +1353,9 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_guard_baseline` | `GET /v1/platform/guard/baseline` | GUARD-1 |
 | `platform_grace_mode` | `POST /v1/platform/guard/grace-mode` | GUARD-6 |
 | `platform_evals` | `GET/POST /v1/platform/evals` | GUARD-11 GUARD-13 ROUTE-4 |
+| `platform_plugins` | `GET/POST /v1/platform/plugins` | PLUGIN-1 PLUGIN-3 PLUGIN-6 |
+| `platform_plugin_activate` | `POST /v1/platform/plugins/{id}/activate` | PLUGIN-4 |
+| `platform_plugin_delete` | `DELETE /v1/platform/plugins/{id}` | PLUGIN-5 |
 | `platform_diagnostics` | `GET /v1/platform/diagnostics` | OPS-3 |
 | `platform_notifications` | `GET/POST /v1/platform/notifications` | OPS-4 |
 | `metrics` | `GET /metrics` | OPS-1 |

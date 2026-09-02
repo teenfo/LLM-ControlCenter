@@ -152,7 +152,7 @@ def store(clock):
 
 
 @pytest.fixture
-def harness(config, store, clock, vault):
+def harness(config, store, clock, vault, tmp_path):
     """앱 + 부품 묶음. 테스트가 내부 상태를 직접 만질 수 있게 함께 돌려준다."""
     accountant = CostAccountant(config.pricing, store, now=clock)
     channel = RecordingChannel()
@@ -184,10 +184,16 @@ def harness(config, store, clock, vault):
         evaluator=evaluator, certifier_factory=pipeline.make_certifier,
     )
 
+    # 플러그인 설치본과 신뢰 키는 **테스트마다 격리된 임시 경로**에 둔다.
+    # 기본값은 저장소 상대 경로라 그대로 두면 테스트가 저장소에 파일을 쓴다.
+    data_dir = tmp_path / "data"
+    trust_dir = tmp_path / "plugin-trust"
+
     app = build_app(
         config=config, store=store, cluster=cluster, guard=guard, scheduler=scheduler,
         pipeline=pipeline, vault=vault, evaluator=evaluator, registrar=registrar,
         accountant=accountant, notifier=notifier, now=clock,
+        data_dir=data_dir, plugin_trust_dir=trust_dir,
     )
 
     class Harness:
@@ -209,6 +215,8 @@ def harness(config, store, clock, vault):
     h.notifier = notifier
     h.channel = channel
     h.completion = completion
+    h.data_dir = data_dir
+    h.trust_dir = trust_dir
     return h
 
 
