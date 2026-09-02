@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -148,3 +149,43 @@ def test_locale_maps_to_guard_pack():
 def test_unknown_locale_has_no_guard_pack():
     """대응 팩이 없으면 None 이다. 조용히 다른 나라 팩을 켜지 않는다."""
     assert guard_pack_for("fr-FR") is None
+
+
+# ── 코드와 카탈로그가 어긋나는 것을 잡는다 ───────────────────────────────────
+
+
+def test_every_raised_error_code_has_a_message():
+    """`ApiError("x")` 를 새로 던져 놓고 문구를 안 넣으면, 소비자 화면에
+
+    `error.x` 라는 **원문 키가 그대로 뜬다.** 위의
+    `test_all_locales_have_the_same_keys` 는 로케일끼리만 대조하므로,
+    두 로케일에서 똑같이 빠진 키는 잡지 못한다 — 실제로 그렇게
+    `plugin_rejected` 와 `unsupported_operation` 이 빠져 있었다.
+
+    자리(placeholder)까지는 보지 않는다. `t()` 가 인자 불일치에도 화면을
+    띄우게 만들어 두었으므로 그건 장애가 아니고, 여기서 보려면 호출부의
+    `params` 를 정적으로 따라가야 해서 규칙이 주관적이 된다.
+    """
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    catalogs = {
+        path.stem: json.loads(path.read_text(encoding="utf-8"))
+        for path in LOCALES_DIR.glob("*.json")
+    }
+
+    raised: dict[str, str] = {}   # code → 처음 던진 곳
+    for path in sorted(app_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "ApiError"):
+                continue
+            first = node.args[0] if node.args else None
+            # 코드를 실행 중에 정하는 곳이 하나 있다(배치 결과 코드).
+            # 정적으로는 못 보므로 건너뛴다 — 못 보는 것을 본 척하지 않는다.
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                raised.setdefault(first.value, f"{path.relative_to(app_dir.parent)}:{node.lineno}")
+
+    assert raised, "ApiError 호출을 하나도 못 찾았다 — 이 검사가 죽어 있다는 뜻이다"
+
+    for name, catalog in catalogs.items():
+        missing = {code: where for code, where in raised.items() if f"error.{code}" not in catalog}
+        assert not missing, f"{name} 에 문구가 없는 오류 코드: {missing}"

@@ -38,6 +38,8 @@
   "error.promotion_blocked": "False-positive rate ({rate}) exceeds the limit ({limit}); cannot promote.",
   "error.classifier_noncompliant": "Classifier schema compliance ({rate}) is below the threshold ({limit}).",
   "error.internal": "An internal error occurred.",
+  "error.plugin_rejected": "Cannot install the plugin: {reason}",
+  "error.unsupported_operation": "Node '{node}' does not support this operation.",
   "scope.tenant": "tenant",
   "scope.service": "service",
   "scope.end_user": "end user",
