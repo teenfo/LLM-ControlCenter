@@ -169,6 +169,7 @@
   "ui.plugins": "Plugins",
   "ui.plugin": "Plugin",
   "ui.plugin_install": "Install bundle (.lccp)",
+  "ui.plugin_install_go": "Install",
   "ui.plugin_activate": "Activate",
   "ui.plugin_deactivate": "Deactivate",
   "ui.plugin_remove": "Remove",

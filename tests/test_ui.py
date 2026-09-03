@@ -390,3 +390,26 @@ def test_an_external_node_registered_with_auth_is_accepted(harness, client, acme
         headers=auth(acme["platform_admin"]),
     )
     assert response.status_code in (200, 201), response.text
+
+
+def test_hidden_actually_hides():
+    """**`el.hidden = true` 를 CSS 가 이기면 안 된다.**
+
+    브라우저 기본 스타일의 `[hidden] { display: none }` 은 **작성자 규칙에 진다.**
+    그래서 `#login { display: grid }` 한 줄 때문에 `login.hidden = true` 가 아무
+    효과가 없었다 — 접속한 뒤에도 로그인 폼이 화면을 그대로 채우고 앱은 정확히
+    한 화면 아래에 있었다. 이 저장소의 테스트는 전부 통과했다. 브라우저로 실제
+    렌더해 보기 전에는 나오지 않는 종류다(플레이라이트로 `#shell` 이 `y=900` 에
+    있는 것을 보고 알았다).
+
+    여기서는 렌더까지 못 보므로 **그 사고가 다시 가능해지는 조건**을 막는다:
+    `[hidden]` 이 `!important` 로 이기는 규칙이 있는가. 이것이 있으면 앞으로
+    누가 어떤 선택자에 `display` 를 줘도 같은 일이 안 생긴다.
+    """
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    override = re.search(r"\[hidden\][^{]*\{[^}]*display\s*:\s*none\s*!important", css)
+    assert override, "[hidden] { display: none !important } 규칙이 없다"
+
+    # 이 검사가 지키는 대상이 실재하는지도 본다 — 대상이 없으면 규칙만 남아 있는 것이다.
+    toggled = set(re.findall(r"\$\(['\"](\w+)['\"]\)\.hidden\s*=", (STATIC / "app.js").read_text(encoding="utf-8")))
+    assert toggled, "app.js 가 .hidden 을 토글하지 않는다 — 이 검사가 죽어 있다"

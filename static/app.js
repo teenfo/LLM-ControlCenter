@@ -675,7 +675,7 @@ async function renderPlugins() {
 
   const picker = el('input', { type: 'file', accept: '.lccp,.zip' });
   const install = el('button', {
-    text: t('ui.plugin_install'),
+    text: t('ui.plugin_install_go'),
     onclick: async () => {
       const file = picker.files && picker.files[0];
       if (!file) return;
@@ -727,10 +727,10 @@ async function renderPlugins() {
   ]);
 
   return [
-    card(t('ui.plugin_install'), [el('div', { class: 'row' }, [picker, install])]),
+    card(t('ui.plugin_install'), [el('div', { class: 'row' }, [picker, install])]),  // 버튼 문구는 ui.plugin_install_go
     card(t('ui.plugins'), rows.length
       ? [table(
-          [t('ui.plugin'), t('ui.plugin_signature'), '', '',
+          [t('ui.plugin'), t('ui.plugin_signature'), t('ui.status'), t('ui.role'),
            t('ui.plugin_jobs'), t('ui.plugin_schedule'), '', ''],
           rows)]
       : [el('p', { class: 'muted', text: t('ui.plugin_none') })]),

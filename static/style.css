@@ -40,6 +40,17 @@ h3 { font-size: .95rem; margin: 0 0 .4rem; }
 .error { color: var(--bad); margin: .75rem 1rem; }
 .hint { color: var(--muted); font-size: .85rem; margin: .35rem 0 .9rem; }
 
+/* **`hidden` 을 어떤 규칙도 못 이기게 한다.**
+
+   브라우저 기본 스타일의 `[hidden] { display: none }` 은 **작성자 규칙에 진다.**
+   그래서 `#login { display: grid }` 하나 때문에 `login.hidden = true` 가 아무 효과가
+   없었다 — 접속한 뒤에도 로그인 폼이 화면을 그대로 채우고 앱은 정확히 한 화면
+   아래에 있었다. 테스트는 전부 통과했다. 브라우저로 띄워 보기 전에는 안 나온다.
+
+   개별 선택자를 고치는 대신 여기서 한 번에 막는다 — 다음에 누가 `display` 를 주는
+   규칙을 추가해도 같은 일이 다시 안 생긴다. */
+[hidden] { display: none !important; }
+
 /* -- 접속 -- */
 #login { display: grid; place-items: center; min-height: 100vh; padding: 1rem; }
 #login form {

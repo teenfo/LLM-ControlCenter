@@ -169,6 +169,7 @@
   "ui.plugins": "플러그인",
   "ui.plugin": "플러그인",
   "ui.plugin_install": "번들 설치 (.lccp)",
+  "ui.plugin_install_go": "설치",
   "ui.plugin_activate": "켜기",
   "ui.plugin_deactivate": "끄기",
   "ui.plugin_remove": "제거",
