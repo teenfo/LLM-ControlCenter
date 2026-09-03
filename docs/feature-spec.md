@@ -1215,8 +1215,31 @@
        test_plugins.py::test_the_origin_survives_uninstalling_the_plugin
        test_architecture.py::test_the_job_creating_call_stamps_the_origin
        test_architecture.py::test_only_one_place_decides_what_the_origin_means
-상태   부분 — 표식과 판정은 있고 **그 판정을 묻는 트리거가 아직 없다.**
-       표식은 잡이 만들어지는 순간에만 붙일 수 있어 트리거보다 먼저 넣었다
+상태   부분 — 표식과 판정은 있고 **그 판정을 묻는 이벤트 트리거가 아직 없다.**
+       스케줄 트리거(PLUGIN-8)는 잡이 아니라 시각이 원인이라 이 판정을 안 지난다
+
+### PLUGIN-8  스케줄 트리거
+정의   매니페스트가 `[trigger] kind = "schedule"` 과 다섯 칸 cron 을 선언하면, 컨트롤 플레인이
+       예정을 갖고 플러그인이 `POST /v1/plugin/tick` 으로 "지금 내 차례인가" 를 물어 가져간다.
+표면   `plugin.toml` 의 `[trigger]` (`schedule` · `timezone`) · `POST /v1/plugin/tick` ·
+       `GET /v1/platform/plugins` 의 `schedule`·`next_run_at`·`last_run_at` · 관제 UI 「스케줄」 칸
+구현   app/schedule.py(cron 파싱·다음 시각) · app/plugins.py:claim_tick ·
+       app/store.py:claim_plugin_tick · app/main.py:plugin_tick
+계약   **컨트롤 플레인이 플러그인을 부르러 나가지 않는다**(풀). `external` 은 "우리가 안 띄운다" 는
+       뜻이었고, zip 이 들고 온 주소로 서버가 연결을 거는 것은 그 전제와 반대 방향이다
+       클레임은 CAS 다 — 복제본이 넷이어도 한 번만 가져간다
+       **끄면 선다** — 이 경로도 `auth.active_service` 를 지난다(제출 경로와 같은 함수)
+       밀린 것을 몰아 돌리지 않는다 — 사흘 꺼져 있었어도 한 번 돌고, `scheduled_for` 로
+       얼마나 늦었는지만 알려 준다. 따라잡을지는 플러그인이 정한다
+       예정은 켤 때 지금 기준으로 잡고 끌 때 지운다. 판올림은 비활성으로 내려가므로 함께 지워진다
+       못 도는 스케줄은 **설치 시점에** 거부한다 — 실제로 다음 시각을 계산해 본다
+고정   test_schedule.py (cron 34건 — 일·요일 OR · 윤년 · 서머타임 · 단조 증가)
+       test_plugins.py::test_after_the_scheduled_time_the_answer_is_yes_exactly_once
+       test_plugins.py::test_a_long_outage_fires_once_not_a_backlog
+       test_plugins.py::test_turning_the_plugin_off_stops_its_schedule_at_the_same_choke_point
+       test_multiprocess.py::test_only_one_replica_claims_a_scheduled_tick
+       test_architecture.py::test_only_one_place_decides_whether_a_service_is_switched_on
+상태   구현됨 — `schedule` 하나다. `event`(잡 완료·알림) 트리거는 미구현
 
 ---
 
@@ -1377,6 +1400,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_plugins` | `GET/POST /v1/platform/plugins` | PLUGIN-1 PLUGIN-3 PLUGIN-6 |
 | `platform_plugin_activate` | `POST /v1/platform/plugins/{id}/activate` | PLUGIN-4 |
 | `platform_plugin_delete` | `DELETE /v1/platform/plugins/{id}` | PLUGIN-5 |
+| `plugin_tick` | `POST /v1/plugin/tick` | PLUGIN-8 |
 | `platform_diagnostics` | `GET /v1/platform/diagnostics` | OPS-3 |
 | `platform_notifications` | `GET/POST /v1/platform/notifications` | OPS-4 |
 | `metrics` | `GET /metrics` | OPS-1 |

@@ -699,6 +699,8 @@ async function renderPlugins() {
     (p.allow_roles || []).join(', '),
     // 이 플러그인이 만든 잡 수. 트리거가 없는 지금도 "얼마나 쓰고 있나" 를 답한다.
     String(p.jobs_created || 0),
+    // 스케줄이 있는데 아직 한 번도 안 돌았으면 그 사실이 보여야 한다.
+    p.schedule ? p.schedule + (p.last_run_at ? '' : ' · ' + t('ui.plugin_never_ran')) : '',
     p.files_present ? '' : t('ui.plugin_missing_files'),
     el('div', { class: 'row' }, [
       el('button', {
@@ -728,7 +730,8 @@ async function renderPlugins() {
     card(t('ui.plugin_install'), [el('div', { class: 'row' }, [picker, install])]),
     card(t('ui.plugins'), rows.length
       ? [table(
-          [t('ui.plugin'), t('ui.plugin_signature'), '', '', t('ui.plugin_jobs'), '', ''],
+          [t('ui.plugin'), t('ui.plugin_signature'), '', '',
+           t('ui.plugin_jobs'), t('ui.plugin_schedule'), '', ''],
           rows)]
       : [el('p', { class: 'muted', text: t('ui.plugin_none') })]),
   ];

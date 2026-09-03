@@ -176,6 +176,8 @@
   "ui.plugin_inactive": "Inactive",
   "ui.plugin_signature": "Signature",
   "ui.plugin_jobs": "Jobs",
+  "ui.plugin_schedule": "Schedule",
+  "ui.plugin_never_ran": "never ran",
   "ui.plugin_token_once": "This token is shown once. Put it in the plugin's configuration",
   "ui.plugin_installed_inactive": "Installed. Turning it on is a separate decision",
   "ui.plugin_no_trust_key": "No trust keys — signed bundles cannot be installed",

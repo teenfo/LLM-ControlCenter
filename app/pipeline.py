@@ -23,7 +23,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Collection, Mapping, Sequence
 
-from .auth import Principal, RateLimiter, check_role_allowed, limits_for
+from .auth import (
+    Principal, RateLimiter, active_service, check_role_allowed, limits_for,
+)
 from .cluster import PLACED, WAIT, Cluster
 from .completion import CompletionSignal
 from .config import EXTERNAL, INTERNAL, Config, GuardRule, Role
@@ -153,9 +155,9 @@ class Pipeline:
         if tenant is None or tenant["status"] != "active":
             raise ApiError("tenant_inactive", status=403)
 
-        service = self._store.get_service(principal.scope(), principal.service_id)
-        if service is None or service["status"] != "active":
-            raise ApiError("unauthorized", status=401)
+        # 꺼진 서비스를 거르는 판정은 `auth.active_service` 하나다 — 스케줄
+        # 클레임도 같은 함수를 지난다(구조 검사가 지킨다).
+        service = active_service(self._store, principal)
 
         role = self._roles.get(principal.tenant_id, role_name)
         if role is None or not is_public_role(role_name):

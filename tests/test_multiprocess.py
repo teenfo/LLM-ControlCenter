@@ -60,6 +60,28 @@ def _cas_worker(db_path: str, job_id: str, barrier, results) -> None:
         store.close()
 
 
+def _plugin_tick_worker(db_path: str, plugin_id: str, due_at: float, barrier, results) -> None:
+    """플러그인 복제본이 저마다 **같은 예정**을 가져가려고 다툰다.
+
+    실제 배치가 이 모양이다 — `external` 플러그인은 운영자가 띄우고, 가용성을
+    위해 보통 복제본이 여럿이다. 넷이 넷 다 "내 차례" 를 받으면 그날 요약이
+    네 번 나가고 예산도 네 배로 쓴다.
+    """
+    store = SqliteStore(db_path)
+    try:
+        barrier.wait()
+        won = store.claim_plugin_tick(
+            plugin_id, now=due_at + 1, next_run_at=due_at + 86400
+        )
+        results.put(("ok", bool(won)))
+    except sqlite3.Error as exc:
+        results.put(("sqlite_error", f"{type(exc).__name__}: {exc}"))
+    except Exception as exc:                       # pragma: no cover - 진단용
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        store.close()
+
+
 def _tx_rollback_worker(db_path: str, results) -> None:
     """`_tx()` 안에서 중간에 터진다. 앞선 쓰기가 남으면 안 된다."""
     store = SqliteStore(db_path)
@@ -219,6 +241,40 @@ def test_only_one_process_wins_the_state_transition(shared_db):
 
     verify = SqliteStore(shared_db)
     assert verify.job_status(ACME, job_id) == "running"
+    verify.close()
+
+
+def test_only_one_replica_claims_a_scheduled_tick(shared_db):
+    """스케줄 트리거의 존재 이유 하나가 여기서 검증된다.
+
+    플러그인이 자기 cron 을 쓰면 복제본 수만큼 돈다. 컨트롤 플레인이 예정을 갖고
+    **클레임을 CAS 로** 주기 때문에 복제본이 넷이어도 한 번이다.
+
+    순차 호출로는 이것을 못 잰다 — 두 번째 호출은 이미 밀린 예정을 읽고 클레임을
+    시도조차 안 한다. 넷이 **같은 예정을 읽은 상태**에서 겹쳐야 CAS 를 지난다.
+    """
+    due_at = 1_700_000_000.0
+    store = SqliteStore(shared_db)
+    store.save_plugin({
+        "id": "acme.digest", "version": "1.0.0", "name": "digest", "kind": "external",
+        "tenant_id": "acme", "service_id": "acme.digest", "endpoint": None,
+        "manifest_json": "{}", "bundle_sha256": "0" * 64, "signature_state": "signed",
+        "last_error": None, "installed_by": "t", "installed_at": 0.0,
+        "schedule": "0 8 * * *", "schedule_tz": "UTC",
+    })
+    store.set_plugin_next_run("acme.digest", due_at)
+    store.close()
+
+    outcomes = run_workers(_plugin_tick_worker, shared_db, "acme.digest", due_at)
+
+    failures = [o for kind, o in outcomes if kind != "ok"]
+    assert not failures, f"워커가 오류를 냈다: {failures}"
+
+    wins = [won for _, won in outcomes if won]
+    assert len(wins) == 1, f"{WORKERS}개 복제본 중 {len(wins)}개가 가져갔다"
+
+    verify = SqliteStore(shared_db)
+    assert verify.get_plugin("acme.digest")["next_run_at"] == due_at + 86400
     verify.close()
 
 

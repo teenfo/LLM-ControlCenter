@@ -23,7 +23,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from .i18n import ApiError
 from .store import SqliteStore, TenantScope
@@ -205,6 +205,33 @@ def authenticate(
         token_id=row["id"],
         role=row["role"],
     )
+
+
+def service_is_active(service: Any) -> bool:
+    """이 서비스가 켜져 있는가. **"켜져 있다" 의 뜻은 여기서만 정한다.**
+
+    판정하는 쪽(`active_service`)과 보여 주는 쪽(`plugins.snapshot`)이 각자 이
+    비교를 쓰면, 화면은 "동작 중" 인데 요청은 401 인 조합이 생긴다. 관제 화면이
+    거짓말을 하면 그 화면으로는 아무것도 못 고친다.
+    """
+    return service is not None and service["status"] == "active"
+
+
+def active_service(store: Any, principal: Principal) -> Any:
+    """이 토큰의 서비스가 켜져 있는가. **꺼진 서비스의 토큰은 없는 토큰이다.**
+
+    **강제 지점이 여기 하나다.** 제출(`pipeline`)과 스케줄 클레임(`/v1/plugin/tick`)이
+    둘 다 이 함수를 지난다. 각자 `service["status"]` 를 읽어 판정하면 둘은 반드시
+    어긋나고, 그때 "껐는데 왜 도느냐" 가 된다 — 플러그인 토글의 실체가 바로 이
+    컬럼이라 그 어긋남이 곧 토글이 안 듣는 것이다.
+
+    401 인 이유는 403 이 아니기 때문이다. 꺼진 서비스는 "권한이 없다" 가 아니라
+    "그런 신원이 지금 없다" 다.
+    """
+    service = store.get_service(principal.scope(), principal.service_id)
+    if not service_is_active(service):
+        raise ApiError("unauthorized", status=401)
+    return service
 
 
 def bearer_from_header(header: str | None) -> str | None:

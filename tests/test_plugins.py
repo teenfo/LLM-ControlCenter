@@ -686,3 +686,253 @@ def test_the_admin_list_shows_how_many_jobs_each_plugin_made(
 
     [row] = plugins.snapshot(harness.store, data_dir=harness.data_dir)
     assert row["jobs_created"] == 2
+
+
+# ── 스케줄 트리거 ────────────────────────────────────────────────────────────
+
+SCHEDULED = MANIFEST + """
+[trigger]
+kind = "schedule"
+schedule = "0 8 * * *"
+timezone = "Asia/Seoul"
+"""
+
+
+def scheduled_bundle(**overrides):
+    manifest = SCHEDULED
+    for old, new in overrides.items():
+        manifest = manifest.replace(old.replace("__", " "), new)
+    return manifest
+
+
+def install_scheduled(harness, signing_key, manifest: str = SCHEDULED):
+    return do_install(harness, bundle(manifest, key=signing_key))
+
+
+def test_a_plugin_without_a_trigger_section_has_no_schedule(harness, signing_key, platform_tenant):
+    """**스케줄이 없는 것이 기본이다.** 선언하지 않은 플러그인이 돌기 시작하면 안 된다."""
+    do_install(harness, bundle(key=signing_key))
+    row = harness.store.get_plugin("acme.daily-digest")
+    assert row["schedule"] is None
+    assert row["next_run_at"] is None
+
+
+def test_a_declared_schedule_is_stored_with_its_timezone(harness, signing_key, platform_tenant):
+    install_scheduled(harness, signing_key)
+    row = harness.store.get_plugin("acme.daily-digest")
+    assert row["schedule"] == "0 8 * * *"
+    assert row["schedule_tz"] == "Asia/Seoul"
+
+
+@pytest.mark.parametrize("edit,fragment", [
+    ('schedule = "0 8 * * *"', "다섯 칸"),          # 아래에서 값만 갈아 끼운다
+    ('timezone = "Asia/Seoul"', "시간대"),
+])
+def test_a_schedule_that_cannot_be_computed_is_refused_at_install(
+    harness, signing_key, platform_tenant, edit, fragment
+):
+    """**설치 시점에 실제로 계산해 본다.** 형식만 보면 안 도는 스케줄이 설치된다."""
+    broken = SCHEDULED.replace(edit, {
+        'schedule = "0 8 * * *"': 'schedule = "0 8 * *"',
+        'timezone = "Asia/Seoul"': 'timezone = "Asia/Seuol"',
+    }[edit])
+    with pytest.raises(PluginError) as caught:
+        do_install(harness, bundle(broken, key=signing_key))
+    assert fragment in str(caught.value)
+
+
+def test_a_schedule_that_never_fires_is_refused(harness, signing_key, platform_tenant):
+    """`0 0 30 2 *` — 2월 30일. 문법은 맞고 영원히 안 돈다.
+
+    받아 두면 켜져 있고 화면에도 보이는데 아무 일도 안 하는 플러그인이 되고,
+    그 상태를 아무도 못 읽는다.
+    """
+    never = SCHEDULED.replace('"0 8 * * *"', '"0 0 30 2 *"')
+    with pytest.raises(PluginError) as caught:
+        do_install(harness, bundle(never, key=signing_key))
+    assert "없는 날짜" in str(caught.value)
+
+
+def test_an_unsupported_trigger_kind_is_refused(harness, signing_key, platform_tenant):
+    """`event` 는 아직 배관이 없다. 받아 두고 안 도는 것보다 거부가 낫다."""
+    evented = SCHEDULED.replace('kind = "schedule"', 'kind = "event"')
+    with pytest.raises(PluginError) as caught:
+        do_install(harness, bundle(evented, key=signing_key))
+    assert "트리거" in str(caught.value)
+
+
+# ── 예정은 켤 때 잡는다 ──────────────────────────────────────────────────────
+
+
+def test_installing_does_not_schedule_anything(harness, signing_key, platform_tenant):
+    """설치는 켜는 것이 아니다 — 예정도 안 잡는다.
+
+    설치 시점에 잡아 두면, 설치해 두고 한 달 뒤에 켠 플러그인이 **켜자마자** 한 번 돈다.
+    """
+    install_scheduled(harness, signing_key)
+    assert harness.store.get_plugin("acme.daily-digest")["next_run_at"] is None
+
+
+def test_activating_schedules_from_now(harness, signing_key, platform_tenant):
+    install_scheduled(harness, signing_key)
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+
+    next_run = harness.store.get_plugin("acme.daily-digest")["next_run_at"]
+    assert next_run is not None and next_run > harness.clock()
+
+
+def test_deactivating_clears_the_schedule(harness, signing_key, platform_tenant):
+    """끄면 예정이 없어진다. 남겨 두면 다시 켤 때 지난 예정이 즉시 터진다."""
+    install_scheduled(harness, signing_key)
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+    plugins.set_active(harness.store, "acme.daily-digest", False, actor="t", now=harness.clock)
+    assert harness.store.get_plugin("acme.daily-digest")["next_run_at"] is None
+
+
+# ── 클레임 ──────────────────────────────────────────────────────────────────
+
+
+def activated(harness, signing_key):
+    install_scheduled(harness, signing_key)
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+    return harness.store.get_plugin("acme.daily-digest")["next_run_at"]
+
+
+def test_before_the_scheduled_time_the_answer_is_no(harness, signing_key, platform_tenant):
+    due_at = activated(harness, signing_key)
+    tick = plugins.claim_tick(harness.store, "acme.daily-digest", now=harness.clock)
+    assert tick.due is False
+    assert tick.next_run_at == due_at
+
+
+def test_after_the_scheduled_time_the_answer_is_yes_exactly_once(
+    harness, signing_key, platform_tenant
+):
+    """**이 파일에서 스케줄 쪽의 핵심 테스트다.**
+
+    두 번째 물음에 또 "예" 라고 하면, 폴링하는 플러그인이 하루 종일 돈다.
+    """
+    due_at = activated(harness, signing_key)
+    harness.clock.now = due_at + 1
+
+    first = plugins.claim_tick(harness.store, "acme.daily-digest", now=harness.clock)
+    assert first.due is True
+    assert first.scheduled_for == due_at
+    assert first.next_run_at > harness.clock()
+
+    second = plugins.claim_tick(harness.store, "acme.daily-digest", now=harness.clock)
+    assert second.due is False
+
+
+def test_only_one_replica_wins_the_same_tick(harness, signing_key, platform_tenant):
+    """복제본이 셋이면 셋이 동시에 묻는다. **클레임이 CAS 라서** 하나만 가져간다.
+
+    이것이 플러그인이 자기 cron 을 쓰는 것과 다른 점 하나다 — 자기 cron 은
+    복제본 수만큼 돈다.
+    """
+    due_at = activated(harness, signing_key)
+    harness.clock.now = due_at + 1
+
+    answers = [
+        plugins.claim_tick(harness.store, "acme.daily-digest", now=harness.clock)
+        for _ in range(3)
+    ]
+    assert sum(1 for a in answers if a.due) == 1
+
+
+def test_a_long_outage_fires_once_not_a_backlog(harness, signing_key, platform_tenant):
+    """사흘 꺼져 있었다고 사흘치를 몰아 돌리지 않는다. **그게 사고다.**
+
+    얼마나 늦었는지는 `scheduled_for` 로 알려 주므로, 따라잡을지는 플러그인이 정한다.
+    """
+    due_at = activated(harness, signing_key)
+    harness.clock.now = due_at + 3 * 86400 + 60
+
+    first = plugins.claim_tick(harness.store, "acme.daily-digest", now=harness.clock)
+    assert first.due is True
+    assert first.scheduled_for == due_at              # 늦었다는 사실은 그대로 전한다
+    assert first.next_run_at > harness.clock()        # 다음은 **지금** 기준
+
+    assert plugins.claim_tick(harness.store, "acme.daily-digest", now=harness.clock).due is False
+
+
+def test_a_plugin_without_a_schedule_is_told_no_not_an_error(
+    harness, signing_key, platform_tenant
+):
+    do_install(harness, bundle(key=signing_key))
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+    assert plugins.claim_tick(harness.store, "acme.daily-digest", now=harness.clock).due is False
+
+
+def test_an_upgrade_clears_the_schedule_because_it_lands_inactive(
+    harness, signing_key, platform_tenant
+):
+    """판올림은 이미 **비활성으로 내려간다**(`test_an_upgrade_lands_inactive`).
+
+    그러면 예정도 같이 없어져야 규칙이 하나로 남는다 — "꺼진 플러그인은 예정이 없다".
+    남겨 두면 꺼져 있는데 예정이 살아 있는 상태가 생기고, `set_active` 가 끌 때
+    지우는 것과 갈린다. 사람이 다시 켜면 그때부터 다시 잡힌다.
+    """
+    activated(harness, signing_key)
+    upgraded = SCHEDULED.replace('version = "1.0.0"', 'version = "1.1.0"')
+    do_install(harness, bundle(upgraded, key=signing_key))
+    assert harness.store.get_plugin("acme.daily-digest")["next_run_at"] is None
+
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+    assert harness.store.get_plugin("acme.daily-digest")["next_run_at"] > harness.clock()
+
+
+# ── 앞문에서 ────────────────────────────────────────────────────────────────
+
+
+def test_the_tick_route_answers_the_plugins_own_token(
+    harness, client, signing_key, platform_tenant
+):
+    result = install_scheduled(harness, signing_key)
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+
+    early = client.post("/v1/plugin/tick", headers=auth(result.token))
+    assert early.status_code == 200, early.text
+    assert early.json()["due"] is False
+
+    harness.clock.now = harness.store.get_plugin("acme.daily-digest")["next_run_at"] + 1
+    due = client.post("/v1/plugin/tick", headers=auth(result.token))
+    assert due.json()["due"] is True
+    assert due.json()["id"] == "acme.daily-digest"
+
+
+def test_turning_the_plugin_off_stops_its_schedule_at_the_same_choke_point(
+    harness, client, signing_key, platform_tenant
+):
+    """**끄면 스케줄도 선다.**
+
+    제출 경로와 **같은 함수**(`auth.active_service`)를 지나므로 두 곳이 갈릴 수 없다.
+    자기 cron 을 쓰는 플러그인은 관제 화면에서 꺼도 계속 때린다 — 그 차이가 이
+    기능이 존재하는 이유의 절반이다.
+    """
+    result = install_scheduled(harness, signing_key)
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+    assert client.post("/v1/plugin/tick", headers=auth(result.token)).status_code == 200
+
+    plugins.set_active(harness.store, "acme.daily-digest", False, actor="t", now=harness.clock)
+    assert client.post("/v1/plugin/tick", headers=auth(result.token)).status_code == 401
+
+
+def test_an_ordinary_service_token_is_not_a_plugin(harness, client, acme):
+    """플러그인이 아닌 서비스에게 "예정 없음" 이라고 답하면 거짓말이 된다."""
+    assert client.post("/v1/plugin/tick", headers=auth(acme["service"])).status_code == 404
+
+
+def test_a_plugin_can_only_claim_its_own_tick(harness, client, signing_key, platform_tenant):
+    """**남의 차례를 가져갈 수 있는 인자가 없다.**
+
+    플러그인 id 를 요청 본문에서 받으면 언젠가 남의 것을 가져간다. 토큰에서
+    유도하므로 그 경로가 존재하지 않는다.
+    """
+    result = install_scheduled(harness, signing_key)
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+
+    body = client.post(
+        "/v1/plugin/tick", json={"id": "someone.else"}, headers=auth(result.token)
+    ).json()
+    assert body["id"] == "acme.daily-digest"

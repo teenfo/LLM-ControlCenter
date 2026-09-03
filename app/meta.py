@@ -166,6 +166,12 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
         "플러그인 제거. **서비스 행은 남긴다** — 사용량·감사가 이름을 잃지 않게.",
         "platform_admin", False,
     ),
+    "plugin_tick": (
+        "스케줄 클레임 — 플러그인이 자기 토큰으로 \"지금 내 차례인가\" 를 묻는다. "
+        "예정이 지났으면 **한 번만** 준다(복제본이 여럿이어도). "
+        "컨트롤 플레인은 플러그인을 부르러 나가지 않는다.",
+        "service", True,
+    ),
     "platform_diagnostics": ("진단 번들 — 비밀은 마스킹, 프롬프트 본문은 미포함.", "platform_admin", False),
     "platform_notifications": ("알림 채널 현황과 테스트 발송.", "platform_admin", False),
     "metrics": ("Prometheus/OpenMetrics 노출. 테넌트 이름은 라벨에 없다.", "platform_admin", False),

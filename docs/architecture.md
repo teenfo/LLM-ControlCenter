@@ -427,6 +427,7 @@ HTTP (Starlette)                                              main.py · meta.py
 운영        알림 · 메트릭 · 구조화 로그 · 진단 번들            notify.py · observability.py
 플러그인    앞문(`/v1/*`)으로 지나는 소비자. 설치가 곧 서비스     plugins.py
             등록이고 토글은 그 서비스의 `status` 다
+            스케줄은 컨트롤 플레인이 갖고 클레임만 준다        schedule.py
 측정        부하 측정 — 추정치를 설치처의 사실로 바꾼다        loadtest.py
 설치        부트스트랩 · CLI · 백업 스냅샷 · 복원              bootstrap.py · cli.py ·
                                                               backup.py · restore.py ·

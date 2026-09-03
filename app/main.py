@@ -37,6 +37,7 @@ from .auth import (
     ROLE_SERVICE,
     Principal,
     RateLimiter,
+    active_service,
     authenticate,
     bearer_from_header,
     issue_token,
@@ -1761,6 +1762,35 @@ async def platform_plugin_delete(request: Request) -> Response:
     return _ok(request, {"id": plugin_id, "removed": True})
 
 
+async def plugin_tick(request: Request) -> Response:
+    """플러그인이 "지금 내 차례인가" 를 묻는다. **플러그인 자신의 토큰으로.**
+
+    컨트롤 플레인이 플러그인을 부르러 나가지 않는 이유는 `plugins.claim_tick` 에
+    적어 두었다 — 요약하면 `external` 은 "우리가 안 띄운다" 는 뜻이었고, zip 이
+    들고 온 주소로 서버가 연결을 거는 것은 그 전제와 반대 방향이다.
+
+    **`active_service` 를 지나는 것이 핵심이다.** 플러그인을 끄면 이 경로도 401 이
+    된다 — 제출 경로와 **같은 함수**를 지나므로 두 곳이 갈릴 수 없다. 자기 cron 을
+    쓰는 플러그인은 관제 화면에서 꺼도 계속 때린다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    active_service(ctx.store, principal)
+
+    plugin_id = ctx.store.plugin_id_for_service(principal.scope(), principal.service_id)
+    if plugin_id is None:
+        # 플러그인이 아닌 서비스에게 "예정 없음" 이라고 답하면 거짓말이 된다.
+        raise ApiError("not_found", status=404)
+
+    tick = plugin_mod.claim_tick(ctx.store, plugin_id, now=ctx.now)
+    return _ok(request, {
+        "id": plugin_id,
+        "due": tick.due,
+        "scheduled_for": tick.scheduled_for,
+        "next_run_at": tick.next_run_at,
+    })
+
+
 async def platform_diagnostics(request: Request) -> Response:
     """진단 번들.
 
@@ -1894,6 +1924,7 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["POST"], name="platform_plugin_activate"),
         Route(f"{v}/platform/plugins/{{plugin_id}}", platform_plugin_delete,
               methods=["DELETE"], name="platform_plugin_delete"),
+        Route(f"{v}/plugin/tick", plugin_tick, methods=["POST"], name="plugin_tick"),
         Route(f"{v}/platform/diagnostics", platform_diagnostics, name="platform_diagnostics"),
         Route(f"{v}/platform/notifications", platform_notifications,
               methods=["GET", "POST"], name="platform_notifications"),

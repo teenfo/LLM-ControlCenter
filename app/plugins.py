@@ -43,7 +43,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-from .auth import ROLE_SERVICE, issue_token
+from .auth import ROLE_SERVICE, issue_token, service_is_active
+from .schedule import ScheduleError, next_after, parse_cron
 from .store import JobRow, SqliteStore, TenantScope
 
 #: 번들 안에서 이름이 정해진 파일 셋.
@@ -59,6 +60,10 @@ MAX_FILES = 512
 
 #: 지금 지원하는 실행 형태. 늘릴 때는 그 형태의 감독 코드도 같이 온다.
 SUPPORTED_KINDS = ("external",)
+
+#: 지금 지원하는 트리거. `event`(잡 완료·알림)는 아직 없다 — 재귀 방지는 들어와
+#: 있으므로(`may_wake_plugins`) 막혔던 것은 풀렸고, 남은 것은 배관이다.
+SUPPORTED_TRIGGERS = ("schedule",)
 
 #: 역DNS. 점이 하나는 있어야 한다 — 일반 서비스 id(`acme-web`)와 섞이지 않게 한다.
 _ID = re.compile(r"^[a-z0-9]+(?:\.[a-z0-9][a-z0-9_-]*)+$")
@@ -85,6 +90,9 @@ class Manifest:
     allow_roles: tuple[str, ...] = ()
     rate_limit_per_min: int | None = None
     budget_usd_per_month: float | None = None
+    #: 스케줄 트리거. 둘 다 `None` 이면 이 플러그인은 스스로 안 깨어난다.
+    schedule: str | None = None
+    schedule_tz: str = "UTC"
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     def service_fields(self) -> dict[str, Any]:
@@ -99,6 +107,37 @@ class Manifest:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise PluginError(message)
+
+
+def _parse_trigger(trigger: Any) -> tuple[str | None, str]:
+    """`[trigger]` 절. 없으면 스케줄이 없는 것이고, 그것이 기본이다.
+
+    **표현식을 여기서 실제로 계산해 본다.** 형식만 보고 통과시키면 `0 0 30 2 *`
+    (2월 30일)처럼 문법은 맞는데 영원히 안 도는 스케줄이 설치된다. 그 플러그인은
+    켜져 있고 화면에도 보이는데 아무 일도 안 하고, 그 상태를 아무도 못 읽는다.
+    """
+    if trigger is None:
+        return None, "UTC"
+    _require(isinstance(trigger, dict), "[trigger] 절은 표가 아닙니다")
+
+    kind = str(trigger.get("kind", ""))
+    _require(
+        kind in SUPPORTED_TRIGGERS,
+        f"지원하지 않는 트리거입니다: {kind!r} — 지금 되는 것은 {', '.join(SUPPORTED_TRIGGERS)}",
+    )
+    expression = trigger.get("schedule")
+    _require(
+        isinstance(expression, str) and expression.strip(),
+        '[trigger] kind = "schedule" 에는 schedule = "분 시 일 월 요일" 이 있어야 합니다',
+    )
+    timezone = str(trigger.get("timezone", "UTC"))
+
+    try:
+        spec = parse_cron(str(expression))
+        next_after(spec, time.time(), timezone=timezone)
+    except ScheduleError as exc:
+        raise PluginError(f"스케줄을 쓸 수 없습니다: {exc}") from exc
+    return spec.source, timezone
 
 
 def parse_manifest(raw: bytes) -> Manifest:
@@ -169,6 +208,8 @@ def parse_manifest(raw: bytes) -> Manifest:
         "budget_usd_per_month 는 0 이상이어야 합니다",
     )
 
+    schedule, schedule_tz = _parse_trigger(data.get("trigger"))
+
     return Manifest(
         plugin_id=plugin_id,
         name=str(plugin.get("name") or plugin_id),
@@ -180,6 +221,8 @@ def parse_manifest(raw: bytes) -> Manifest:
         allow_roles=tuple(roles),
         rate_limit_per_min=rate,
         budget_usd_per_month=float(budget) if budget is not None else None,
+        schedule=schedule,
+        schedule_tz=schedule_tz,
         raw=data,
     )
 
@@ -520,9 +563,16 @@ def install(
         "last_error": None,
         "installed_by": actor,
         "installed_at": now(),
+        "schedule": manifest.schedule,
+        "schedule_tz": manifest.schedule_tz if manifest.schedule else None,
     })
     # 설치는 켜는 것이 아니다. 모델 설치 요청이 승인과 나뉘어 있는 것과 같다.
+    # 판올림도 같다 — 새 코드는 새 코드이므로 다시 꺼진다.
     store.set_service_status(scope, service_id, "inactive")
+    # **꺼지면 예정도 없다.** 여기서 남겨 두면 판올림 뒤 꺼져 있는 플러그인의
+    # 예정이 살아 있게 되고, `set_active` 가 끌 때 지우는 것과 규칙이 갈린다.
+    # 사람이 다시 켜는 순간 그때부터 다시 잡힌다.
+    store.set_plugin_next_run(manifest.plugin_id, None)
     store.audit(
         actor, "install_plugin", target=manifest.plugin_id,
         detail={"version": manifest.version, "signature": state, "service": service_id},
@@ -537,7 +587,23 @@ def install(
     )
 
 
-def set_active(store: SqliteStore, plugin_id: str, active: bool, *, actor: str) -> bool:
+def _next_run(expression: str, timezone: str | None, after: float) -> float | None:
+    """다음 예정. **못 계산하면 예정을 없앤다** — 틀린 예정보다 없는 예정이 낫다.
+
+    설치 때 한 번 계산해 봤으므로 여기서 실패하는 것은 그 사이에 시간대 데이터가
+    바뀐 것 같은 경우다. 예외를 올려 보내면 켜는 것 자체가 실패하는데, 그러면
+    스케줄 하나 때문에 플러그인 전체를 못 쓴다.
+    """
+    try:
+        return next_after(parse_cron(expression), after, timezone=timezone or "UTC")
+    except ScheduleError:
+        return None
+
+
+def set_active(
+    store: SqliteStore, plugin_id: str, active: bool, *, actor: str,
+    now: Callable[[], float] = time.time,
+) -> bool:
     """플러그인을 켜고 끈다 — **실체는 그 서비스의 status 다.**
 
     별도 플래그를 두지 않으므로 여기서 상태가 갈릴 여지가 없다.
@@ -548,6 +614,15 @@ def set_active(store: SqliteStore, plugin_id: str, active: bool, *, actor: str) 
     store.set_service_status(
         TenantScope(row["tenant_id"]), row["service_id"], "active" if active else "inactive"
     )
+    # **예정은 켤 때 지금부터 다시 잡는다.** 끄면 지운다.
+    #
+    # 껐다 켜는 사이에 지난 예정을 그대로 두면, 켜자마자 한 번 돈다 — 사흘 꺼 뒀다
+    # 켠 사람이 원한 것은 사흘치도 즉시 실행도 아니고 "다음 예정부터" 다.
+    if row["schedule"]:
+        store.set_plugin_next_run(
+            plugin_id,
+            _next_run(row["schedule"], row["schedule_tz"], now()) if active else None,
+        )
     store.audit(
         actor, "activate_plugin" if active else "deactivate_plugin", target=plugin_id,
     )
@@ -568,6 +643,74 @@ def uninstall(store: SqliteStore, plugin_id: str, *, actor: str, data_dir: Path)
     shutil.rmtree(plugin_root(data_dir) / plugin_id, ignore_errors=True)
     store.audit(actor, "uninstall_plugin", target=plugin_id)
     return True
+
+
+# ── 스케줄 클레임 ────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Tick:
+    """"지금 내 차례인가" 에 대한 답."""
+
+    due: bool
+    #: 가져갔을 때, 그 실행이 **예정돼 있던** 시각. 지금이 아니다 — 플러그인이
+    #: 얼마나 늦게 왔는지 알아야 "어제 것" 인지 "오늘 것" 인지 판단할 수 있다.
+    scheduled_for: float | None = None
+    #: 다음 예정. `due` 든 아니든 알려 준다 — 플러그인이 폴링 간격을 정할 근거다.
+    next_run_at: float | None = None
+
+
+def claim_tick(
+    store: SqliteStore, plugin_id: str, *, now: Callable[[], float] = time.time
+) -> Tick:
+    """플러그인이 "내 차례인가" 를 물으면 여기서 답한다.
+
+    ### 왜 컨트롤 플레인이 플러그인을 부르지 않는가 (풀, 푸시 아님)
+
+    `external` 은 **컨트롤 플레인이 프로세스를 안 띄운다**는 뜻이었다. 예정 시각에
+    컨트롤 플레인이 플러그인의 `endpoint` 로 연결을 걸면 그 전제가 깨진다 — 그
+    주소는 zip 파일이 들고 온 것이고, 그 주소로 서버가 연결을 거는 것은
+    **플러그인이 스스로에게 준 권한**이다. `allow_roles` 나 예산처럼 플러그인이
+    받아들이는 제약과는 방향이 반대다. (`notify` 의 웹훅 주소는 운영자가 `config/`
+    에 직접 적은 것이라 출처가 다르다.)
+
+    그래서 나가는 연결이 하나도 없다. 플러그인은 LLM 을 쓸 때도, "내 차례인가" 를
+    물을 때도 같은 앞문으로 온다.
+
+    ### 그러면 플러그인이 자기 cron 을 쓰는 것과 뭐가 다른가
+
+    - **복제본이 셋이어도 한 번 돈다** — 클레임이 CAS 라서(`claim_plugin_tick`)
+    - **끄면 선다** — 이 경로도 `auth.active_service` 를 지난다. 자기 cron 은
+      관제 화면에서 꺼도 계속 때린다
+    - **스케줄이 번들에 실려 서명된다** — 별도로 배선하는 것이 아니다
+    - **안 돌고 있는 것이 보인다** — `last_run_at` 이 비어 있는 것으로
+
+    ### 밀린 것을 몰아 돌리지 않는다
+
+    다음 예정은 **지금 기준**으로 다시 잡는다. 사흘 꺼져 있었다면 사흘치가 아니라
+    한 번 돌고 끝이다. `scheduled_for` 로 얼마나 늦었는지는 알려 주므로, 밀린 것을
+    따라잡을지는 플러그인이 정한다 — 컨트롤 플레인이 정할 일이 아니다.
+    """
+    row = store.get_plugin(plugin_id)
+    if row is None or not row["schedule"]:
+        return Tick(due=False)
+
+    moment = now()
+    scheduled_for = row["next_run_at"]
+    if scheduled_for is None or scheduled_for > moment:
+        return Tick(due=False, next_run_at=scheduled_for)
+
+    following = _next_run(row["schedule"], row["schedule_tz"], moment)
+    if following is None:
+        # 다음을 못 잡으면 이번도 안 준다. 예정을 비운 채로 주면 그 뒤로 영영
+        # 안 돌면서 "한 번은 돌았다" 는 기록만 남는다.
+        store.set_plugin_error(plugin_id, f"스케줄을 계산할 수 없습니다: {row['schedule']}")
+        return Tick(due=False)
+
+    if not store.claim_plugin_tick(plugin_id, now=moment, next_run_at=following):
+        # 다른 복제본이 먼저 가져갔다. 진 쪽은 그냥 아니라고 듣는다.
+        return Tick(due=False, next_run_at=store.get_plugin(plugin_id)["next_run_at"])
+    return Tick(due=True, scheduled_for=scheduled_for, next_run_at=following)
 
 
 # ── 재귀 방지 ────────────────────────────────────────────────────────────────
@@ -637,12 +780,18 @@ def snapshot(store: SqliteStore, *, data_dir: Path) -> list[dict[str, Any]]:
             "service_id": row["service_id"],
             "signature": row["signature_state"],
             # 활성 여부의 유일한 출처는 서비스다.
-            "active": bool(service is not None and service["status"] == "active"),
+            "active": service_is_active(service),
             "allow_roles": json.loads(service["allow_roles_json"]) if service else [],
             "files_present": path.is_dir(),
             # 이 플러그인이 만든 잡 수. **출처 칸을 사람이 볼 수 있게 하는 창이다** —
             # 쓰기만 하고 아무도 안 읽는 칸은 언젠가 틀린 채로 방치된다.
             "jobs_created": counts[row["tenant_id"]].get(row["id"], 0),
+            # 스케줄. **안 돌고 있는 것이 보여야 한다** — 켜 두고 `last_run_at` 이
+            # 비어 있으면 그것이 진단이다.
+            "schedule": row["schedule"],
+            "schedule_tz": row["schedule_tz"],
+            "next_run_at": row["next_run_at"],
+            "last_run_at": row["last_run_at"],
             "last_error": row["last_error"],
             "installed_at": row["installed_at"],
         })

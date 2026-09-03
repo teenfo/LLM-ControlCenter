@@ -342,3 +342,24 @@ def test_only_one_place_decides_what_the_origin_means(path):
     assert "origin_plugin" not in source, (
         f"{path.name} 이 출처를 직접 해석한다 — plugins.may_wake_plugins 를 쓸 것"
     )
+
+
+@pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
+def test_only_one_place_decides_whether_a_service_is_switched_on(path):
+    """**꺼진 서비스를 거르는 판정은 `auth.active_service` 하나다.**
+
+    플러그인 토글의 실체가 `services.status` 라서, 이 판정이 두 곳에 있으면 그
+    둘은 반드시 어긋나고 그때 "껐는데 왜 도느냐" 가 된다. 실제로 그렇게 될 뻔했다 —
+    스케줄 클레임(`/v1/plugin/tick`)은 제출 경로를 안 지나므로, 각자 상태를 읽었으면
+    "제출은 막히는데 스케줄은 도는" 플러그인이 생겼다.
+
+    `tenant["status"]` 는 대상이 아니다. 테넌트 판정은 `authenticate` 안에 있고
+    토글과 무관하다 — 한 검사에 둘을 섞으면 어느 쪽이 깨졌는지 못 읽는다.
+    """
+    if path.name == "auth.py":
+        return
+    source = path.read_text(encoding="utf-8")
+    for pattern in ('service["status"]', "service.get(\"status\")"):
+        assert pattern not in source, (
+            f"{path.name} 이 서비스 상태를 직접 판정한다 — auth.active_service 를 쓸 것"
+        )

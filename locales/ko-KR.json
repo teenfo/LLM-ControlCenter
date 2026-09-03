@@ -176,6 +176,8 @@
   "ui.plugin_inactive": "꺼짐",
   "ui.plugin_signature": "서명",
   "ui.plugin_jobs": "만든 잡",
+  "ui.plugin_schedule": "스케줄",
+  "ui.plugin_never_ran": "아직 안 돎",
   "ui.plugin_token_once": "이 토큰은 지금 한 번만 보입니다. 플러그인 설정에 넣으세요",
   "ui.plugin_installed_inactive": "설치됐습니다. 켜는 것은 별도 결정입니다",
   "ui.plugin_no_trust_key": "신뢰 키가 없습니다 — 서명된 번들을 설치할 수 없습니다",

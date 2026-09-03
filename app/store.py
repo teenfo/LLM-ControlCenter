@@ -300,7 +300,17 @@ CREATE TABLE IF NOT EXISTS plugins (
     signature_state TEXT NOT NULL,          -- signed | unsigned | invalid
     last_error      TEXT,
     installed_by    TEXT,
-    installed_at    REAL NOT NULL
+    installed_at    REAL NOT NULL,
+
+    -- 스케줄 트리거. NULL 이면 이 플러그인은 스스로 안 깨어난다.
+    --
+    -- 예정이 **한 칸뿐인 이유**는 밀린 것을 몰아 돌리지 않기 때문이다. 사흘
+    -- 꺼져 있다 켜면 사흘치가 아니라 한 번 돈다 — 큐로 두면 그 사흘치가 한꺼번에
+    -- 나가고, 예정 시각을 지나서 켠 사람이 원한 것은 그게 아니다.
+    schedule        TEXT,                   -- 다섯 칸 cron. 매니페스트가 준 그대로
+    schedule_tz     TEXT,                   -- IANA 이름. "아침 8시" 는 그 나라의 8시다
+    next_run_at     REAL,                   -- 다음 예정. 클레임이 CAS 로 미룬다
+    last_run_at     REAL                    -- 마지막으로 가져간 시각. 안 돌면 여기가 비어 있다
 );
 CREATE INDEX IF NOT EXISTS idx_plugins_service ON plugins(tenant_id, service_id);
 
@@ -662,6 +672,12 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 잡을 만든 플러그인. 옛 행은 NULL 로 남고 그것이 맞다 — 플러그인이 없던
     # 시절의 잡은 전부 사람이 만든 것이다.
     ("jobs", "origin_plugin", "TEXT"),
+    # 스케줄 트리거. 이전에 설치한 플러그인은 NULL 이고 그것이 맞다 — 선언하지
+    # 않은 스케줄을 업그레이드가 만들어 주면 안 된다.
+    ("plugins", "schedule", "TEXT"),
+    ("plugins", "schedule_tz", "TEXT"),
+    ("plugins", "next_run_at", "REAL"),
+    ("plugins", "last_run_at", "REAL"),
 )
 
 #: 컬럼이 생긴 **뒤에** 만들어야 하는 인덱스. `_SCHEMA` 에 두면 옛 DB 에서
@@ -2171,15 +2187,21 @@ class SqliteStore:
         """설치된 플러그인을 기록한다. 같은 id 의 재설치는 덮어쓴다(업그레이드)."""
         self._conn.execute(
             "INSERT INTO plugins(id, version, name, kind, tenant_id, service_id, endpoint, "
-            "manifest_json, bundle_sha256, signature_state, last_error, installed_by, installed_at) "
+            "manifest_json, bundle_sha256, signature_state, last_error, installed_by, installed_at, "
+            "schedule, schedule_tz) "
             "VALUES(:id, :version, :name, :kind, :tenant_id, :service_id, :endpoint, "
-            ":manifest_json, :bundle_sha256, :signature_state, :last_error, :installed_by, :installed_at) "
+            ":manifest_json, :bundle_sha256, :signature_state, :last_error, :installed_by, :installed_at, "
+            ":schedule, :schedule_tz) "
             "ON CONFLICT(id) DO UPDATE SET "
             "version=excluded.version, name=excluded.name, kind=excluded.kind, "
             "endpoint=excluded.endpoint, manifest_json=excluded.manifest_json, "
             "bundle_sha256=excluded.bundle_sha256, signature_state=excluded.signature_state, "
             "last_error=excluded.last_error, installed_by=excluded.installed_by, "
-            "installed_at=excluded.installed_at",
+            "installed_at=excluded.installed_at, "
+            # 판올림이 스케줄을 바꿀 수 있다 — 그것이 새 버전이 가져오는 것이다.
+            # 다만 **예정과 이력(`next_run_at`·`last_run_at`)은 안 건드린다.**
+            # 여기서 덮으면 판올림이 예정을 지우고, 지워진 예정은 다시 안 온다.
+            "schedule=excluded.schedule, schedule_tz=excluded.schedule_tz",
             dict(row),
         )
         self._conn.commit()
@@ -2203,6 +2225,31 @@ class SqliteStore:
         cur = self._conn.execute("DELETE FROM plugins WHERE id = ?", (plugin_id,))
         self._conn.commit()
         return cur.rowcount > 0
+
+    def set_plugin_next_run(self, plugin_id: str, next_run_at: float | None) -> None:
+        """다음 예정을 정한다. 켤 때·끌 때·설치할 때 부른다."""
+        self._conn.execute(
+            "UPDATE plugins SET next_run_at = ? WHERE id = ?", (next_run_at, plugin_id)
+        )
+        self._conn.commit()
+
+    def claim_plugin_tick(
+        self, plugin_id: str, *, now: float, next_run_at: float
+    ) -> bool:
+        """예정 시각이 지났으면 **한 번만** 가져간다. 가져갔으면 True.
+
+        **CAS 다.** 플러그인이 복제본 셋으로 돌면 셋이 동시에 물어보는데, 조회하고
+        나서 갱신하면 셋 다 "내 차례다" 를 받는다. `next_run_at <= ?` 를 UPDATE 의
+        조건에 넣어 두면 이긴 하나만 rowcount 1 을 받는다 — `node_leases` 와 잡
+        디스패치가 쓰는 것과 같은 패턴이다.
+        """
+        with self._tx():
+            cursor = self._conn.execute(
+                "UPDATE plugins SET last_run_at = ?, next_run_at = ? "
+                "WHERE id = ? AND next_run_at IS NOT NULL AND next_run_at <= ?",
+                (now, next_run_at, plugin_id, now),
+            )
+        return cursor.rowcount > 0
 
     def plugin_id_for_service(self, scope: TenantScope, service_id: str) -> str | None:
         """이 서비스가 플러그인의 것인가. 맞으면 그 플러그인 id.
