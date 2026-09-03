@@ -1,0 +1,65 @@
+[project]
+name = "llm-controlcenter"
+version = "0.1.0"
+description = "설치형 LLM 클러스터 관제 솔루션 — 다중 백엔드 라우팅·테넌시·프롬프트 거버넌스"
+requires-python = ">=3.11"
+
+# 의존성을 얇게 유지하는 것이 이 시스템의 이식성을 만든다.
+# cryptography 는 5번째로 의식적으로 추가했다 — 암호를 직접 구현하는 쪽이 훨씬 나쁘다.
+dependencies = [
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+    "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+# 클라우드 프로바이더는 선택적이다. 로컬 노드만 쓰는 설치처가 클라우드 SDK 를
+# 강제로 받을 이유가 없고, 에어갭 설치에서는 아예 설치되지 않는다.
+anthropic = ["anthropic>=0.40"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# **번들 자산을 휠에 담는다.**
+#
+# `include = ["app*"]` 만 두면 `config`·`locales`·`static`·`clients` 가 배포물에서
+# 빠진다. 그러면 `pip install .` 로 설치한 것은 **기동조차 못 한다** — 실측으로
+# `설정 파일이 없다: .../site-packages/config/nodes.yaml` 로 죽었다.
+# `-e` 설치와 도커 WORKDIR 에서만 도는 패키징은 그 둘을 벗어나는 순간 깨진다.
+#
+# 저장소 배치는 그대로 두고 **설치될 때만** 패키지 아래로 들어가게 매핑한다.
+# 디렉터리를 옮기면 컴포즈의 `./config:/app/config:ro` 마운트와 문서가 전부 어긋난다.
+[tool.setuptools]
+packages = [
+    "app",
+    "app.providers",
+    "app.bundled_config",
+    "app.bundled_locales",
+    "app.bundled_static",
+    "app.bundled_clients",
+]
+
+[tool.setuptools.package-dir]
+"app.bundled_config" = "config"
+"app.bundled_locales" = "locales"
+"app.bundled_static" = "static"
+"app.bundled_clients" = "clients"
+
+[tool.setuptools.package-data]
+"app.bundled_config" = ["*.yaml", "*.yml"]
+"app.bundled_locales" = ["*.json"]
+"app.bundled_static" = ["*.html", "*.js", "*.css"]
+"app.bundled_clients" = ["*.py", "*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 설치 없이도 `pytest -q` 한 줄로 돌아야 한다 — 검증 절차에 PYTHONPATH 설정이
+# 끼면 설치처에서 그 한 줄이 먼저 실패한다.
+pythonpath = ["."]
+asyncio_mode = "auto"
+filterwarnings = ["error::DeprecationWarning"]

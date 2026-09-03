@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<!--
+  관제 UI.
+
+  **외부 CDN 을 쓰지 않는다.** 에어갭 설치에서 화면이 깨지고, 인터넷이 있는
+  설치에서도 남의 사이트 개편에 우리 UI 가 끌려 죽는다. 프레임워크도 없다 —
+  의존성 5개를 이식성의 근거로 삼은 제품이 프런트에서 그것을 버릴 이유가 없다.
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM ControlCenter</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <noscript>이 관제 화면은 자바스크립트가 필요합니다.</noscript>
+
+  <!-- 접속 -->
+  <section id="login" hidden>
+    <form id="login-form">
+      <h1 data-t="ui.sign_in">LLM ControlCenter</h1>
+      <label for="token" data-t="ui.token">토큰</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" required>
+      <p class="hint" data-t="ui.token_hint">부트스트랩이 1회 표시한 토큰을 붙여 넣으세요.</p>
+      <button type="submit" data-t="ui.connect">접속</button>
+      <p id="login-error" class="error" role="alert" hidden></p>
+    </form>
+  </section>
+
+  <!-- 관제 -->
+  <div id="shell" hidden>
+    <header>
+      <strong data-t="ui.title">LLM ControlCenter</strong>
+      <span id="who" class="muted"></span>
+      <span class="grow"></span>
+      <span id="version" class="muted"></span>
+      <button id="refresh" data-t="ui.refresh"></button>
+      <button id="logout" data-t="ui.disconnect"></button>
+    </header>
+
+    <div id="banners" role="status"></div>
+    <nav id="tabs"></nav>
+    <main id="view" aria-live="polite"></main>
+    <p id="error" class="error" role="alert" hidden></p>
+  </div>
+
+  <script src="app.js?v=__VERSION__"></script>
+</body>
+</html>

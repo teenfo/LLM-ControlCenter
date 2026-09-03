@@ -1,0 +1,482 @@
+"""관제 UI — 정적 자산 · `/v1/session` · UI 가 의존하는 계약.
+
+UI 자체는 브라우저에서 돌지만, **깨지는 지점은 대부분 서버 쪽 계약이다** —
+문자열 키가 사라지거나, 세션이 역할을 안 알려주거나, 화면이 쓰는 필드가
+이름을 바꾸거나. 그것들을 여기서 못박는다.
+
+그리고 두 가지 규칙을 파일 자체에 대해 검사한다:
+**외부 CDN 을 안 쓴다**(에어갭에서 깨진다) · **`innerHTML` 로 서버 데이터를 안 꽂는다**.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+from tests.conftest import auth, seed_tenant
+
+STATIC = Path(__file__).resolve().parent.parent / "static"
+LOCALES = Path(__file__).resolve().parent.parent / "locales"
+
+
+# ── 정적 자산 ────────────────────────────────────────────────────────────────
+
+
+def test_the_ui_is_served_without_a_build_step():
+    for name in ("index.html", "app.js", "style.css"):
+        assert (STATIC / name).is_file(), name
+
+
+def test_ui_is_mounted(client):
+    response = client.get("/ui/")
+    assert response.status_code == 200
+    assert "LLM ControlCenter" in response.text
+
+
+@pytest.mark.parametrize("name", ["index.html", "app.js", "style.css"])
+def test_no_external_assets(name):
+    """**에어갭에서 화면이 깨지고, 인터넷이 있어도 남의 사이트 개편에 끌려 죽는다.**"""
+    text = (STATIC / name).read_text(encoding="utf-8")
+    for pattern in ("http://", "https://", "//cdn.", "unpkg", "jsdelivr", "googleapis"):
+        assert pattern not in text, f"{name} 이 외부 자산을 참조한다: {pattern}"
+
+
+def test_no_framework_bundle():
+    """의존성 5개를 이식성의 근거로 삼은 제품이 프런트에서 그것을 버릴 이유가 없다."""
+    code = strip_comments((STATIC / "app.js").read_text(encoding="utf-8"))
+    for marker in ("require(", "import ", "React", "Vue.", "angular"):
+        assert marker not in code, marker
+
+
+def strip_comments(source: str) -> str:
+    """주석을 뺀 코드. 주석에 적어 둔 금지어가 검사에 걸리면 안 된다."""
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    return re.sub(r"(?m)^\s*//.*$|\s//.*$", "", source)
+
+
+def test_server_data_is_never_written_as_html():
+    """`innerHTML` 로 서버 데이터를 꽂으면 테넌트 이름 하나로 XSS 가 열린다."""
+    code = strip_comments((STATIC / "app.js").read_text(encoding="utf-8"))
+    assert "innerHTML" not in code
+    assert "outerHTML" not in code
+    assert "document.write" not in code
+    assert "insertAdjacentHTML" not in code
+
+
+def test_the_token_is_kept_in_session_storage_only():
+    """공용 PC 에 토큰이 남지 않게 — 탭을 닫으면 지워져야 한다."""
+    code = strip_comments((STATIC / "app.js").read_text(encoding="utf-8"))
+    assert "sessionStorage" in code
+    assert "localStorage" not in code
+
+
+def test_the_ui_only_opens_the_raw_prompt_one_job_at_a_time():
+    """화면은 마스킹본만 본다. 원문은 **단건 API + 감사**다."""
+    code = strip_comments((STATIC / "app.js").read_text(encoding="utf-8"))
+    assert "/raw'" in code, "단건 원문 경로를 안 쓴다"
+    # 목록에 원문을 실어 달라고 부르는 코드가 없어야 한다.
+    assert "/admin/jobs/raw" not in code
+    assert "raw=1" not in code and "include_raw" not in code
+    # 열기 전에 사람이 한 번 확인한다 — 감사에 남는 행위이기 때문이다.
+    assert "confirm(t('ui.raw_audited'))" in code
+
+
+# ── 문자열 카탈로그 ──────────────────────────────────────────────────────────
+
+
+def ui_keys_used() -> set[str]:
+    """화면이 실제로 쓰는 키.
+
+    **키를 문자열로 조립하면 여기서 못 잡는다** — 그래서 UI 쪽에서 조립을 금지하고
+    조회표(`BOUNDARY_LABEL` 등)로 쓰며, 아래 검사가 조립 흔적을 잡아낸다.
+    """
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert not re.search(r"['\"]ui\.[a-z0-9_]*['\"]\s*\+", js), "번역 키를 조립하고 있다"
+    return set(re.findall(r"['\"](ui\.[a-z0-9_]+)['\"]", js + html))
+
+
+def test_every_ui_string_the_screen_uses_exists_in_every_locale():
+    """**키를 추가하고 번역을 안 달면 화면에 키 문자열이 그대로 뜬다.**"""
+    used = ui_keys_used()
+    assert len(used) > 30, "UI 문자열을 못 찾았다 — 추출 정규식을 확인할 것"
+
+    for path in LOCALES.glob("*.json"):
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+        missing = sorted(used - set(catalog))
+        assert not missing, f"{path.name} 에 없는 키: {missing}"
+
+
+def test_locale_catalogs_stay_in_parity():
+    catalogs = {
+        path.name: set(json.loads(path.read_text(encoding="utf-8")))
+        for path in LOCALES.glob("*.json")
+    }
+    reference = next(iter(catalogs.values()))
+    for name, keys in catalogs.items():
+        assert keys == reference, f"{name} 의 키가 다르다: {sorted(keys ^ reference)}"
+
+
+def test_no_dead_ui_strings():
+    """반대 방향도 본다 — 화면에서 안 쓰는 문자열이 카탈로그에 쌓이면 번역 비용만 는다."""
+    catalog = json.loads((LOCALES / "ko-KR.json").read_text(encoding="utf-8"))
+    declared = {k for k in catalog if k.startswith("ui.")}
+    assert not sorted(declared - ui_keys_used())
+
+
+# ── /v1/session ──────────────────────────────────────────────────────────────
+
+
+def test_session_tells_the_ui_its_role_and_strings(client, acme):
+    body = client.get("/v1/session", headers=auth(acme["tenant_admin"])).json()
+    assert body["is_tenant_admin"] is True
+    assert body["is_platform_admin"] is False
+    assert body["tenant"]["id"] == "acme"
+    assert body["strings"]["ui.nodes"] == "노드"
+
+
+def test_session_follows_the_requested_locale(client, acme):
+    en = client.get(
+        "/v1/session", headers={**auth(acme["tenant_admin"]), "Accept-Language": "en-US"}
+    ).json()
+    assert en["locale"] == "en-US"
+    assert en["strings"]["ui.nodes"] == "Nodes"
+
+
+def test_session_falls_back_to_the_tenant_locale(client, globex):
+    body = client.get("/v1/session", headers=auth(globex["tenant_admin"])).json()
+    assert body["locale"] == "en-US"
+
+
+def test_session_reports_the_conditions_the_ui_must_show(harness, client, acme):
+    """**조용한 실패를 시끄럽게 만드는 것이 관제 UI 의 일이다.**"""
+    body = client.get("/v1/session", headers=auth(acme["service"])).json()
+    assert body["guard_locale_pack"] == "ko_KR"
+    assert body["raw_prompt_storage"] is True
+    assert "guard_classifier_ready" in body
+    assert body["airgap"] is False
+
+
+def test_session_flags_a_missing_locale_pack(harness, client):
+    """팩이 없으면 그 나라 PII 는 안 잡힌다. UI 가 상시 표시할 근거를 준다."""
+    tokens = seed_tenant(harness, "nordic", locale="en-US")
+    body = client.get("/v1/session", headers=auth(tokens["service"])).json()
+    assert body["guard_locale_pack"] == "en_US"
+
+
+def test_session_never_returns_the_token(client, acme):
+    body = client.get("/v1/session", headers=auth(acme["service"])).text
+    assert acme["service"] not in body
+
+
+def test_session_needs_auth(client):
+    assert client.get("/v1/session").status_code == 401
+
+
+def test_session_carries_only_the_negotiated_locale(client, acme):
+    """전체 카탈로그를 보내면 쓰지도 않을 번역이 매 요청마다 따라다닌다."""
+    body = client.get(
+        "/v1/session", headers={**auth(acme["service"]), "Accept-Language": "ko-KR"}
+    ).json()
+    assert body["strings"]["ui.nodes"] == "노드"
+    assert "Nodes" not in json.dumps(body["strings"], ensure_ascii=False)
+
+
+# ── UI 가 의존하는 응답 필드 ─────────────────────────────────────────────────
+
+
+def test_platform_overview_has_the_fields_the_first_class_cards_read(client, acme):
+    body = client.get("/v1/platform/overview", headers=auth(acme["platform_admin"])).json()
+    for key in ("single_homed_roles", "waiting_by_reason", "lanes", "nodes",
+                "usage_by_tenant", "model_requests_pending", "tenants"):
+        assert key in body, key
+
+
+def test_node_grid_carries_the_boundary_badge(client, acme):
+    """`provider: ollama` 가 로컬이라는 뜻이 아니다 — 배지는 경계를 보여줘야 한다."""
+    body = client.get("/v1/platform/nodes", headers=auth(acme["platform_admin"])).json()
+    for node in body["nodes"]:
+        assert node["data_boundary"] in ("internal", "external")
+        assert {"status", "running", "max_concurrent", "metered"} <= set(node)
+
+
+def test_guard_view_shows_the_effective_merged_rules(client, acme):
+    """화면이 보여줘야 하는 것은 베이스라인도 테넌트 규칙도 아니라 **적용된 값**이다."""
+    body = client.get("/v1/admin/guard/rules", headers=auth(acme["tenant_admin"])).json()
+    assert body["effective"]
+    for rule in body["effective"]:
+        assert set(rule["action"]) == {"internal", "external"}
+
+
+def test_usage_view_axes_match_what_the_selector_offers(client, acme):
+    """UI 셀렉터에 있는 축이 서버에서 거절되면 화면이 빈다."""
+    text = (STATIC / "app.js").read_text(encoding="utf-8")
+    offered = re.search(r"\[([^\]]*'service_id'[^\]]*)\]", text).group(1)
+    axes = re.findall(r"'([a-z_]+)'", offered)
+    assert "service_id" in axes
+
+    for axis in axes:
+        response = client.get(
+            f"/v1/admin/usage?by={axis}", headers=auth(acme["tenant_admin"])
+        )
+        assert response.status_code == 200, axis
+
+
+def test_job_list_gives_the_ui_a_raw_availability_flag(harness, client, acme):
+    """버튼을 띄울지 말지를 화면이 추측하면 안 된다."""
+    client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    body = client.get("/v1/admin/jobs", headers=auth(acme["tenant_admin"])).json()
+    assert body["jobs"][0]["has_raw"] is True
+    assert "prompt_cipher" not in body["jobs"][0]
+
+
+def test_settings_view_can_tell_a_capped_value_from_an_applied_one(client, acme):
+    client.put(
+        "/v1/admin/settings", json={"raw_prompt_retention_days": 999},
+        headers=auth(acme["tenant_admin"]),
+    )
+    body = client.get("/v1/admin/settings", headers=auth(acme["tenant_admin"])).json()
+    assert body["raw_prompt_retention_days_requested"] == 999
+    assert body["raw_prompt_retention_days"] < 999
+
+
+# ── 감사 M23 — 로그인 화면이 항상 원시 i18n 키를 표시한다 ───────────────────
+
+
+def test_static_strings_do_not_overwrite_the_fallback_when_empty():
+    """**모든 설치의 첫 화면이 `"ui.sign_in"` 으로 깨져 보였다.**
+
+    `t()` 는 없는 키를 키 자체로 돌려주는데(누락이 화면을 멈추게 하지 않는다),
+    로그인 전에는 카탈로그가 통째로 비어 있다 — 세션 API 로 받아오기 때문이다.
+    그래서 `applyStaticStrings()` 가 index.html 의 폴백 텍스트를 키 리터럴로
+    덮어썼다.
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    body = source[source.index("function applyStaticStrings"):]
+    body = body[:body.index("\n}")]
+
+    assert "t(node.dataset.t)" not in body, "카탈로그가 비어도 폴백을 덮어쓴다"
+    assert "if (text)" in body, "빈 값을 거르지 않는다"
+
+
+def test_the_login_screen_has_real_fallback_text():
+    """폴백이 없으면 위 수정이 화면을 비워 버린다 — 둘은 한 벌이다."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    login = html[html.index('id="login"'):]
+    login = login[:login.index("</section>")] if "</section>" in login else login
+
+    labelled = re.findall(r'data-t="([^"]+)"[^>]*>([^<]*)<', login)
+    assert labelled, "로그인 화면에 data-t 요소가 없다"
+    for key, text in labelled:
+        assert text.strip(), f"{key} 에 폴백 텍스트가 없다"
+        assert text.strip() != key, f"{key} 의 폴백이 키 자체다"
+
+
+# ── 감사 M28 — 모델 화면이 서버의 `missing` 목록을 안 그린다 ────────────────
+
+
+def test_the_models_view_renders_what_is_missing():
+    """`역할이 요구하는데 어느 노드에도 없는 모델` 을 서버가 주는데 안 그렸다.
+
+    그 잡들은 레인을 막지 않고 조용히 대기하므로(§13-6), 화면에 안 보이면
+    관리자는 왜 그 역할만 안 도는지 알 방법이 없다.
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    view = source[source.index("async function renderModels"):]
+    view = view[:view.index("\nasync function ")]
+
+    assert "m.missing" in view, "missing 목록을 읽지 않는다"
+    assert "ui.missing_models" in view, "missing 을 카드로 그리지 않는다"
+
+
+def test_the_missing_list_offers_the_action_that_fixes_it():
+    """보여주기만 하고 고칠 방법을 안 주면 화면을 한 번 더 옮겨 다녀야 한다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "async function requestInstall" in source
+    assert "ui.request_install" in source
+
+
+def test_the_missing_model_endpoint_actually_returns_it(harness, client, acme):
+    """화면을 고쳤는데 서버가 안 주면 소용없다 — 양쪽을 함께 못박는다."""
+    # 노드는 살아 있고 인벤토리도 받았는데 **역할이 요구하는 모델만 없다.**
+    # 인벤토리가 비어 있으면(프로브 전) 모른다는 이유로 요청하지 않으므로,
+    # 그 상태로는 이 경로를 못 지난다.
+    for state in harness.cluster.nodes.values():
+        state.models = frozenset({"전혀-다른-모델"})
+
+    body = client.get(
+        "/v1/platform/models", headers=auth(acme["platform_admin"])
+    ).json()
+    assert body["missing"], "역할이 요구하는 모델이 없는데 missing 이 비어 있다"
+    assert {"node", "model"} <= set(body["missing"][0])
+
+
+def test_a_pending_install_is_reachable_from_the_screen(harness, client, acme):
+    """**개요가 "승인 대기 N" 이라고 말하면, 화면에서 그 요청에 닿을 수 있어야 한다.**
+
+    닿을 수 없었다. 모델 API 가 `requests` 라는 이름으로 **재고**(설치된 것)를 주는데
+    화면은 그것을 **요청**(설치하려는 것)으로 그렸다. 재고 행에는 `status` 도
+    `progress` 도 `id` 도 없으므로 상태 칸에 `undefined` 가 뜨고, 승인 버튼은
+    `status === 'pending'` 일 때만 나오니 **영원히 안 나온다.** 개요에는 "승인 대기 1"
+    이 떠 있는데 모델 화면에서는 그 요청이 존재하지도 않았다.
+
+    실제 화면을 브라우저로 띄워 `undefined` 를 보고서야 알았다.
+    """
+    for state in harness.cluster.nodes.values():
+        state.models = frozenset({"전혀-다른-모델"})
+
+    body = client.get("/v1/platform/models", headers=auth(acme["platform_admin"])).json()
+
+    assert body["pending"] > 0, "이 상황이면 승인 대기가 있어야 테스트가 성립한다"
+    assert body["install_requests"], "승인 대기가 있는데 요청 목록이 비어 있다"
+
+    request = body["install_requests"][0]
+    # 승인 버튼이 필요로 하는 것 전부. 하나라도 없으면 버튼이 안 나오거나 안 먹는다.
+    assert {"id", "node", "model", "status", "progress"} <= set(request)
+    assert request["id"], "승인은 id 로 한다 — 없으면 버튼이 아무 데도 못 보낸다"
+
+    approved = client.post(
+        f"/v1/platform/models/{request['id']}/approve",
+        json={}, headers=auth(acme["platform_admin"]),
+    )
+    assert approved.status_code == 200, approved.text
+
+
+def test_inventory_and_requests_are_not_the_same_list(harness, client, acme):
+    """재고와 요청을 한 칸에 담으면 다시 섞인다. **이름을 갈라 둔다.**"""
+    body = client.get("/v1/platform/models", headers=auth(acme["platform_admin"])).json()
+    assert "inventory" in body and "install_requests" in body
+    assert "requests" not in body, "옛 이름이 남아 있으면 어느 쪽인지 다시 헷갈린다"
+
+
+def test_the_missing_list_does_not_repeat_a_node_and_model(harness, client, acme):
+    """역할 둘이 같은 노드의 같은 모델을 가리키면 같은 행이 두 번 나왔다.
+
+    관리자는 설치가 두 건 필요한 줄로 읽는다.
+    """
+    for state in harness.cluster.nodes.values():
+        state.models = frozenset({"전혀-다른-모델"})
+
+    missing = client.get(
+        "/v1/platform/models", headers=auth(acme["platform_admin"])
+    ).json()["missing"]
+    pairs = [(m["node"], m["model"]) for m in missing]
+    assert len(pairs) == len(set(pairs)), f"중복된 행: {pairs}"
+
+
+# ── 감사 LOW — 자원·UI ──────────────────────────────────────────────────────
+
+
+def test_the_script_reference_carries_a_version():
+    """**업그레이드 후 브라우저가 캐시한 옛 JS 를 새 API 에 대고 돈다.**
+
+    증상은 "일부 화면만 이상하다" 로 나타나서 원인을 찾기 어렵다.
+    """
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert "app.js?v=" in html
+
+
+def test_the_served_index_substitutes_the_real_version(client):
+    """플레이스홀더가 그대로 나가면 버전이 안 바뀌어 캐시버스팅이 아니다."""
+    from app.main import VERSION
+
+    response = client.get("/ui")
+    assert response.status_code == 200
+    assert "__VERSION__" not in response.text
+    assert f"app.js?v={VERSION}" in response.text
+
+
+def test_the_ui_refreshes_itself():
+    """노드가 죽어도 새로고침 전까지 과거 화면을 본다 — 그건 관제가 아니다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "startAutoRefresh" in source
+    assert "REFRESH_INTERVAL_MS" in source
+    assert "document.hidden" in source, "안 보이는 탭도 서버를 두드린다"
+
+
+def test_a_stale_refresh_does_not_paint_over_the_current_tab():
+    """탭을 빠르게 옮기면 먼저 시작한 요청이 나중에 도착해 이전 탭 내용을 그린다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "refreshGeneration" in source
+    assert "generation !== refreshGeneration" in source
+
+
+def test_the_node_form_can_supply_authentication():
+    """**경계 밖 노드는 서버가 TLS + 인증을 강제한다**(D9).
+
+    폼에 입력 수단이 없어서 external 노드 등록이 항상 실패했다 — 화면에 있는데
+    절대 안 되는 기능이 가장 나쁘다.
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    form = source[source.index("function registerNodeForm"):]
+    form = form[:form.index("\nfunction ")]
+
+    assert "api_key_env" in form
+    assert "auth_header_env" in form
+
+
+def test_the_form_takes_env_var_names_not_secrets():
+    """자격증명 자체를 DB 에 넣으면 백업·내보내기·진단 번들이 전부 그것을 나른다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    form = source[source.index("function registerNodeForm"):]
+    form = form[:form.index("\nfunction ")]
+
+    assert "api_key:" not in form and "auth_header:" not in form
+
+
+def test_an_external_node_registered_with_auth_is_accepted(harness, client, acme, monkeypatch):
+    """폼을 고쳤는데 서버가 여전히 거절하면 소용없다 — 양쪽을 함께 못박는다."""
+    monkeypatch.setenv("DEMO_NODE_KEY", "secret")
+
+    response = client.post(
+        "/v1/platform/nodes",
+        json={
+            "name": "rented", "provider": "mock", "data_boundary": "external",
+            "base_url": "https://rented.example", "api_key_env": "DEMO_NODE_KEY",
+        },
+        headers=auth(acme["platform_admin"]),
+    )
+    assert response.status_code in (200, 201), response.text
+
+
+def test_hidden_actually_hides():
+    """**`el.hidden = true` 를 CSS 가 이기면 안 된다.**
+
+    브라우저 기본 스타일의 `[hidden] { display: none }` 은 **작성자 규칙에 진다.**
+    그래서 `#login { display: grid }` 한 줄 때문에 `login.hidden = true` 가 아무
+    효과가 없었다 — 접속한 뒤에도 로그인 폼이 화면을 그대로 채우고 앱은 정확히
+    한 화면 아래에 있었다. 이 저장소의 테스트는 전부 통과했다. 브라우저로 실제
+    렌더해 보기 전에는 나오지 않는 종류다(플레이라이트로 `#shell` 이 `y=900` 에
+    있는 것을 보고 알았다).
+
+    여기서는 렌더까지 못 보므로 **그 사고가 다시 가능해지는 조건**을 막는다:
+    `[hidden]` 이 `!important` 로 이기는 규칙이 있는가. 이것이 있으면 앞으로
+    누가 어떤 선택자에 `display` 를 줘도 같은 일이 안 생긴다.
+    """
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    override = re.search(r"\[hidden\][^{]*\{[^}]*display\s*:\s*none\s*!important", css)
+    assert override, "[hidden] { display: none !important } 규칙이 없다"
+
+    # 이 검사가 지키는 대상이 실재하는지도 본다 — 대상이 없으면 규칙만 남아 있는 것이다.
+    toggled = set(re.findall(r"\$\(['\"](\w+)['\"]\)\.hidden\s*=", (STATIC / "app.js").read_text(encoding="utf-8")))
+    assert toggled, "app.js 가 .hidden 을 토글하지 않는다 — 이 검사가 죽어 있다"
+
+
+def test_a_header_with_an_empty_label_does_not_render_as_an_object():
+    """`{label: '', num: true}` 머리글이 화면에 `[object Object]` 로 떴다.
+
+    `h.label || h` 는 빈 문자열이 falsy 라서 객체 자체로 떨어진다. 제목 없이
+    오른쪽 정렬만 하는 칸에서 매번 이 일이 난다 — 카탈로그 표가 그랬다.
+
+    렌더까지는 못 보므로 **그 사고를 만드는 표현식**을 막는다. 값이 있는지가
+    아니라 모양이 무엇인지로 갈라야 한다.
+    """
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "label || h" not in js, "머리글이 falsy 폴백으로 객체를 문자열화한다"
+    assert re.search(r"typeof h === 'object'", js), "머리글을 모양으로 가르지 않는다"
