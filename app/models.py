@@ -159,6 +159,9 @@ class ModelRegistrar:
         배치 필터가 그 노드만 스킵하므로 **레인은 막히지 않는다.** 여기서는 요청만 남긴다.
         """
         created: list[InstallRequest] = []
+        # **(노드, 모델)로 접는다.** 역할 둘이 같은 노드의 같은 모델을 가리키면
+        # 같은 행이 두 번 나오고, 관리자는 설치가 두 건 필요한 줄로 읽는다.
+        seen: set[tuple[str, str]] = set()
 
         for role in self._config.roles.values():
             for tier in role.placement:
@@ -171,6 +174,9 @@ class ModelRegistrar:
                     # 프로브 전에는 인벤토리를 모른다. 모른다는 이유로 요청하지 않는다.
                     if not state.models or model in state.models:
                         continue
+                    if (state.name, model) in seen:
+                        continue
+                    seen.add((state.name, model))
 
                     try:
                         created.append(
@@ -319,6 +325,27 @@ class ModelRegistrar:
 
     def pending_count(self) -> int:
         return len(self._store.list_model_requests(status=PENDING))
+
+    def open_requests(self) -> list[dict[str, Any]]:
+        """진행 중인 설치 **요청**. `snapshot()` 이 주는 재고와 다른 것이다.
+
+        요청에는 상태·진행률·승인 대상 id 가 있고, 재고에는 없다. 둘을 한 표에
+        섞으면 상태 칸이 비고(재고에는 그 값이 없다) **승인 버튼에 도달할 수 없다** —
+        실제로 그랬다: 개요에 "승인 대기 1" 이 떠 있는데 모델 화면에서 그 요청을
+        볼 수도 승인할 수도 없었다.
+        """
+        return [
+            {
+                "id": row["id"], "node": row["node"], "model": row["model"],
+                "status": row["status"], "progress": int(row["progress"] or 0),
+                "error": row["error"],
+            }
+            for row in self._store.list_model_requests()
+            # `ready` 는 끝난 것이고 그 모델은 아래 재고 표에 나타난다. `rejected` 는
+            # 사람이 이미 판단한 것이다. **`failed` 는 남긴다** — 실패를 화면에서
+            # 치우면 아무도 모르는 채로 그 역할만 계속 굶는다.
+            if row["status"] not in (READY, REJECTED)
+        ]
 
     def snapshot(self) -> list[dict[str, Any]]:
         """관제 UI 용. 삭제 차단 사유를 함께 실어 왜 못 지우는지 보여준다."""

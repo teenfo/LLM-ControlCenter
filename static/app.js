@@ -108,8 +108,14 @@ function table(headers, rows) {
   if (!rows.length) return el('p', { class: 'muted', text: t('ui.empty') });
   return el('div', { class: 'scroll' }, [
     el('table', {}, [
+      // **머리글은 값이 아니라 모양으로 가른다.** 라벨 자리에 falsy 폴백을 쓰면
+      // 빈 문자열 라벨(`{label:'', num:true}` — 제목 없이 오른쪽 정렬만 하는 칸)이
+      // 객체 자체로 떨어져 화면에 `[object Object]` 가 뜬다. 카탈로그 표가 그랬다.
       el('thead', {}, [el('tr', {}, headers.map((h) =>
-        el('th', { class: h.num ? 'num' : null, text: h.label || h })))]),
+        el('th', {
+          class: h && h.num ? 'num' : null,
+          text: (h && typeof h === 'object') ? (h.label ?? '') : (h ?? ''),
+        })))]),
       el('tbody', {}, rows.map((cells) => el('tr', {}, cells.map((cell, i) =>
         el('td', { class: headers[i] && headers[i].num ? 'num' : null },
           typeof cell === 'object' && cell !== null ? [cell] : [String(cell ?? '')]))))),
@@ -515,20 +521,30 @@ async function purgeTenant(tenantId) {
 async function renderModels() {
   const data = await fetchAll({ models: '/v1/platform/models', catalog: '/v1/platform/catalog' });
   renderBanners();
-  const m = data.models || { requests: [], missing: [] };
+  const m = data.models || { inventory: [], install_requests: [], missing: [] };
 
-  const requests = (m.requests || []).map((r) => [
+  // **설치 요청과 재고는 다른 것이다.** 한 표에 섞었더니 요청의 상태·진행률 칸이
+  // `undefined` 로 뜨고(재고에는 그 값이 없다) 승인 버튼에 도달할 수 없었다 —
+  // 개요에 "승인 대기 1" 이 떠 있는데도 그 요청을 볼 방법이 없었다.
+  const pending = (m.install_requests || []).map((r) => [
     r.node, r.model,
-    badge(r.status, r.status === 'ready' ? 'healthy' : (r.status === 'failed' ? 'unhealthy' : '')),
-    r.progress != null ? bar(r.progress / 100) : '—',
-    r.est_size_gb ? r.est_size_gb + ' GB' : '—',
+    badge(r.status, r.status === 'failed' ? 'unhealthy' : (r.status === 'pulling' ? 'healthy' : '')),
+    r.status === 'pulling' ? bar((r.progress || 0) / 100) : (r.error || '—'),
     el('div', { class: 'row' }, r.status === 'pending' ? [
       el('button', {
         class: 'primary', text: t('ui.approve'),
         onclick: () => modelDecision(r.id, false),
       }),
       el('button', { text: t('ui.reject'), onclick: () => modelDecision(r.id, true) }),
-    ] : [
+    ] : []),
+  ]);
+
+  const inventory = (m.inventory || []).map((r) => [
+    r.node, r.model,
+    r.loaded ? badge(t('ui.model_loaded'), 'healthy') : '',
+    r.est_size_gb ? r.est_size_gb + ' GB' : '—',
+    (r.deletion_blockers || []).join(', '),
+    el('div', { class: 'row' }, [
       el('button', {
         class: 'danger', text: t('ui.delete'),
         onclick: () => deleteModel(r.node, r.model),
@@ -551,8 +567,13 @@ async function renderModels() {
     missing.length
       ? card(t('ui.missing_models'), table([t('ui.node'), t('ui.model'), ''], missing))
       : null,
+    pending.length
+      ? card(t('ui.install_requests'), table(
+          [t('ui.node'), t('ui.model'), t('ui.status'), t('ui.install_progress'), ''], pending))
+      : null,
     card(t('ui.models'), table(
-      [t('ui.node'), t('ui.model'), t('ui.status'), t('ui.install_progress'), '', ''], requests)),
+      [t('ui.node'), t('ui.model'), '', { label: t('ui.size'), num: true },
+       t('ui.deletion_blocked'), ''], inventory)),
     card(t('ui.catalog'), table(
       [t('ui.model'), '', { label: '', num: true }, ''],
       (data.catalog ? data.catalog.catalog : []).map((c) =>

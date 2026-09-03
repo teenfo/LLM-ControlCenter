@@ -1507,12 +1507,18 @@ async def platform_node_drain(request: Request) -> Response:
 async def platform_models(request: Request) -> Response:
     ctx, principal = _platform_admin(request)
     if request.method == "GET":
+        # **탐지가 먼저다.** `detect_missing()` 은 없는 모델에 대해 설치 요청을
+        # 만드는데, 아래 집계를 먼저 읽으면 그 요청들이 이번 응답에 안 잡힌다 —
+        # 첫 조회는 "승인 대기 0", 새로고침하면 "승인 대기 1" 이 된다. 화면을
+        # 한 번 더 눌러야 진실이 나오는 관제 화면은 관제가 아니다.
+        missing = ctx.registrar.detect_missing()
         return _ok(request, {
-            "requests": ctx.registrar.snapshot(),
+            # 재고(설치된 것)와 요청(설치하려는 것)은 **다른 것이다.** 한 표에
+            # 섞으면 요청의 상태·진행률 칸이 비고 승인 버튼에 도달할 수 없다.
+            "inventory": ctx.registrar.snapshot(),
+            "install_requests": ctx.registrar.open_requests(),
             "pending": ctx.registrar.pending_count(),
-            "missing": [
-                {"node": r.node, "model": r.model} for r in ctx.registrar.detect_missing()
-            ],
+            "missing": [{"node": r.node, "model": r.model} for r in missing],
         })
 
     body = await _body(request)

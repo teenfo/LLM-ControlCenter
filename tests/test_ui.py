@@ -317,6 +317,59 @@ def test_the_missing_model_endpoint_actually_returns_it(harness, client, acme):
     assert {"node", "model"} <= set(body["missing"][0])
 
 
+def test_a_pending_install_is_reachable_from_the_screen(harness, client, acme):
+    """**개요가 "승인 대기 N" 이라고 말하면, 화면에서 그 요청에 닿을 수 있어야 한다.**
+
+    닿을 수 없었다. 모델 API 가 `requests` 라는 이름으로 **재고**(설치된 것)를 주는데
+    화면은 그것을 **요청**(설치하려는 것)으로 그렸다. 재고 행에는 `status` 도
+    `progress` 도 `id` 도 없으므로 상태 칸에 `undefined` 가 뜨고, 승인 버튼은
+    `status === 'pending'` 일 때만 나오니 **영원히 안 나온다.** 개요에는 "승인 대기 1"
+    이 떠 있는데 모델 화면에서는 그 요청이 존재하지도 않았다.
+
+    실제 화면을 브라우저로 띄워 `undefined` 를 보고서야 알았다.
+    """
+    for state in harness.cluster.nodes.values():
+        state.models = frozenset({"전혀-다른-모델"})
+
+    body = client.get("/v1/platform/models", headers=auth(acme["platform_admin"])).json()
+
+    assert body["pending"] > 0, "이 상황이면 승인 대기가 있어야 테스트가 성립한다"
+    assert body["install_requests"], "승인 대기가 있는데 요청 목록이 비어 있다"
+
+    request = body["install_requests"][0]
+    # 승인 버튼이 필요로 하는 것 전부. 하나라도 없으면 버튼이 안 나오거나 안 먹는다.
+    assert {"id", "node", "model", "status", "progress"} <= set(request)
+    assert request["id"], "승인은 id 로 한다 — 없으면 버튼이 아무 데도 못 보낸다"
+
+    approved = client.post(
+        f"/v1/platform/models/{request['id']}/approve",
+        json={}, headers=auth(acme["platform_admin"]),
+    )
+    assert approved.status_code == 200, approved.text
+
+
+def test_inventory_and_requests_are_not_the_same_list(harness, client, acme):
+    """재고와 요청을 한 칸에 담으면 다시 섞인다. **이름을 갈라 둔다.**"""
+    body = client.get("/v1/platform/models", headers=auth(acme["platform_admin"])).json()
+    assert "inventory" in body and "install_requests" in body
+    assert "requests" not in body, "옛 이름이 남아 있으면 어느 쪽인지 다시 헷갈린다"
+
+
+def test_the_missing_list_does_not_repeat_a_node_and_model(harness, client, acme):
+    """역할 둘이 같은 노드의 같은 모델을 가리키면 같은 행이 두 번 나왔다.
+
+    관리자는 설치가 두 건 필요한 줄로 읽는다.
+    """
+    for state in harness.cluster.nodes.values():
+        state.models = frozenset({"전혀-다른-모델"})
+
+    missing = client.get(
+        "/v1/platform/models", headers=auth(acme["platform_admin"])
+    ).json()["missing"]
+    pairs = [(m["node"], m["model"]) for m in missing]
+    assert len(pairs) == len(set(pairs)), f"중복된 행: {pairs}"
+
+
 # ── 감사 LOW — 자원·UI ──────────────────────────────────────────────────────
 
 
@@ -413,3 +466,17 @@ def test_hidden_actually_hides():
     # 이 검사가 지키는 대상이 실재하는지도 본다 — 대상이 없으면 규칙만 남아 있는 것이다.
     toggled = set(re.findall(r"\$\(['\"](\w+)['\"]\)\.hidden\s*=", (STATIC / "app.js").read_text(encoding="utf-8")))
     assert toggled, "app.js 가 .hidden 을 토글하지 않는다 — 이 검사가 죽어 있다"
+
+
+def test_a_header_with_an_empty_label_does_not_render_as_an_object():
+    """`{label: '', num: true}` 머리글이 화면에 `[object Object]` 로 떴다.
+
+    `h.label || h` 는 빈 문자열이 falsy 라서 객체 자체로 떨어진다. 제목 없이
+    오른쪽 정렬만 하는 칸에서 매번 이 일이 난다 — 카탈로그 표가 그랬다.
+
+    렌더까지는 못 보므로 **그 사고를 만드는 표현식**을 막는다. 값이 있는지가
+    아니라 모양이 무엇인지로 갈라야 한다.
+    """
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "label || h" not in js, "머리글이 falsy 폴백으로 객체를 문자열화한다"
+    assert re.search(r"typeof h === 'object'", js), "머리글을 모양으로 가르지 않는다"
