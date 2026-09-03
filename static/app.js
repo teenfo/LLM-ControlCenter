@@ -526,8 +526,17 @@ async function renderModels() {
   // **설치 요청과 재고는 다른 것이다.** 한 표에 섞었더니 요청의 상태·진행률 칸이
   // `undefined` 로 뜨고(재고에는 그 값이 없다) 승인 버튼에 도달할 수 없었다 —
   // 개요에 "승인 대기 1" 이 떠 있는데도 그 요청을 볼 방법이 없었다.
+  // 대기 중이면 노드 칸이 선택 상자다 — 탐지가 제안한 디스크를 관리자가 바꾼다.
+  // 목록은 서버가 준 `eligible_nodes` 그대로다. 화면이 따로 고르지 않는다.
+  const nodeCell = (r) => (r.status === 'pending' && (r.eligible_nodes || []).length > 1)
+    ? el('select', {
+        title: t('ui.retarget_hint'),
+        onchange: (e) => retargetRequest(r.id, e.target.value),
+      }, r.eligible_nodes.map((n) => el('option', { value: n, selected: n === r.node ? true : null, text: n })))
+    : r.node;
+
   const pending = (m.install_requests || []).map((r) => [
-    r.node, r.model,
+    nodeCell(r), r.model,
     badge(r.status, r.status === 'failed' ? 'unhealthy' : (r.status === 'pulling' ? 'healthy' : '')),
     r.status === 'pulling' ? bar((r.progress || 0) / 100) : (r.error || '—'),
     el('div', { class: 'row' }, r.status === 'pending' ? [
@@ -586,6 +595,15 @@ async function requestInstall(node, model) {
     await api('/v1/platform/models', { method: 'POST', body: { node: node, model: model } });
     refresh();
   } catch (err) { showError(err); }
+}
+
+async function retargetRequest(requestId, node) {
+  try {
+    await api('/v1/platform/models/' + encodeURIComponent(requestId) + '/retarget', {
+      method: 'POST', body: { node: node },
+    });
+    refresh();
+  } catch (err) { showError(err); refresh(); }   // 실패하면 선택 상자를 서버 상태로 되돌린다
 }
 
 async function modelDecision(requestId, reject) {

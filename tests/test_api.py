@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from app.pipeline import MAX_WAIT_SECONDS
 from app.store import TenantScope
 from tests.conftest import auth, seed_tenant
@@ -1389,3 +1391,50 @@ async def test_a_chunked_body_is_cut_at_the_limit_not_buffered_whole():
     assert served["n"] <= limit_chunks, (
         f"상한을 넘고도 {served['n']}조각을 계속 읽었다 — 전량 버퍼링이다"
     )
+
+
+# ── 설치 요청의 노드 변경 ───────────────────────────────────────────────────
+
+
+def test_tenant_admin_cannot_retarget_model_installs(client, acme):
+    response = client.post(
+        "/v1/platform/models/whatever/retarget", json={"node": "in-1"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 403
+
+
+def test_pending_requests_carry_the_nodes_they_may_move_to(harness, client, acme):
+    """화면은 서버가 준 목록만 그린다. 그 목록이 응답에 있어야 한다."""
+    for state in harness.cluster.nodes.values():
+        state.models = frozenset({"전혀-다른-모델"})
+    body = client.get("/v1/platform/models", headers=auth(acme["platform_admin"])).json()
+    pending = [r for r in body["install_requests"] if r["status"] == "pending"]
+    assert pending
+    for r in pending:
+        assert "eligible_nodes" in r
+        assert r["node"] in r["eligible_nodes"], "현재 노드는 항상 목록에 있어야 선택 상자가 성립한다"
+
+
+def test_retarget_over_http_moves_the_request(harness, client, acme):
+    for state in harness.cluster.nodes.values():
+        state.models = frozenset({"전혀-다른-모델"})
+    body = client.get("/v1/platform/models", headers=auth(acme["platform_admin"])).json()
+    movable = [r for r in body["install_requests"]
+               if r["status"] == "pending" and len(r["eligible_nodes"]) > 1]
+    if not movable:
+        pytest.skip("이 설정에는 같은 모델을 받을 수 있는 노드가 둘 이상 없다")
+    r = movable[0]
+    target = next(n for n in r["eligible_nodes"] if n != r["node"])
+
+    moved = client.post(
+        f"/v1/platform/models/{r['id']}/retarget", json={"node": target},
+        headers=auth(acme["platform_admin"]),
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["node"] == target
+
+    after = client.get("/v1/platform/models", headers=auth(acme["platform_admin"])).json()
+    nodes_pending = {x["node"] for x in after["install_requests"] if x["model"] == r["model"]}
+    assert target in nodes_pending
+    assert r["node"] not in nodes_pending, "원래 노드가 대기로 되돌아왔다 — 거부가 유지되지 않는다"

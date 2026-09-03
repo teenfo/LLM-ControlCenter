@@ -148,6 +148,10 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "platform_node_drain": ("노드 드레이닝·복귀. 즉시 차단이 아니라 신규만 막는다.", "platform_admin", False),
     "platform_models": ("모델 설치 요청 목록.", "platform_admin", False),
     "platform_model_approve": ("모델 설치 승인·거부. 공유 노드 디스크를 쓰므로 플랫폼 권한이다.", "platform_admin", False),
+    "platform_model_retarget": (
+        "대기 중인 설치 요청을 다른 노드로. 탐지가 제안한 디스크를 관리자가 바꾼다 — 승인은 그대로 사람이.",
+        "platform_admin", False,
+    ),
     "platform_model_delete": ("모델 삭제. 차단 사유가 하나라도 있으면 거부된다(`force` 없음).", "platform_admin", False),
     "platform_catalog": ("번들 카탈로그 검색. 외부 레지스트리를 스크레이핑하지 않는다.", "platform_admin", False),
     "platform_overview": ("전역 관제 — 테넌트별 소비·노드 그리드·단일 호밍 경고.", "platform_admin", False),

@@ -566,9 +566,14 @@
 구현   `app/models.py:ModelRegistrar` `InstallRequest`
 계약   **내려받기 전에** 디스크 용량으로 거른다 · 요청은 (노드, 모델) 쌍마다 하나다
        클라우드 노드에는 설치 생애주기가 없다 · 감지가 레인을 막지 않는다
-       거부는 대기 중인 잡에 명확한 사유를 준다 · 승인·거부가 감사에 남는다
+       거부는 대기 중인 잡에 명확한 사유를 준다 · 승인·거부·노드 변경이 감사에 남는다
+       **대기 중인 요청의 노드는 승인 전에 바꿀 수 있다** — 탐지가 제안한 디스크를 관리자가 고른다.
+       원래 노드는 거부로 남아 자동 탐지가 되묻지 않고, 옮길 수 있는 노드는 서버가 정해 준다
+       자동 탐지는 사람의 거부를 되살리지 않는다 — 되살리기는 사람이 다시 올릴 때만
 고정   `test_models.py::test_size_gate_rejects_before_downloading`
        `test_models.py::test_request_is_per_node_model_pair`
+       `test_models.py::test_retarget_moves_a_pending_request_and_declines_the_old_node`
+       `test_models.py::test_auto_detection_does_not_revive_a_rejected_request`
        `test_models.py::test_detect_missing_creates_requests_without_blocking_lanes`
        `test_models.py::test_rejection_gives_waiting_jobs_a_clear_reason`
 상태   구현됨
@@ -1391,6 +1396,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_node_drain` | `POST /v1/platform/nodes/{node}/drain` | CLUSTER-8 |
 | `platform_models` | `GET /v1/platform/models` | CLUSTER-11 |
 | `platform_model_approve` | `POST /v1/platform/models/{id}/approve` | CLUSTER-11 |
+| `platform_model_retarget` | `POST /v1/platform/models/{id}/retarget` | CLUSTER-11 |
 | `platform_model_delete` | `DELETE /v1/platform/nodes/{node}/models/{model}` | CLUSTER-12 |
 | `platform_catalog` | `GET /v1/platform/catalog` | CLUSTER-13 |
 | `platform_overview` | `GET /v1/platform/overview` | OPS-9 |

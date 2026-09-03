@@ -1548,6 +1548,21 @@ async def platform_model_approve(request: Request) -> Response:
     return _ok(request, {"id": req.id, "status": req.status, "progress": req.progress})
 
 
+async def platform_model_retarget(request: Request) -> Response:
+    """대기 중인 설치 요청의 노드를 바꾼다. 승인은 따로, 사람이 그대로 한다.
+
+    탐지가 제안한 노드를 관리자가 다른 디스크로 옮기는 경로다. 옮길 수 있는
+    노드는 서버가 `eligible_nodes` 로 함께 내려 주므로, 화면은 그 목록만 그린다.
+    """
+    ctx, principal = _platform_admin(request)
+    request_id = request.path_params["request_id"]
+    body = await _body(request)
+    req = ctx.registrar.retarget(
+        request_id, str(_need(body, "node")), actor=principal.token_id
+    )
+    return _ok(request, {"id": req.id, "node": req.node, "status": req.status})
+
+
 async def platform_model_delete(request: Request) -> Response:
     """모델 삭제. **`force` 는 없다** — 다섯 차단 사유 중 하나라도 걸리면 거부한다."""
     ctx, principal = _platform_admin(request)
@@ -1914,6 +1929,8 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["GET", "POST"], name="platform_models"),
         Route(f"{v}/platform/models/{{request_id}}/approve", platform_model_approve,
               methods=["POST"], name="platform_model_approve"),
+        Route(f"{v}/platform/models/{{request_id}}/retarget", platform_model_retarget,
+              methods=["POST"], name="platform_model_retarget"),
         Route(f"{v}/platform/nodes/{{node}}/models/{{model:path}}", platform_model_delete,
               methods=["DELETE"], name="platform_model_delete"),
         Route(f"{v}/platform/catalog", platform_catalog, name="platform_catalog"),

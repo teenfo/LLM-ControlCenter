@@ -124,6 +124,12 @@ class ModelRegistrar:
         existing = self._store.get_model_request(node, model)
         if existing is not None and existing["status"] not in DEAD_STATUSES:
             return _to_request(existing)
+        if existing is not None and auto:
+            # **자동 탐지는 사람의 거부를 뒤집지 않는다.** 되살리기는 사람이 다시
+            # 올리는 경로(`auto=False`)에만 있다. 여기서도 되살리면 `reject` 가
+            # 약속한 "다시 물어보지 않는다" 가 화면을 새로 여는 순간 깨지고,
+            # 노드를 옮긴 요청의 원래 노드가 다음 조회에서 대기 상태로 돌아온다.
+            return _to_request(existing)
 
         size = self.estimated_size_gb(model)
         budget = state.node.mem_budget_gb
@@ -219,6 +225,84 @@ class ModelRegistrar:
             target=f"{row['node']}/{row['model']}", detail={"reason": reason},
         )
         return _to_request(self._store.get_model_request_by_id(request_id))
+
+    def eligible_nodes(self, row: Any) -> list[str]:
+        """이 요청을 옮길 수 있는 노드들. **화면과 서버가 같은 목록을 본다.**
+
+        기준은 요청을 처음 만들 때와 같다 — 설치 생애주기가 있는 노드, 그 모델이
+        아직 없는 노드, 크기 게이트를 지나는 노드. 하나가 더 있다: 요청을 만든
+        역할들이 실제로 **그 노드에 배치될 수 있어야** 한다. 역할이 안 가는 노드에
+        얹으면 모델은 놀고, 원래 노드는 다음 탐지에서 다시 "없다" 로 뜬다.
+        수동 요청(역할 없음)은 이 마지막 조건을 안 탄다.
+        """
+        import json
+
+        model = row["model"]
+        roles = [
+            self._config.roles[name]
+            for name in json.loads(row["roles_json"] or "[]")
+            if name in self._config.roles
+        ]
+        size = self.estimated_size_gb(model)
+        out: list[str] = []
+        for state in self._cluster.nodes.values():
+            node = state.node
+            if not node.enabled or not state.provider.capabilities.requires_model_install:
+                continue
+            if model in state.models and node.name != row["node"]:
+                continue
+            budget = node.mem_budget_gb
+            if size and budget is not None and size > budget:
+                continue
+            if roles and not any(
+                node.matches_tier(t) for role in roles for t in role.placement
+                if role.model_for_tier(t) == model
+            ):
+                continue
+            out.append(node.name)
+        return out
+
+    def retarget(self, request_id: str, node: str, *, actor: str) -> InstallRequest:
+        """대기 중인 요청을 다른 노드로 옮긴다. **승인은 그대로 사람이 한다.**
+
+        탐지는 노드마다 요청을 만들고, 관리자는 그중 어느 디스크에 받을지 고른다.
+        여기서 바뀌는 것은 그 선택이다 — 시스템이 A 를 제안했고 사람이 B 라고
+        답한다. 그래서 두 행이 된다: A 는 `rejected`(사유에 B 를 적는다) 로 남아
+        다음 탐지가 되묻지 않고, B 는 대기 상태가 된다. 한 행의 `node` 만 바꾸면
+        A 에 대한 답이 사라져서 다음 조회에 A 가 대기로 되돌아온다.
+
+        `pending` 만 옮길 수 있다. 승인된 뒤에는 그 호스트에서 내려받기가 시작되므로
+        목적지가 이미 정해진 것이다.
+        """
+        row = self._store.get_model_request_by_id(request_id)
+        if row is None:
+            raise ApiError("job_not_found", status=404)
+        if row["status"] != PENDING:
+            raise ApiError(
+                "request_not_pending", status=409,
+                params={"status": row["status"]},
+            )
+        if node == row["node"]:
+            return _to_request(row)
+        if node not in self.eligible_nodes(row):
+            raise ApiError(
+                "node_not_eligible", status=409,
+                params={"node": node, "model": row["model"]},
+            )
+
+        import json
+
+        roles = json.loads(row["roles_json"] or "[]")
+        moved = self.request_install(node, row["model"], requested_by=actor, roles=roles)
+        self._store.update_model_request(
+            request_id, status=REJECTED, error=f"노드 변경 → {node}",
+            decided_at=self._now(),
+        )
+        self._store.audit(
+            actor, "retarget_model_install",
+            target=f"{row['node']}/{row['model']}", detail={"to": node},
+        )
+        return moved
 
     # -- 설치 -----------------------------------------------------------------
 
@@ -339,6 +423,8 @@ class ModelRegistrar:
                 "id": row["id"], "node": row["node"], "model": row["model"],
                 "status": row["status"], "progress": int(row["progress"] or 0),
                 "error": row["error"],
+                # 대기 중일 때만 뜻이 있다. 승인된 뒤에는 목적지가 정해진 것이다.
+                "eligible_nodes": self.eligible_nodes(row) if row["status"] == PENDING else [],
             }
             for row in self._store.list_model_requests()
             # `ready` 는 끝난 것이고 그 모델은 아래 재고 표에 나타난다. `rejected` 는
