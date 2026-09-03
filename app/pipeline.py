@@ -375,6 +375,15 @@ class Pipeline:
                 max_prompt_chars=role_config.max_prompt_chars,
                 metadata=dict(metadata or {}),
                 idempotency_key=idempotency_key,
+                # **재귀 방지의 뿌리.** 이 잡을 만든 것이 플러그인인가.
+                #
+                # 플러그인은 앞문으로 들어오므로 여기서 보이는 것은 서비스 토큰뿐이고,
+                # 그 서비스가 플러그인의 것인지는 `plugins` 행만이 안다. 잡을 만드는
+                # 곳이 여기 하나뿐이라(`test_only_the_pipeline_creates_jobs`) 표식을
+                # 빠뜨릴 다른 경로가 없다.
+                origin_plugin=self._store.plugin_id_for_service(
+                    scope, principal.service_id
+                ),
             )
         except sqlite3.IntegrityError:
             # **유일성 인덱스가 잡았다.** 같은 키로 두 요청이 나란히 들어오면 조회는

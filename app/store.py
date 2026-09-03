@@ -204,6 +204,7 @@ class StoreError(RuntimeError):
     pass
 
 
+
 class AlreadyExists(StoreError):
     """유일성 제약에 걸렸다 — 같은 id 가 이미 있다.
 
@@ -386,6 +387,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- 네트워크 단절 뒤 재시도하는 소비자가 같은 작업을 두 번 만들지 않게 한다 —
     -- metered 경로면 그 중복이 곧 이중 과금이다.
     idempotency_key   TEXT,
+
+    -- 이 잡을 만든 플러그인. NULL 이면 사람(일반 소비자)이 만든 것이다.
+    --
+    -- **잡 행에 박아 둔다.** 나중에 `plugins` 에서 되짚으면 안 된다 — 플러그인을
+    -- 지우면 출처가 사라지고, 지워진 플러그인이 만든 잡이 사람이 만든 잡으로
+    -- 보이게 된다. 재귀를 막는 판정이 바로 그 구분 위에 서 있다.
+    origin_plugin     TEXT,
 
     cost_reserved_usd REAL NOT NULL DEFAULT 0.0,
     cost_usd          REAL NOT NULL DEFAULT 0.0,
@@ -651,6 +659,9 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 제출 시 잰 입력 토큰 상한. 스케줄러가 매 틱 프롬프트를 다시 읽지 않게 하려고
     # 둔다 — 옛 행은 NULL 이고 `_backfill_input_token_estimates` 가 채운다.
     ("jobs", "input_tokens_estimate", "INTEGER"),
+    # 잡을 만든 플러그인. 옛 행은 NULL 로 남고 그것이 맞다 — 플러그인이 없던
+    # 시절의 잡은 전부 사람이 만든 것이다.
+    ("jobs", "origin_plugin", "TEXT"),
 )
 
 #: 컬럼이 생긴 **뒤에** 만들어야 하는 인덱스. `_SCHEMA` 에 두면 옛 DB 에서
@@ -718,6 +729,9 @@ class JobRow:
     prompt_hash: str | None = None
     system_hash: str | None = None
     idempotency_key: str | None = None
+    #: 이 잡을 만든 플러그인. `None` 이면 사람이 만든 것이다.
+    #: 뜻을 판정하는 곳은 `plugins.may_wake_plugins` 하나다(구조 검사가 지킨다).
+    origin_plugin: str | None = None
     #: 제출 시점에 고정된 라우팅 판정. 재시도해도 안 바뀐다 — 디스패치마다 다시
     #: 판정하면 같은 잡이 재시도마다 다른 모델을 타고 재현성이 사라진다.
     route: str | None = None
@@ -1099,6 +1113,11 @@ class SqliteStore:
             "system_hash": fields.pop("system_hash", None),
             "idempotency_key": fields.pop("idempotency_key", None),
             "route": fields.pop("route", None),
+            # 잡을 만든 플러그인. **기본값 `None` 은 "사람이 만들었다" 는 주장이다** —
+            # 편의가 아니라 뜻이 있는 값이다. 제품 경로에서 그 주장을 우연히 하게
+            # 두지 않으려고, 유일한 호출부가 이 칸을 실제로 채우는지를
+            # `test_the_job_creating_call_stamps_the_origin` 이 AST 로 본다.
+            "origin_plugin": fields.pop("origin_plugin", None),
             "placement_json": _json(list(fields.pop("placement", ()))),
             "tier_models_json": _json(dict(fields.pop("tier_models", {}))),
             "options_json": _json(dict(fields.pop("options", {}))),
@@ -2185,6 +2204,34 @@ class SqliteStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def plugin_id_for_service(self, scope: TenantScope, service_id: str) -> str | None:
+        """이 서비스가 플러그인의 것인가. 맞으면 그 플러그인 id.
+
+        파이프라인이 제출마다 부른다. **여기서 묻는 이유**는 `plugins` 행이 유일한
+        진실이기 때문이다 — `services` 에 표식을 하나 더 두면 둘이 어긋나고, 어긋난
+        쪽이 "사람이 만든 잡" 으로 보이는 순간 재귀 방지가 뚫린다.
+
+        `idx_plugins_service(tenant_id, service_id)` 를 타는 인덱스 조회다.
+        """
+        where, params = self._scoped_where(scope, "service_id = ?")
+        params.append(service_id)
+        row = self._conn.execute(
+            f"SELECT id FROM plugins WHERE {where}", params
+        ).fetchone()
+        return row["id"] if row else None
+
+    def count_jobs_by_origin(self, scope: TenantScope) -> dict[str, int]:
+        """플러그인별로 만든 잡 수. 출처 칸을 사람이 볼 수 있게 하는 창이다.
+
+        쓰기만 하고 아무도 안 읽는 칸은 언젠가 틀린 채로 방치된다.
+        """
+        where, params = self._scoped_where(scope, "origin_plugin IS NOT NULL")
+        rows = self._conn.execute(
+            f"SELECT origin_plugin, COUNT(*) AS n FROM jobs WHERE {where} "
+            "GROUP BY origin_plugin", params
+        )
+        return {row["origin_plugin"]: row["n"] for row in rows}
+
     # -- 테넌트 설정 -----------------------------------------------------------
 
     def set_tenant_setting(self, scope: TenantScope, key: str, value: Any) -> None:
@@ -3180,6 +3227,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRow:
         prompt_hash=get("prompt_hash"),
         system_hash=get("system_hash"),
         idempotency_key=get("idempotency_key"),
+        origin_plugin=get("origin_plugin"),
         route=get("route"),
         response=get("response"),
         response_cipher=get("response_cipher"),

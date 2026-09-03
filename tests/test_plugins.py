@@ -26,7 +26,7 @@ from app.plugins import (
     host_satisfies,
 )
 from app.identity import new_salt
-from app.store import TenantScope
+from app.store import JobRow, TenantScope
 
 from tests.conftest import auth
 
@@ -560,3 +560,129 @@ def test_the_lifecycle_is_audited(client, harness, acme, signing_key, platform_t
         for row in harness.store._conn.execute("SELECT action FROM admin_audit")
     }
     assert {"install_plugin", "activate_plugin", "uninstall_plugin"} <= actions
+
+
+# ── 재귀 방지 ────────────────────────────────────────────────────────────────
+
+
+def test_a_job_a_plugin_created_does_not_wake_that_plugin(
+    harness, client, signing_key, platform_tenant
+):
+    """**계획서(§11-4)가 이름으로 지정한 테스트다.**
+
+    막으려는 고리: 플러그인이 깨어난다 → `/v1/generate` → 그 잡이 끝난다 →
+    그 완료가 다시 그 플러그인을 깨운다 → … 한 바퀴마다 돈을 쓰면서 아무도
+    멈추라고 말하지 않는다.
+
+    표식은 잡이 만들어지는 순간에만 붙일 수 있으므로, 트리거보다 **먼저** 있어야 한다.
+    """
+    result = do_install(harness, bundle(key=signing_key))
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t")
+
+    response = client.post(
+        "/v1/generate",
+        json={"role": "summarize", "prompt": "요약할 내용", "wait": 0},
+        headers=auth(result.token),
+    )
+    assert response.status_code in (200, 202), response.text
+
+    job = harness.store.get_job(platform_tenant, response.json()["job_id"])
+    assert job.origin_plugin == "acme.daily-digest"
+    assert plugins.may_wake_plugins(job) is False
+
+
+def test_a_job_a_person_created_does_wake_plugins(harness, client, acme):
+    """반대 방향도 본다. 전부 막으면 트리거는 영원히 안 도는 기능이 된다."""
+    response = client.post(
+        "/v1/generate",
+        json={"role": "summarize", "prompt": "요약할 내용", "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert response.status_code in (200, 202), response.text
+
+    job = harness.store.get_job(TenantScope("acme"), response.json()["job_id"])
+    assert job.origin_plugin is None
+    assert plugins.may_wake_plugins(job) is True
+
+
+def test_a_plugins_job_wakes_no_plugin_at_all_not_just_its_own(
+    harness, signing_key, platform_tenant
+):
+    """**자기 자신만 막으면 A→B→A 고리가 그대로 남는다.**
+
+    두 플러그인이 각자 정직해도 짝지어 놓으면 도는 고리라, 하나씩 심사해서는
+    보이지 않는다. 그래서 판정에 플러그인 id 를 쓰지 않는다 — 판정 함수의 인자에
+    깨우려는 대상이 아예 없다는 것이 그 설계다.
+    """
+    import inspect
+
+    signature = inspect.signature(plugins.may_wake_plugins)
+    assert list(signature.parameters) == ["job"], (
+        "판정이 '어느 플러그인을 깨우는가' 를 받기 시작하면 자기 고리만 막게 된다"
+    )
+
+    do_install(harness, bundle(key=signing_key))
+    job_of_a = JobRow(
+        id="j", tenant_id=PLATFORM, service_id="acme.daily-digest",
+        role="summarize", lane="interactive", status="ok",
+        origin_plugin="acme.daily-digest",
+    )
+    assert plugins.may_wake_plugins(job_of_a) is False
+
+
+def test_the_origin_survives_uninstalling_the_plugin(
+    harness, client, signing_key, platform_tenant
+):
+    """**표식이 잡 행에 있는 이유다.**
+
+    `plugins` 를 되짚어 출처를 알아내면, 플러그인을 지우는 순간 그 플러그인이 만든
+    잡이 전부 "사람이 만든 잡" 으로 바뀐다 — 지웠다 다시 깔면 그 사이 잡들이
+    트리거를 깨우게 된다.
+    """
+    result = do_install(harness, bundle(key=signing_key))
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t")
+    response = client.post(
+        "/v1/generate",
+        json={"role": "summarize", "prompt": "요약할 내용", "wait": 0},
+        headers=auth(result.token),
+    )
+    job_id = response.json()["job_id"]
+
+    plugins.uninstall(harness.store, "acme.daily-digest", actor="t", data_dir=harness.data_dir)
+
+    job = harness.store.get_job(platform_tenant, job_id)
+    assert job.origin_plugin == "acme.daily-digest"
+    assert plugins.may_wake_plugins(job) is False
+
+
+def test_an_ambiguous_origin_is_read_as_a_plugin_not_a_person(harness):
+    """애매하면 **안 깨우는 쪽**이다. 깨우는 쪽으로 틀리면 그것이 고리다."""
+    def job(origin):
+        return JobRow(
+            id="j", tenant_id=PLATFORM, service_id="s", role="summarize",
+            lane="interactive", status="ok", origin_plugin=origin,
+        )
+
+    assert plugins.may_wake_plugins(job("")) is False
+    assert plugins.may_wake_plugins(job(None)) is True
+
+
+def test_the_admin_list_shows_how_many_jobs_each_plugin_made(
+    harness, client, signing_key, platform_tenant
+):
+    """출처 칸을 사람이 볼 수 있어야 한다 — 아무도 안 읽는 칸은 언젠가 틀린다."""
+    result = do_install(harness, bundle(key=signing_key))
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t")
+
+    [row] = plugins.snapshot(harness.store, data_dir=harness.data_dir)
+    assert row["jobs_created"] == 0
+
+    for _ in range(2):
+        client.post(
+            "/v1/generate",
+            json={"role": "summarize", "prompt": "요약할 내용", "wait": 0},
+            headers=auth(result.token),
+        )
+
+    [row] = plugins.snapshot(harness.store, data_dir=harness.data_dir)
+    assert row["jobs_created"] == 2

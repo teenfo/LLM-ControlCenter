@@ -44,7 +44,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from .auth import ROLE_SERVICE, issue_token
-from .store import SqliteStore, TenantScope
+from .store import JobRow, SqliteStore, TenantScope
 
 #: 번들 안에서 이름이 정해진 파일 셋.
 MANIFEST_NAME = "plugin.toml"
@@ -570,6 +570,49 @@ def uninstall(store: SqliteStore, plugin_id: str, *, actor: str, data_dir: Path)
     return True
 
 
+# ── 재귀 방지 ────────────────────────────────────────────────────────────────
+
+
+def may_wake_plugins(job: JobRow) -> bool:
+    """이 잡의 완료가 플러그인을 깨워도 되는가. **플러그인이 만든 잡은 안 된다.**
+
+    막으려는 고리는 이것이다:
+
+        플러그인이 깨어난다 → `/v1/generate` 를 부른다 → 그 잡이 끝난다
+        → 그 완료가 다시 플러그인을 깨운다 → …
+
+    한 바퀴에 한 번씩 돈을 쓰면서 아무도 멈추라고 말하지 않는다. 레이트리밋과
+    예산이 결국 세우기는 하지만, **예산이 다 탈 때까지 안 멈춘다** 는 것이 문제다.
+
+    ### 왜 "그 플러그인" 이 아니라 "어떤 플러그인도" 인가
+
+    자기 자신만 막으면 둘이 서로를 깨우는 고리(A→B→A)가 그대로 남는다. 두 플러그인이
+    각자 정직해도 짝지어 놓으면 도는 고리라, 플러그인 하나를 심사해서는 볼 수 없다.
+    그래서 판정에 플러그인 id 를 안 쓴다 — **플러그인이 만든 잡은 아무것도 안 깨운다.**
+
+    그 결과 성질 하나가 선다: **플러그인이 하는 일은 사람이 시킨 일에서 딱 한 걸음이다.**
+    사람이 요청 → 그 완료가 플러그인을 깨움 → 플러그인이 잡을 만듦 → 거기서 끝.
+
+    ### 왜 깊이 카운터가 아닌가
+
+    깊이를 세려면 "이 호출은 저 잡 때문이다" 를 서버가 알아야 하는데, 플러그인은
+    앞문으로 **새 HTTP 요청**을 보내므로 서버는 그 인과를 볼 수 없다. 플러그인이
+    상관 토큰을 되돌려 주게 하면 셀 수는 있지만, 그러면 재귀를 안 도는 것이
+    **플러그인의 성의**에 달린다. 그건 방지가 아니다.
+
+    ### 지금 부르는 곳이 없다
+
+    트리거가 아직 없어서(§11-4) 이 판정을 물을 곳이 아직 없다. 그래도 지금 넣는
+    이유는 두 가지다 — 표식(`jobs.origin_plugin`)은 **잡이 만들어지는 순간에만**
+    붙일 수 있어서 나중에 소급할 수 없고, 트리거를 먼저 붙이면 그 사이에 만들어진
+    잡은 출처를 모른 채 남는다. `test_architecture` 가 `origin_plugin` 을 읽는 곳을
+    이 함수 하나로 묶어 두므로, 트리거를 짜는 사람은 여기를 지날 수밖에 없다.
+    """
+    # `is None` 이다. 빈 문자열이 들어오는 경우를 "사람" 으로 읽으면 깨우지 말아야 할
+    # 잡을 깨운다 — 애매하면 **안 깨우는 쪽**이 안전한 쪽이다.
+    return job.origin_plugin is None
+
+
 def snapshot(store: SqliteStore, *, data_dir: Path) -> list[dict[str, Any]]:
     """관제 화면이 그대로 그리는 목록.
 
@@ -577,9 +620,13 @@ def snapshot(store: SqliteStore, *, data_dir: Path) -> list[dict[str, Any]]:
     곧 진단이다 — `doctor` 가 짚을 자리이기도 하다.
     """
     out: list[dict[str, Any]] = []
+    counts: dict[str, dict[str, int]] = {}
     for row in store.list_plugins():
         scope = TenantScope(row["tenant_id"])
         service = store.get_service(scope, row["service_id"])
+        # 테넌트별로 한 번만 센다 — 플러그인마다 세면 목록 하나에 질의가 N 개 붙는다.
+        if row["tenant_id"] not in counts:
+            counts[row["tenant_id"]] = store.count_jobs_by_origin(scope)
         path = plugin_root(data_dir) / row["id"] / row["version"]
         out.append({
             "id": row["id"],
@@ -593,6 +640,9 @@ def snapshot(store: SqliteStore, *, data_dir: Path) -> list[dict[str, Any]]:
             "active": bool(service is not None and service["status"] == "active"),
             "allow_roles": json.loads(service["allow_roles_json"]) if service else [],
             "files_present": path.is_dir(),
+            # 이 플러그인이 만든 잡 수. **출처 칸을 사람이 볼 수 있게 하는 창이다** —
+            # 쓰기만 하고 아무도 안 읽는 칸은 언젠가 틀린 채로 방치된다.
+            "jobs_created": counts[row["tenant_id"]].get(row["id"], 0),
             "last_error": row["last_error"],
             "installed_at": row["installed_at"],
         })

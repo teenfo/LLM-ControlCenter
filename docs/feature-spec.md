@@ -1197,6 +1197,27 @@
        번들 업로드는 raw body 다(멀티파트는 6번째 의존성)
 상태   부분 — `external` 외 실행 형태 없음. 이벤트·스케줄 트리거 없음
 
+### PLUGIN-7  재귀 방지 — 플러그인이 만든 잡은 아무것도 깨우지 않는다
+정의   잡마다 그것을 만든 플러그인을 적어 두고, 그 잡의 완료로는 어떤 플러그인도 깨우지 않는다.
+       막는 고리는 "플러그인이 깨어난다 → `/v1/generate` → 완료 → 다시 깨어난다" 다 —
+       한 바퀴마다 돈을 쓰면서 예산이 다 탈 때까지 안 멈춘다.
+표면   `GET /v1/platform/plugins` 의 `jobs_created` · 관제 UI 플러그인 탭 「만든 잡」 칸
+구현   app/pipeline.py:_create_job(표식) · app/store.py:plugin_id_for_service ·
+       app/plugins.py:may_wake_plugins(판정) · jobs.origin_plugin(칸)
+계약   표식은 **잡 행에 박힌다** — 플러그인을 지워도 남는다(되짚으면 지운 순간 출처가 사라진다)
+       판정은 깨울 대상을 인자로 받지 않는다 — 자기 고리만 막으면 A→B→A 가 남는다
+       `origin_plugin` 을 해석하는 곳은 `may_wake_plugins` 하나다(구조 검사가 지킨다)
+       깊이 카운터를 쓰지 않는다 — 플러그인은 새 HTTP 요청으로 들어오므로 서버가 인과를 못 본다.
+       상관 토큰을 되돌려 받으면 셀 수는 있으나 그러면 방지가 플러그인의 성의에 달린다
+고정   test_plugins.py::test_a_job_a_plugin_created_does_not_wake_that_plugin
+       test_plugins.py::test_a_job_a_person_created_does_wake_plugins
+       test_plugins.py::test_a_plugins_job_wakes_no_plugin_at_all_not_just_its_own
+       test_plugins.py::test_the_origin_survives_uninstalling_the_plugin
+       test_architecture.py::test_the_job_creating_call_stamps_the_origin
+       test_architecture.py::test_only_one_place_decides_what_the_origin_means
+상태   부분 — 표식과 판정은 있고 **그 판정을 묻는 트리거가 아직 없다.**
+       표식은 잡이 만들어지는 순간에만 붙일 수 있어 트리거보다 먼저 넣었다
+
 ---
 
 ## 13. 하기로 했지만 아직 없는 것

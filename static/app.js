@@ -697,6 +697,8 @@ async function renderPlugins() {
     p.signature,
     p.active ? t('ui.plugin_active') : t('ui.plugin_inactive'),
     (p.allow_roles || []).join(', '),
+    // 이 플러그인이 만든 잡 수. 트리거가 없는 지금도 "얼마나 쓰고 있나" 를 답한다.
+    String(p.jobs_created || 0),
     p.files_present ? '' : t('ui.plugin_missing_files'),
     el('div', { class: 'row' }, [
       el('button', {
@@ -725,7 +727,9 @@ async function renderPlugins() {
   return [
     card(t('ui.plugin_install'), [el('div', { class: 'row' }, [picker, install])]),
     card(t('ui.plugins'), rows.length
-      ? [table([t('ui.plugin'), t('ui.plugin_signature'), '', '', '', ''], rows)]
+      ? [table(
+          [t('ui.plugin'), t('ui.plugin_signature'), '', '', t('ui.plugin_jobs'), '', ''],
+          rows)]
       : [el('p', { class: 'muted', text: t('ui.plugin_none') })]),
   ];
 }

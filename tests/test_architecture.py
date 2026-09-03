@@ -288,3 +288,57 @@ def test_partial_masking_cannot_keep_the_whole_value():
 
     assert 0 < MAX_KEEP_TAIL <= 8
     assert "MAX_KEEP_TAIL" in (APP / "main.py").read_text(encoding="utf-8")
+
+
+# ── 재귀 방지 — 출처 표식이 붙는 자리와, 그것을 읽는 자리 ─────────────────────
+
+
+def test_the_job_creating_call_stamps_the_origin():
+    """**잡을 만드는 그 한 줄이 출처를 반드시 정한다.**
+
+    `store.create_job` 의 `origin_plugin` 은 기본값이 `None` 이고, 그 기본값은
+    편의가 아니라 **"사람이 만들었다" 는 주장**이다. 제품 경로가 그 주장을 우연히
+    하게 두면, 새로 생긴 제출 경로가 만든 잡이 플러그인을 깨울 수 있게 된다 —
+    막으려는 고리가 정확히 그것이다.
+
+    런타임에 필수 인자로 막지 않는 이유: 잡을 만드는 곳은
+    `test_only_the_pipeline_creates_jobs` 가 이미 하나로 묶어 두었고, 그 하나를
+    여기서 보면 된다. 필수 인자로 바꾸면 잡을 직접 만드는 테스트 43곳이 전부
+    이 칸을 적어야 하는데, 그 잡음은 장치를 지키는 게 아니라 흐리게 만든다.
+    """
+    calls = []
+    for path in SOURCES:
+        if path.name == "store.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "create_job":
+                    calls.append((path.name, node))
+
+    assert len(calls) == 1, f"잡을 만드는 호출이 하나가 아니다: {[n for n, _ in calls]}"
+    name, node = calls[0]
+    stamped = {kw.arg for kw in node.keywords}
+    assert "origin_plugin" in stamped, f"{name} 의 잡 생성이 출처를 안 남긴다"
+
+
+@pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
+def test_only_one_place_decides_what_the_origin_means(path):
+    """**출처 칸을 읽고 판정하는 곳은 `plugins.may_wake_plugins` 하나다.**
+
+    트리거는 아직 없다. 그래서 이 검사는 **아직 안 쓰인 코드를 지키는 것이 아니라,
+    앞으로 쓰일 때 어디를 지나야 하는지를 지금 정해 두는 것**이다. 트리거를 짜는
+    사람이 `job["origin_plugin"]` 을 직접 읽어 자기 규칙을 세우면 여기서 실패한다 —
+    그때 규칙이 두 벌이 되고, 둘은 반드시 어긋난다.
+
+    허용하는 세 곳은 역할이 각각 다르다:
+      · `store.py`    — 스키마·마이그레이션·질의 (칸 자체)
+      · `pipeline.py` — 잡을 만들 때 붙이는 표식 (쓰기)
+      · `plugins.py`  — 그 표식이 무엇을 뜻하는지의 판정 (읽기)
+    """
+    if path.name in ("store.py", "pipeline.py", "plugins.py"):
+        return
+    source = path.read_text(encoding="utf-8")
+    assert "origin_plugin" not in source, (
+        f"{path.name} 이 출처를 직접 해석한다 — plugins.may_wake_plugins 를 쓸 것"
+    )
