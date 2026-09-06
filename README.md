@@ -288,3 +288,16 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 의존성은 5개입니다: `starlette` · `uvicorn` · `httpx` · `PyYAML` · `cryptography`.
 마지막 하나는 의식적인 추가입니다 — **암호를 직접 구현하는 쪽이 훨씬 나쁩니다.**
+
+### Claude Code 로 개발할 때
+
+`.claude/settings.json` 이 `PreToolUse` 훅 둘을 겁니다. 500줄이 넘는 파일을 `Read` 로
+통째로 읽거나 `cat`·`less`·`head -2000` 으로 컨텍스트에 붓는 것을 막고, `Grep` 으로
+자리를 찾아 `offset/limit`(또는 `sed -n '<시작>,<끝>p'`)으로 그 구간만 읽으라고
+돌려보냅니다. 파이프를 거치거나(`| grep`) 파일로 보내는(`> /tmp/x`) 명령은 막지 않습니다.
+상한은 `LCC_READ_MAX_LINES` 로 바꿉니다.
+
+이 저장소에서 `app/store.py` 한 번 통째 읽기가 약 30K 토큰입니다 — 그것을 막는 것이
+목적입니다. 스포티파이 Shunt 플러그인에서 훅 부분만 가져왔고, 저쪽의 "저가 모델에
+위임" 은 가져오지 않았습니다. `tests/test_claude_hooks.py` 가 설정에 적힌 명령 그대로
+두 훅을 실행해 판정을 봅니다 — 설정이 깨지면 훅은 조용히 없어지고, 그때 그 테스트가 먼저 압니다.
