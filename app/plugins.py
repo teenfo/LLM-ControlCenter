@@ -35,7 +35,7 @@ import tomllib
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -44,6 +44,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from .auth import ROLE_SERVICE, issue_token, service_is_active
+from .bootstrap import PLATFORM_TENANT
+from .config import INTERNAL
 from .schedule import ScheduleError, next_after, parse_cron
 from .store import JobRow, SqliteStore, TenantScope
 
@@ -61,9 +63,18 @@ MAX_FILES = 512
 #: 지금 지원하는 실행 형태. 늘릴 때는 그 형태의 감독 코드도 같이 온다.
 SUPPORTED_KINDS = ("external",)
 
-#: 지금 지원하는 트리거. `event`(잡 완료·알림)는 아직 없다 — 재귀 방지는 들어와
-#: 있으므로(`may_wake_plugins`) 막혔던 것은 풀렸고, 남은 것은 배관이다.
-SUPPORTED_TRIGGERS = ("schedule",)
+#: 지금 지원하는 트리거.
+#:   schedule — 시각이 원인. 컨트롤 플레인이 예정을 갖고 클레임만 준다(`claim_tick`)
+#:   event    — 잡 종결이 원인. 모델 경계를 지난 것을 뒤에서 본다(`pull_events`)
+SUPPORTED_TRIGGERS = ("schedule", "event")
+
+#: `event` 트리거가 구독할 수 있는 것. 지금은 잡 종결 하나다 — 프롬프트가 나가고
+#: 결과가 돌아온 그 경계가 훅을 원한 자리다. `notify` 의 운영 이벤트(node_offline·
+#: budget_warn…)는 여기 없다: 그것은 사람에게 가는 알림이고 채널이 따로 있다.
+SUPPORTED_EVENTS = ("job.finished",)
+
+#: 한 번의 풀이 돌려주는 최대 건수. 플러그인이 `limit` 을 더 크게 불러도 여기서 자른다.
+MAX_EVENT_BATCH = 200
 
 #: 역DNS. 점이 하나는 있어야 한다 — 일반 서비스 id(`acme-web`)와 섞이지 않게 한다.
 _ID = re.compile(r"^[a-z0-9]+(?:\.[a-z0-9][a-z0-9_-]*)+$")
@@ -90,9 +101,13 @@ class Manifest:
     allow_roles: tuple[str, ...] = ()
     rate_limit_per_min: int | None = None
     budget_usd_per_month: float | None = None
-    #: 스케줄 트리거. 둘 다 `None` 이면 이 플러그인은 스스로 안 깨어난다.
+    #: 스케줄 트리거. `None` 이면 예정이 없다.
     schedule: str | None = None
     schedule_tz: str = "UTC"
+    #: 이벤트 트리거. `None` 이면 구독이 없다. `event_roles` 가 비면 모든 역할이다.
+    #: 스케줄도 이벤트도 없으면 이 플러그인은 스스로 안 깨어난다.
+    event: str | None = None
+    event_roles: tuple[str, ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     def service_fields(self) -> dict[str, Any]:
@@ -109,15 +124,28 @@ def _require(condition: bool, message: str) -> None:
         raise PluginError(message)
 
 
-def _parse_trigger(trigger: Any) -> tuple[str | None, str]:
-    """`[trigger]` 절. 없으면 스케줄이 없는 것이고, 그것이 기본이다.
+@dataclass(frozen=True)
+class Trigger:
+    """`[trigger]` 절을 읽은 결과. 전부 비어 있으면 이 플러그인은 스스로 안 깨어난다."""
 
-    **표현식을 여기서 실제로 계산해 본다.** 형식만 보고 통과시키면 `0 0 30 2 *`
+    schedule: str | None = None
+    schedule_tz: str = "UTC"
+    event: str | None = None
+    event_roles: tuple[str, ...] = ()
+
+
+def _parse_trigger(trigger: Any) -> Trigger:
+    """`[trigger]` 절. 없으면 트리거가 없는 것이고, 그것이 기본이다.
+
+    **스케줄 표현식은 여기서 실제로 계산해 본다.** 형식만 보고 통과시키면 `0 0 30 2 *`
     (2월 30일)처럼 문법은 맞는데 영원히 안 도는 스케줄이 설치된다. 그 플러그인은
     켜져 있고 화면에도 보이는데 아무 일도 안 하고, 그 상태를 아무도 못 읽는다.
+
+    이벤트도 같은 태도다 — 모르는 이벤트 이름은 설치 시점에 거부한다. 받아 두면
+    "구독은 했는데 아무것도 안 오는" 플러그인이 되고, 그 원인을 화면에서 못 읽는다.
     """
     if trigger is None:
-        return None, "UTC"
+        return Trigger()
     _require(isinstance(trigger, dict), "[trigger] 절은 표가 아닙니다")
 
     kind = str(trigger.get("kind", ""))
@@ -125,6 +153,25 @@ def _parse_trigger(trigger: Any) -> tuple[str | None, str]:
         kind in SUPPORTED_TRIGGERS,
         f"지원하지 않는 트리거입니다: {kind!r} — 지금 되는 것은 {', '.join(SUPPORTED_TRIGGERS)}",
     )
+
+    if kind == "event":
+        event = trigger.get("event")
+        _require(
+            isinstance(event, str) and event in SUPPORTED_EVENTS,
+            f'[trigger] kind = "event" 의 event 는 {", ".join(SUPPORTED_EVENTS)} 중 하나여야 '
+            f"합니다: {event!r}",
+        )
+        roles = trigger.get("roles", [])
+        _require(
+            isinstance(roles, list) and all(isinstance(r, str) and r for r in roles),
+            "[trigger].roles 는 문자열 목록이어야 합니다 — 비우면 모든 역할입니다",
+        )
+        _require(
+            all(not r.startswith("_") for r in roles),
+            "밑줄로 시작하는 역할은 내부 전용이라 구독할 수 없습니다",
+        )
+        return Trigger(event=str(event), event_roles=tuple(dict.fromkeys(roles)))
+
     expression = trigger.get("schedule")
     _require(
         isinstance(expression, str) and expression.strip(),
@@ -137,7 +184,7 @@ def _parse_trigger(trigger: Any) -> tuple[str | None, str]:
         next_after(spec, time.time(), timezone=timezone)
     except ScheduleError as exc:
         raise PluginError(f"스케줄을 쓸 수 없습니다: {exc}") from exc
-    return spec.source, timezone
+    return Trigger(schedule=spec.source, schedule_tz=timezone)
 
 
 def parse_manifest(raw: bytes) -> Manifest:
@@ -208,7 +255,7 @@ def parse_manifest(raw: bytes) -> Manifest:
         "budget_usd_per_month 는 0 이상이어야 합니다",
     )
 
-    schedule, schedule_tz = _parse_trigger(data.get("trigger"))
+    trigger = _parse_trigger(data.get("trigger"))
 
     return Manifest(
         plugin_id=plugin_id,
@@ -221,8 +268,10 @@ def parse_manifest(raw: bytes) -> Manifest:
         allow_roles=tuple(roles),
         rate_limit_per_min=rate,
         budget_usd_per_month=float(budget) if budget is not None else None,
-        schedule=schedule,
-        schedule_tz=schedule_tz,
+        schedule=trigger.schedule,
+        schedule_tz=trigger.schedule_tz,
+        event=trigger.event,
+        event_roles=trigger.event_roles,
         raw=data,
     )
 
@@ -473,12 +522,16 @@ def install(
     host_version: str,
     require_signature: bool = True,
     now: Callable[[], float] = time.time,
+    known_roles: Iterable[str] | None = None,
 ) -> Installed:
     """번들을 검증하고 **서비스를 만들고 토큰을 발급한다.**
 
     설치가 곧 서비스 등록인 것이 요점이다. 이 함수가 끝나는 순간 플러그인은 아직
     한 줄도 안 돌았지만, 사용량 화면에 서비스 축으로 이미 잡히고 레이트리밋에 걸리고
     예산에 계산된다 — 배선을 따로 하지 않는다.
+
+    `known_roles` 를 주면 이벤트 구독의 역할 필터를 그 목록에 대고 검사한다. 오타 난
+    역할은 조용히 아무것도 안 받는 플러그인이 되므로 **설치 시점에** 거부한다.
     """
     _require(
         len(bundle) <= MAX_BUNDLE_BYTES,
@@ -493,6 +546,14 @@ def install(
         names = safe_names(archive)
         _require(MANIFEST_NAME in names, f"번들 루트에 {MANIFEST_NAME} 이 없습니다")
         manifest = parse_manifest(_read(archive, MANIFEST_NAME))
+
+        if known_roles is not None and manifest.event_roles:
+            unknown = sorted(set(manifest.event_roles) - set(known_roles))
+            _require(
+                not unknown,
+                f"[trigger].roles 에 없는 역할이 있습니다: {', '.join(unknown)} — "
+                "오타면 이 플러그인은 켜 놓아도 아무것도 못 받습니다",
+            )
 
         if not host_satisfies(host_version, manifest.requires_host):
             raise PluginError(
@@ -565,14 +626,19 @@ def install(
         "installed_at": now(),
         "schedule": manifest.schedule,
         "schedule_tz": manifest.schedule_tz if manifest.schedule else None,
+        "event": manifest.event,
+        "event_roles": (
+            json.dumps(list(manifest.event_roles), ensure_ascii=False) if manifest.event else None
+        ),
     })
     # 설치는 켜는 것이 아니다. 모델 설치 요청이 승인과 나뉘어 있는 것과 같다.
     # 판올림도 같다 — 새 코드는 새 코드이므로 다시 꺼진다.
     store.set_service_status(scope, service_id, "inactive")
     # **꺼지면 예정도 없다.** 여기서 남겨 두면 판올림 뒤 꺼져 있는 플러그인의
     # 예정이 살아 있게 되고, `set_active` 가 끌 때 지우는 것과 규칙이 갈린다.
-    # 사람이 다시 켜는 순간 그때부터 다시 잡힌다.
+    # 사람이 다시 켜는 순간 그때부터 다시 잡힌다. 이벤트 커서도 같은 규칙이다.
     store.set_plugin_next_run(manifest.plugin_id, None)
+    store.set_plugin_event_cursor(manifest.plugin_id, None)
     store.audit(
         actor, "install_plugin", target=manifest.plugin_id,
         detail={"version": manifest.version, "signature": state, "service": service_id},
@@ -622,6 +688,13 @@ def set_active(
         store.set_plugin_next_run(
             plugin_id,
             _next_run(row["schedule"], row["schedule_tz"], now()) if active else None,
+        )
+    if row["event"]:
+        # **켜는 순간부터다.** 꺼져 있던 동안의 종결은 안 준다 — 스케줄이 밀린 것을
+        # 몰아 돌리지 않는 것과 같은 이유다: 사흘 꺼 뒀다 켠 사람이 원한 것은 사흘치
+        # 종결 이벤트가 아니다. 끄면 커서를 지운다 — 꺼진 플러그인의 「밀림」은 뜻이 없다.
+        store.set_plugin_event_cursor(
+            plugin_id, store.latest_plugin_event_id() if active else None,
         )
     store.audit(
         actor, "activate_plugin" if active else "deactivate_plugin", target=plugin_id,
@@ -743,17 +816,177 @@ def may_wake_plugins(job: JobRow) -> bool:
     상관 토큰을 되돌려 주게 하면 셀 수는 있지만, 그러면 재귀를 안 도는 것이
     **플러그인의 성의**에 달린다. 그건 방지가 아니다.
 
-    ### 지금 부르는 곳이 없다
+    ### 부르는 곳
 
-    트리거가 아직 없어서(§11-4) 이 판정을 물을 곳이 아직 없다. 그래도 지금 넣는
-    이유는 두 가지다 — 표식(`jobs.origin_plugin`)은 **잡이 만들어지는 순간에만**
-    붙일 수 있어서 나중에 소급할 수 없고, 트리거를 먼저 붙이면 그 사이에 만들어진
-    잡은 출처를 모른 채 남는다. `test_architecture` 가 `origin_plugin` 을 읽는 곳을
-    이 함수 하나로 묶어 두므로, 트리거를 짜는 사람은 여기를 지날 수밖에 없다.
+    `pull_events` 하나다 — 이벤트 트리거가 종결을 플러그인에게 내주기 직전에 묻는다.
+    표식(`jobs.origin_plugin`)은 **잡이 만들어지는 순간에만** 붙일 수 있어서 트리거보다
+    먼저 들어왔고, `test_architecture` 가 `origin_plugin` 을 읽는 곳을 이 함수 하나로
+    묶어 두므로 다음 트리거를 짜는 사람도 여기를 지날 수밖에 없다.
     """
     # `is None` 이다. 빈 문자열이 들어오는 경우를 "사람" 으로 읽으면 깨우지 말아야 할
     # 잡을 깨운다 — 애매하면 **안 깨우는 쪽**이 안전한 쪽이다.
     return job.origin_plugin is None
+
+
+# ── 이벤트 풀 ────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Pull:
+    """한 번의 풀에 대한 답."""
+
+    events: list[dict[str, Any]]
+    #: 이번에 **훑은** 마지막 이벤트. 플러그인은 처리를 마치면 이 값을 그대로 ack 한다.
+    #: 빈 배치라도 전진할 수 있다 — 플러그인이 만든 잡의 종결은 훑되 내주지 않는다.
+    cursor: int
+    #: 그 뒤에 남은 건수. 0 이 아니면 바로 다시 물어도 된다.
+    pending: int
+
+
+def visible_tenant(plugin_row: Mapping[str, Any]) -> str | None:
+    """이 플러그인이 보는 테넌트.
+
+    플러그인은 지금 플랫폼 테넌트에 산다(`docs/plugin-exploration.md` §3-4). 그 플러그인이
+    자기 테넌트의 잡만 본다면 볼 것이 없다 — 소비자의 잡은 다른 테넌트에 있다. 그래서
+    플랫폼 테넌트의 플러그인은 **전 테넌트를** 보고(`None`), 보통 테넌트에 설치된
+    플러그인은 자기 테넌트만 본다. 설치처가 `plugin_tenant` 를 어느 테넌트로 두느냐가
+    곧 이 범위다 — 별도 스위치를 두지 않는다.
+    """
+    return None if plugin_row["tenant_id"] == PLATFORM_TENANT else plugin_row["tenant_id"]
+
+
+def subscribed_roles(plugin_row: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = plugin_row["event_roles"]
+    return tuple(json.loads(raw)) if raw else ()
+
+
+def event_payload(
+    event_id: int, ts: float, status: str, job: JobRow, boundaries: Mapping[str, str],
+) -> dict[str, Any]:
+    """플러그인이 받는 한 건. **모델이 본 것을 준다 — 소비자가 보낸 원문이 아니다.**
+
+    가드가 마스킹한 뒤의 프롬프트가 노드로 갔고, 경계 밖 노드였으면 더 가린 변형이
+    갔다. 훅은 그 경계에 서 있으므로 그것을 본다. 원문 암호문은 여기 없다 — 원문은
+    테넌트 관리자의 감사 남는 열람 경로(`tenant_job_raw`) 하나로만 열린다.
+
+    응답도 같다 — 출력 가드를 지나 소비자에게 나간 것(`jobs.response`)이다.
+    노드에 안 간 잡(배치 실패·큐에서 취소)은 프롬프트가 `None` 이다: 모델이 본
+    것이 없다. 노드를 모르면(지워진 노드) 밖으로 친다 — 더 가린 쪽이 안전한 쪽이다.
+    """
+    boundary = boundaries.get(job.node) if job.node else None
+    outbound = boundary != INTERNAL
+    prompt = system = None
+    if job.node is not None:
+        prompt = job.prompt_external if outbound and job.prompt_external else job.prompt_masked
+        system = job.system_external if outbound and job.system_external else job.system_masked
+    return {
+        "id": event_id,
+        "kind": SUPPORTED_EVENTS[0],
+        "ts": ts,
+        "job_id": job.id,
+        "tenant": job.tenant_id,
+        "service": job.service_id,
+        "end_user": job.end_user_hash,
+        "job_kind": job.kind,
+        "role": job.role,
+        "route": job.route,
+        "status": status,
+        "error": job.error,
+        "error_code": job.error_code,
+        "model": job.model,
+        "node": job.node,
+        "boundary": boundary,
+        "prompt": prompt,
+        "system": system,
+        "output": job.response if status == "ok" else None,
+        "usage": {
+            "input_tokens": job.input_tokens,
+            "output_tokens": job.output_tokens,
+            "cost_usd": job.cost_usd,
+        },
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+    }
+
+
+def pull_events(
+    store: SqliteStore,
+    plugin_id: str,
+    *,
+    ack: int | None,
+    limit: int,
+    now: float,
+    boundaries: Mapping[str, str],
+) -> Pull | None:
+    """플러그인이 "내가 못 본 종결이 있나" 를 물으면 여기서 답한다.
+
+    ### 관찰이지 개입이 아니다
+
+    훅은 프롬프트가 나가고 결과가 돌아온 **뒤에** 본다. 나가기 전에 고치거나 막는
+    자리가 아니다. 그 자리를 열면 요청 경로에 외부 프로세스가 끼고, 그 프로세스가
+    죽었을 때 "막을 것인가 통과시킬 것인가" 를 정해야 한다 — 가드의 순서 계약
+    ①~⑦ 은 그 결정을 이 제품 안에서 끝내려고 있는 것이다. 개입이 필요하면 그때
+    `on_hook_error` 같은 정책과 함께 별도로 결정한다.
+
+    ### 풀이다 — 스케줄과 같은 이유
+
+    컨트롤 플레인이 플러그인을 부르러 나가지 않는다(`claim_tick` 의 근거 그대로).
+    종결은 DB 트리거가 아웃박스(`plugin_events`)에 쌓고, 플러그인이 자기 토큰으로
+    커서 다음 것을 가져간다. 그래서:
+
+    - **at-least-once 다.** ack 하기 전에 죽으면 같은 배치를 다시 받는다. 이벤트 `id` 로
+      중복을 거르는 것은 플러그인 몫이다
+    - **복제본이 여럿이어도 커서는 앞으로만 간다** — ack 가 CAS 다(`ack_plugin_events`)
+    - **끄면 선다** — 이 경로도 `auth.active_service` 를 지난다(라우트에서)
+    - **켜는 순간부터다** — 커서가 켤 때 그 시점으로 잡힌다(`set_active`)
+
+    ### 재귀 방지가 여기서 작동한다
+
+    플러그인이 만든 잡의 종결은 **어떤 플러그인에게도** 안 준다(`may_wake_plugins`).
+    A 가 받은 이벤트로 잡을 만들면 그 잡의 종결은 A 에게도 B 에게도 안 온다 — 그래서
+    플러그인이 하는 일은 사람이 시킨 일에서 딱 한 걸음이다. 훑기는 하므로 커서는
+    지나가고, 그래서 빈 배치라도 `cursor` 는 전진할 수 있다.
+
+    ### 감사를 풀마다 남기지 않는다
+
+    초 단위 폴링이 감사 사슬을 잡음으로 채운다. 동의의 기록은 `activate_plugin`
+    감사(사람이 켰다)이고, 어디까지 읽었는지는 `plugins.event_cursor`·`last_event_at`
+    이 화면에 보여 준다. 원문 열람과 달리 여기서 나가는 것은 마스킹본이다.
+
+    `None` 은 "이 플러그인은 이벤트를 구독하지 않는다" 다 — 라우트가 409 로 바꾼다.
+    """
+    row = store.get_plugin(plugin_id)
+    if row is None or not row["event"]:
+        return None
+
+    if ack is not None:
+        store.ack_plugin_events(plugin_id, int(ack), now=now)
+        row = store.get_plugin(plugin_id)
+
+    cursor = row["event_cursor"]
+    if cursor is None:
+        # 켜져 있는데 커서가 없다 — 이 판 이전에 켜 둔 행이거나 손으로 만진 행이다.
+        # 지금부터로 잡는다. 0 으로 잡으면 보존 기간 전체(한 달치)가 한꺼번에 나간다.
+        cursor = store.latest_plugin_event_id()
+        store.set_plugin_event_cursor(plugin_id, cursor)
+
+    tenant = visible_tenant(row)
+    roles = subscribed_roles(row) or None
+    batch = store.plugin_events_after(
+        cursor, tenant_id=tenant, roles=roles, limit=max(1, min(int(limit), MAX_EVENT_BATCH)),
+    )
+
+    events: list[dict[str, Any]] = []
+    last = int(cursor)
+    for event_id, ts, status, job in batch:
+        last = event_id
+        if not may_wake_plugins(job):
+            continue
+        events.append(event_payload(event_id, ts, status, job, boundaries))
+
+    pending = store.count_plugin_events_after(last, tenant_id=tenant, roles=roles)
+    return Pull(events=events, cursor=last, pending=pending)
 
 
 def snapshot(store: SqliteStore, *, data_dir: Path) -> list[dict[str, Any]]:
@@ -792,6 +1025,19 @@ def snapshot(store: SqliteStore, *, data_dir: Path) -> list[dict[str, Any]]:
             "schedule_tz": row["schedule_tz"],
             "next_run_at": row["next_run_at"],
             "last_run_at": row["last_run_at"],
+            # 이벤트 구독. **켜 놓았는데 「밀림」이 늘기만 하면 플러그인이 안 돌고
+            # 있는 것이다** — 스케줄의 `last_run_at` 이 비어 있는 것과 같은 진단이다.
+            "event": row["event"],
+            "event_roles": list(subscribed_roles(row)),
+            "event_cursor": row["event_cursor"],
+            "last_event_at": row["last_event_at"],
+            "events_pending": (
+                store.count_plugin_events_after(
+                    row["event_cursor"], tenant_id=visible_tenant(row),
+                    roles=subscribed_roles(row) or None,
+                )
+                if row["event"] and row["event_cursor"] is not None else None
+            ),
             "last_error": row["last_error"],
             "installed_at": row["installed_at"],
         })

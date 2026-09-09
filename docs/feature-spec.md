@@ -1200,7 +1200,7 @@
        test_plugins.py::test_the_lifecycle_is_audited
 계약   화면이 자체 상태를 들고 있지 않다 — 활성 여부는 서버가 서비스에서 파생해 준다
        번들 업로드는 raw body 다(멀티파트는 6번째 의존성)
-상태   부분 — `external` 외 실행 형태 없음. 이벤트·스케줄 트리거 없음
+상태   부분 — `external` 외 실행 형태 없음. 트리거는 `schedule`(PLUGIN-8)·`event`(PLUGIN-9) 둘
 
 ### PLUGIN-7  재귀 방지 — 플러그인이 만든 잡은 아무것도 깨우지 않는다
 정의   잡마다 그것을 만든 플러그인을 적어 두고, 그 잡의 완료로는 어떤 플러그인도 깨우지 않는다.
@@ -1220,7 +1220,9 @@
        test_plugins.py::test_the_origin_survives_uninstalling_the_plugin
        test_architecture.py::test_the_job_creating_call_stamps_the_origin
        test_architecture.py::test_only_one_place_decides_what_the_origin_means
-상태   부분 — 표식과 판정은 있고 **그 판정을 묻는 이벤트 트리거가 아직 없다.**
+       test_architecture.py::test_the_event_trigger_asks_the_recursion_judgment
+       test_plugins.py::test_a_plugins_own_job_is_delivered_to_no_plugin
+상태   구현됨 — 이벤트 트리거(PLUGIN-9)가 내주기 직전에 이 판정을 묻는다.
        스케줄 트리거(PLUGIN-8)는 잡이 아니라 시각이 원인이라 이 판정을 안 지난다
 
 ### PLUGIN-8  스케줄 트리거
@@ -1244,7 +1246,42 @@
        test_plugins.py::test_turning_the_plugin_off_stops_its_schedule_at_the_same_choke_point
        test_multiprocess.py::test_only_one_replica_claims_a_scheduled_tick
        test_architecture.py::test_only_one_place_decides_whether_a_service_is_switched_on
-상태   구현됨 — `schedule` 하나다. `event`(잡 완료·알림) 트리거는 미구현
+상태   구현됨
+
+### PLUGIN-9  이벤트 트리거 — 모델 경계 뒤의 훅
+정의   매니페스트가 `[trigger] kind = "event"` 와 `event = "job.finished"` 를 선언하면, 잡이 종결될 때마다
+       컨트롤 플레인이 아웃박스에 한 줄을 쌓고 플러그인이 `POST /v1/plugin/events` 로 커서 다음 것을
+       가져간다. 이벤트에는 **모델이 본 프롬프트**(가드가 가린 뒤, 노드 경계에 따른 변형)와 **나간 응답**
+       (출력 가드 뒤)이 실린다. `roles = [...]` 로 역할을 좁힐 수 있다.
+표면   `plugin.toml` 의 `[trigger]` (`event` · `roles`) · `POST /v1/plugin/events` (`ack` · `limit`) ·
+       `GET /v1/platform/plugins` 의 `event`·`event_roles`·`events_pending`·`last_event_at` · 관제 UI 「트리거」 칸
+구현   app/store.py:_finish_trigger_sql(아웃박스를 쓰는 SQLite 트리거) · `plugin_events` 표 ·
+       app/store.py:ack_plugin_events · app/plugins.py:pull_events · app/plugins.py:event_payload ·
+       app/main.py:plugin_events
+계약   **관찰이지 개입이 아니다** — 종결 뒤에 본다. 나가기 전에 고치거나 막는 자리가 아니다: 그 자리를 열면
+       요청 경로에 외부 프로세스가 끼고, 그것이 죽었을 때의 정책이 필요하다. 그 결정은 별도다
+       **모델이 본 것을 준다** — 소비자가 보낸 원문이 아니다. 노드에 안 간 잡(큐 취소·배치 실패)은 프롬프트가 없다
+       아웃박스를 쓰는 곳은 DB 트리거 하나다 — 종결 경로가 여덟 개 남짓이라 파이썬에서 하나씩 넣으면 하나가
+       빠진다. 종결과 같은 트랜잭션이고, 종결에서 종결로(검토 판정)는 새 이벤트가 아니다
+       본문을 복제하지 않는다 — 행은 잡을 가리키고 내용은 읽을 때 합친다. 보존·파기가 잡과 함께 간다
+       풀이다(PLUGIN-8 과 같은 이유) · at-least-once · 커서는 `ack` 로만 앞으로 간다(CAS) · 없는 이벤트는 ack 못 한다
+       **플러그인이 만든 잡의 종결은 어떤 플러그인에게도 안 준다** — PLUGIN-7 의 판정을 내주기 직전에 묻는다
+       켜는 순간부터다 — 커서가 켤 때 그 시점으로 잡힌다. 꺼져 있던 동안의 종결은 안 준다
+       **끄면 선다** — 이 경로도 `auth.active_service` 를 지난다
+       사는 테넌트가 범위다 — 플랫폼 테넌트의 플러그인은 전 테넌트를, 보통 테넌트의 플러그인은 자기 테넌트만 본다
+       풀마다 감사를 남기지 않는다 — 동의의 기록은 `activate_plugin` 이고, 커서·마지막 수신은 화면에 있다
+고정   test_plugins.py::test_a_finished_job_is_delivered_once_with_what_the_model_saw
+       test_plugins.py::test_a_plugins_own_job_is_delivered_to_no_plugin
+       test_plugins.py::test_a_platform_plugin_sees_every_tenant_and_a_tenant_plugin_only_its_own
+       test_plugins.py::test_the_cursor_only_moves_forward_and_never_past_what_exists
+       test_plugins.py::test_events_before_activation_are_not_replayed
+       test_plugins.py::test_a_review_verdict_is_not_a_new_finish_but_a_second_run_is
+       test_plugins.py::test_purging_the_job_takes_its_event_with_it
+       test_plugins.py::test_turning_the_plugin_off_stops_its_events_at_the_same_choke_point
+       test_multiprocess.py::test_the_event_cursor_never_moves_backwards_across_replicas
+       test_architecture.py::test_only_the_finish_trigger_writes_plugin_events
+       test_architecture.py::test_the_event_trigger_asks_the_recursion_judgment
+상태   구현됨 — 이벤트는 `job.finished` 하나. 나가기 전에 개입하는 훅(수정·차단)은 없다
 
 ---
 
@@ -1407,6 +1444,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_plugin_activate` | `POST /v1/platform/plugins/{id}/activate` | PLUGIN-4 |
 | `platform_plugin_delete` | `DELETE /v1/platform/plugins/{id}` | PLUGIN-5 |
 | `plugin_tick` | `POST /v1/plugin/tick` | PLUGIN-8 |
+| `plugin_events` | `POST /v1/plugin/events` | PLUGIN-9 |
 | `platform_diagnostics` | `GET /v1/platform/diagnostics` | OPS-3 |
 | `platform_notifications` | `GET/POST /v1/platform/notifications` | OPS-4 |
 | `metrics` | `GET /metrics` | OPS-1 |

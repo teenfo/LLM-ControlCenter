@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import zipfile
@@ -754,10 +755,10 @@ def test_a_schedule_that_never_fires_is_refused(harness, signing_key, platform_t
 
 
 def test_an_unsupported_trigger_kind_is_refused(harness, signing_key, platform_tenant):
-    """`event` 는 아직 배관이 없다. 받아 두고 안 도는 것보다 거부가 낫다."""
-    evented = SCHEDULED.replace('kind = "schedule"', 'kind = "event"')
+    """`daemon` 은 배관이 없다. 받아 두고 안 도는 것보다 거부가 낫다."""
+    daemon = SCHEDULED.replace('kind = "schedule"', 'kind = "daemon"')
     with pytest.raises(PluginError) as caught:
-        do_install(harness, bundle(evented, key=signing_key))
+        do_install(harness, bundle(daemon, key=signing_key))
     assert "트리거" in str(caught.value)
 
 
@@ -936,3 +937,392 @@ def test_a_plugin_can_only_claim_its_own_tick(harness, client, signing_key, plat
         "/v1/plugin/tick", json={"id": "someone.else"}, headers=auth(result.token)
     ).json()
     assert body["id"] == "acme.daily-digest"
+
+
+# ── 이벤트 트리거 ────────────────────────────────────────────────────────────
+#
+# 훅은 **모델 경계 뒤에 선다.** 프롬프트가 나가고 결과가 돌아온 뒤에 보고, 나가기 전에
+# 고치거나 막지 않는다. 여기서 고정하는 것은 넷이다 — 종결마다 한 번 · 모델이 본 것만 ·
+# 플러그인이 만든 잡은 안 줌 · 커서는 앞으로만.
+
+EVENTED = MANIFEST + """
+[trigger]
+kind = "event"
+event = "job.finished"
+"""
+
+EVENTED_SUMMARIZE_ONLY = EVENTED + 'roles = ["summarize"]\n'
+
+WATCHER = EVENTED.replace('id = "acme.daily-digest"', 'id = "acme.watcher"')
+
+#: 가드가 **가리는** 값(이메일)과 **경계에 따라** 가리는 값(카드 — 안에서는 보이고 밖으로는
+#: 가린다). 주민번호는 차단이라 여기 못 쓴다 — 차단된 프롬프트는 잡이 되지 않는다.
+EMAIL = "hong@example.com"
+VALID_CARD = "4111 1111 1111 1111"
+
+
+def drive(harness, lane="interactive", rounds=6):
+    """스케줄러를 손으로 돌린다 — 테스트는 배경 루프를 켜지 않는다."""
+
+    async def run() -> None:
+        for _ in range(rounds):
+            await harness.scheduler.tick(lane)
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def boundaries(harness):
+    return {name: state.node.data_boundary for name, state in harness.cluster.nodes.items()}
+
+
+def install_evented(harness, signing_key, manifest=EVENTED, *, plugin_id="acme.daily-digest", **overrides):
+    result = do_install(harness, bundle(manifest, key=signing_key), **overrides)
+    plugins.set_active(harness.store, plugin_id, True, actor="t", now=harness.clock)
+    return result
+
+
+def submit(client, token, prompt="요약할 내용", role="summarize"):
+    response = client.post(
+        "/v1/generate", json={"role": role, "prompt": prompt, "wait": 0}, headers=auth(token),
+    )
+    assert response.status_code in (200, 202), response.text
+    return response.json()["job_id"]
+
+
+def pull(harness, plugin_id="acme.daily-digest", *, ack=None, limit=50):
+    return plugins.pull_events(
+        harness.store, plugin_id, ack=ack, limit=limit, now=harness.clock(),
+        boundaries=boundaries(harness),
+    )
+
+
+def test_a_declared_event_subscription_is_stored(harness, signing_key, platform_tenant):
+    do_install(harness, bundle(EVENTED_SUMMARIZE_ONLY, key=signing_key))
+    row = harness.store.get_plugin("acme.daily-digest")
+    assert row["event"] == "job.finished"
+    assert json.loads(row["event_roles"]) == ["summarize"]
+    assert row["event_cursor"] is None, "설치는 켜는 것이 아니다 — 커서도 없다"
+
+
+def test_an_unknown_event_is_refused_at_install(harness, signing_key, platform_tenant):
+    """구독은 했는데 아무것도 안 오는 플러그인이 되면 그 원인을 화면에서 못 읽는다."""
+    with pytest.raises(PluginError) as caught:
+        do_install(harness, bundle(EVENTED.replace("job.finished", "job.started"), key=signing_key))
+    assert "event" in str(caught.value)
+
+
+def test_a_role_filter_with_a_typo_is_refused_when_the_roles_are_known(
+    harness, signing_key, platform_tenant
+):
+    """오타 난 역할은 조용히 아무것도 안 받는 플러그인이 된다 — 설치 시점에 거른다."""
+    typo = EVENTED + 'roles = ["sumarize"]\n'
+    with pytest.raises(PluginError) as caught:
+        do_install(harness, bundle(typo, key=signing_key), known_roles=["summarize", "inside"])
+    assert "sumarize" in str(caught.value)
+
+
+def test_an_internal_role_cannot_be_subscribed(harness, signing_key, platform_tenant):
+    with pytest.raises(PluginError):
+        do_install(harness, bundle(EVENTED + 'roles = ["_guard_classify"]\n', key=signing_key))
+
+
+def test_a_finished_job_is_delivered_once_with_what_the_model_saw(
+    harness, client, signing_key, platform_tenant, acme
+):
+    """**이 절의 핵심이다.** 훅은 모델이 본 것을 본다 — 소비자가 보낸 원문이 아니다.
+
+    가드가 가린 뒤의 프롬프트가 노드로 갔고, 출력 가드를 지난 응답이 소비자에게 갔다.
+    훅은 그 둘을 받는다. 원문은 여기 없다.
+    """
+    install_evented(harness, signing_key)
+    job_id = submit(
+        client, acme["service"], prompt=f"담당자 {EMAIL} 의 카드 {VALID_CARD} 관련 문의를 요약",
+    )
+
+    assert pull(harness).events == [], "큐에 있는 잡은 아직 종결이 아니다"
+
+    drive(harness)
+    job = harness.store.get_job(TenantScope("acme"), job_id)
+    assert job.status == "ok", job.error
+
+    first = pull(harness)
+    [event] = first.events
+    assert event["job_id"] == job_id
+    assert event["kind"] == "job.finished" and event["status"] == "ok"
+    assert event["tenant"] == "acme" and event["role"] == "summarize"
+    # 노드의 경계에 따라 나간 변형이 다르다 — 훅은 **나간 그것**을 준다.
+    sent = job.prompt_masked if boundaries(harness)[job.node] == "internal" else job.prompt_external
+    assert event["prompt"] == sent and event["boundary"] == boundaries(harness)[job.node]
+    assert EMAIL not in event["prompt"], "가드가 가린 값이 훅에서 다시 보이면 안 된다"
+    assert event["output"] == job.response
+    assert event["model"] == job.model and event["node"] == job.node
+    assert first.pending == 0
+
+    again = pull(harness)
+    assert [e["id"] for e in again.events] == [event["id"]], "ack 전에는 같은 배치를 다시 준다"
+
+    acked = pull(harness, ack=first.cursor)
+    assert acked.events == [] and acked.pending == 0
+    assert harness.store.get_plugin("acme.daily-digest")["event_cursor"] == first.cursor
+
+
+def test_a_failed_job_carries_its_error_and_no_output(harness, signing_key, platform_tenant, acme):
+    install_evented(harness, signing_key)
+    scope = TenantScope("acme")
+    job_id = harness.store.create_job(
+        scope, service_id="acme-web", role="summarize", lane="interactive",
+        status="running", prompt_masked="가린 프롬프트",
+    )
+    harness.store.update_job(
+        scope, job_id, node="in-1", status="failed", error="노드가 죽었다",
+        error_code="backend_unavailable", finished_at=harness.clock(),
+    )
+    [event] = pull(harness).events
+    assert event["status"] == "failed" and event["error_code"] == "backend_unavailable"
+    assert event["output"] is None
+    assert event["prompt"] == "가린 프롬프트", "노드까지 간 잡이다 — 모델이 본 프롬프트는 있다"
+
+
+def test_a_job_that_never_reached_a_node_has_no_prompt_in_its_event(
+    harness, client, signing_key, platform_tenant, acme
+):
+    """큐에서 취소된 잡도 종결이지만 모델이 본 것이 없다 — 훅은 그 경계에 서 있다."""
+    install_evented(harness, signing_key)
+    job_id = submit(client, acme["service"])
+    cancelled = client.delete(f"/v1/jobs/{job_id}", headers=auth(acme["service"]))
+    assert cancelled.status_code == 200, cancelled.text
+
+    [event] = pull(harness).events
+    assert event["status"] == "cancelled"
+    assert event["node"] is None and event["prompt"] is None and event["output"] is None
+
+
+def test_a_plugins_own_job_is_delivered_to_no_plugin(harness, client, signing_key, platform_tenant):
+    """**재귀 방지가 실제로 작동하는 자리다.**
+
+    플러그인이 받은 이벤트로 잡을 만들면 그 잡의 종결은 자기에게도 남에게도 안 온다.
+    훑기는 하므로 커서는 지나간다 — 안 지나가면 그 이벤트가 영원히 「밀림」으로 남는다.
+    """
+    digest = install_evented(harness, signing_key)
+    install_evented(harness, signing_key, WATCHER, plugin_id="acme.watcher")
+
+    job_id = submit(client, digest.token)
+    drive(harness)
+    finished = harness.store.get_job(TenantScope(PLATFORM), job_id)
+    assert finished.status == "ok", finished.error
+
+    for plugin_id in ("acme.daily-digest", "acme.watcher"):
+        result = pull(harness, plugin_id)
+        assert result.events == [], f"{plugin_id} 가 플러그인이 만든 잡의 종결을 받았다"
+        assert result.cursor == harness.store.latest_plugin_event_id(), "훑었으므로 커서는 지나간다"
+        assert result.pending == 0
+
+
+def test_a_platform_plugin_sees_every_tenant_and_a_tenant_plugin_only_its_own(
+    harness, client, signing_key, platform_tenant, acme, globex
+):
+    """플러그인이 사는 테넌트가 곧 보는 범위다 — 별도 스위치가 없다."""
+    install_evented(harness, signing_key)
+    install_evented(harness, signing_key, WATCHER, plugin_id="acme.watcher", tenant_id="acme")
+
+    submit(client, acme["service"])
+    submit(client, globex["service"])
+    drive(harness)
+
+    assert {e["tenant"] for e in pull(harness).events} == {"acme", "globex"}
+    assert {e["tenant"] for e in pull(harness, "acme.watcher").events} == {"acme"}
+
+
+def test_the_role_filter_narrows_what_is_delivered(harness, client, signing_key, platform_tenant, acme):
+    install_evented(harness, signing_key, EVENTED_SUMMARIZE_ONLY)
+    summarize = submit(client, acme["service"], role="summarize")
+    inside = submit(client, acme["service"], role="inside")
+    drive(harness)
+    for job_id in (summarize, inside):
+        assert harness.store.get_job(TenantScope("acme"), job_id).status == "ok"
+
+    delivered = pull(harness).events
+    assert [e["job_id"] for e in delivered] == [summarize]
+
+
+def test_the_cursor_only_moves_forward_and_never_past_what_exists(
+    harness, client, signing_key, platform_tenant, acme
+):
+    """뒤처진 복제본의 ack 가 커서를 되돌리면 앞선 복제본이 처리한 것이 다시 나간다."""
+    install_evented(harness, signing_key)
+    for _ in range(3):
+        submit(client, acme["service"])
+    drive(harness)
+
+    first = pull(harness, limit=2)
+    assert len(first.events) == 2 and first.pending == 1
+    second = pull(harness, ack=first.cursor, limit=2)
+    assert len(second.events) == 1 and second.pending == 0
+    third_id = second.events[0]["id"]
+
+    stale = pull(harness, ack=first.cursor - 1)
+    assert [e["id"] for e in stale.events] == [third_id], "뒤처진 ack 가 커서를 되돌렸다"
+    bogus = pull(harness, ack=second.cursor + 1000)
+    assert [e["id"] for e in bogus.events] == [third_id], "없는 이벤트를 ack 해 미래를 건너뛰었다"
+
+
+def test_events_before_activation_are_not_replayed(harness, client, signing_key, platform_tenant, acme):
+    """켜는 순간부터다 — 사흘 꺼 뒀다 켠 사람이 원한 것은 사흘치 종결이 아니다."""
+    do_install(harness, bundle(EVENTED, key=signing_key))
+    submit(client, acme["service"])
+    drive(harness)
+
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+    assert pull(harness).events == []
+
+    fresh = submit(client, acme["service"])
+    drive(harness)
+    assert [e["job_id"] for e in pull(harness).events] == [fresh]
+
+    plugins.set_active(harness.store, "acme.daily-digest", False, actor="t", now=harness.clock)
+    assert harness.store.get_plugin("acme.daily-digest")["event_cursor"] is None
+
+
+def test_a_review_verdict_is_not_a_new_finish_but_a_second_run_is(
+    harness, signing_key, platform_tenant, acme
+):
+    """종결에서 종결로(검토 판정)는 같은 종결의 정정이다. 큐로 돌아갔다 다시 끝나면 새 종결이다."""
+    install_evented(harness, signing_key)
+    scope = TenantScope("acme")
+    job_id = harness.store.create_job(
+        scope, service_id="acme-web", role="summarize", lane="interactive",
+        status="running", prompt_masked="p",
+    )
+    harness.store.update_job(scope, job_id, status="needs_review", finished_at=1.0)
+    harness.store.update_job(scope, job_id, status="failed", finished_at=2.0)
+    assert [e["status"] for e in pull(harness).events] == ["needs_review"]
+
+    harness.store.update_job(scope, job_id, status="queued")
+    harness.store.update_job(scope, job_id, status="running")
+    harness.store.update_job(scope, job_id, status="ok", finished_at=3.0, response="r")
+    assert [e["status"] for e in pull(harness).events] == ["needs_review", "ok"]
+
+
+def test_purging_the_job_takes_its_event_with_it(harness, client, signing_key, platform_tenant, acme):
+    """이벤트 행은 잡을 가리키기만 한다 — 그래서 보존·파기가 잡과 함께 간다."""
+    install_evented(harness, signing_key)
+    submit(client, acme["service"])
+    drive(harness)
+    assert len(pull(harness).events) == 1
+
+    harness.clock.advance(31 * 86400)
+    purged = harness.store.purge_expired(job_retention_days=30)
+    assert purged["jobs"] == 1
+
+    after = pull(harness)
+    assert after.events == [] and after.pending == 0
+    left = harness.store._conn.execute("SELECT COUNT(*) AS n FROM plugin_events").fetchone()["n"]
+    assert left == 0
+
+
+def test_the_prompt_in_the_event_is_the_variant_the_node_boundary_received():
+    """경계 밖 노드에는 더 가린 변형이 갔다. 노드를 모르면 밖으로 친다 — 더 가린 쪽이 안전한 쪽이다."""
+    job = JobRow(
+        id="j", tenant_id="acme", service_id="s", role="summarize", lane="interactive",
+        status="ok", node="n", prompt_masked="덜 가린", prompt_external="더 가린",
+    )
+
+    def prompt_for(node_boundaries):
+        return plugins.event_payload(1, 0.0, "ok", job, node_boundaries)["prompt"]
+
+    assert prompt_for({"n": "internal"}) == "덜 가린"
+    assert prompt_for({"n": "external"}) == "더 가린"
+    assert prompt_for({}) == "더 가린"
+
+
+def test_an_evented_upgrade_lands_inactive_and_forgets_its_cursor(harness, signing_key, platform_tenant):
+    install_evented(harness, signing_key)
+    assert harness.store.get_plugin("acme.daily-digest")["event_cursor"] is not None
+
+    do_install(harness, bundle(EVENTED.replace('version = "1.0.0"', 'version = "1.1.0"'), key=signing_key))
+    row = harness.store.get_plugin("acme.daily-digest")
+    assert row["version"] == "1.1.0"
+    assert row["event_cursor"] is None
+    [shown] = plugins.snapshot(harness.store, data_dir=harness.data_dir)
+    assert shown["active"] is False and shown["events_pending"] is None
+
+
+# ── 이벤트 — 앞문에서 ────────────────────────────────────────────────────────
+
+
+def test_the_events_route_answers_the_plugins_own_token(
+    harness, client, signing_key, platform_tenant, acme
+):
+    result = install_evented(harness, signing_key)
+    submit(client, acme["service"])
+    drive(harness)
+
+    first = client.post("/v1/plugin/events", headers=auth(result.token))
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["id"] == "acme.daily-digest"
+    assert len(body["events"]) == 1 and body["pending"] == 0
+    assert isinstance(body["cursor"], int)
+
+    acked = client.post(
+        "/v1/plugin/events", json={"ack": body["cursor"], "limit": 10}, headers=auth(result.token),
+    )
+    assert acked.status_code == 200 and acked.json()["events"] == []
+
+
+def test_turning_the_plugin_off_stops_its_events_at_the_same_choke_point(
+    harness, client, signing_key, platform_tenant
+):
+    """제출·스케줄과 **같은 함수**(`auth.active_service`)를 지난다."""
+    result = install_evented(harness, signing_key)
+    assert client.post("/v1/plugin/events", headers=auth(result.token)).status_code == 200
+
+    plugins.set_active(harness.store, "acme.daily-digest", False, actor="t", now=harness.clock)
+    assert client.post("/v1/plugin/events", headers=auth(result.token)).status_code == 401
+
+
+def test_a_plugin_without_an_event_subscription_is_told_so(
+    harness, client, signing_key, platform_tenant
+):
+    """빈 목록을 주면 "아직 없다" 로 읽는다 — 구독을 안 했다는 것은 다른 사실이다."""
+    result = install_scheduled(harness, signing_key)
+    plugins.set_active(harness.store, "acme.daily-digest", True, actor="t", now=harness.clock)
+
+    response = client.post("/v1/plugin/events", headers=auth(result.token))
+    assert response.status_code == 409
+    assert response.json()["code"] == "plugin_no_event_trigger"
+
+
+def test_an_ordinary_service_token_gets_no_events(harness, client, acme):
+    assert client.post("/v1/plugin/events", headers=auth(acme["service"])).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "body", [{"ack": -1}, {"ack": "x"}, {"ack": True}, {"limit": 0}, {"limit": "many"}],
+)
+def test_a_malformed_ack_or_limit_is_rejected(harness, client, signing_key, platform_tenant, body):
+    result = install_evented(harness, signing_key)
+    response = client.post("/v1/plugin/events", json=body, headers=auth(result.token))
+    assert response.status_code == 400, response.text
+    assert response.json()["code"] == "invalid_field"
+
+
+def test_the_admin_list_shows_the_subscription_and_the_backlog(
+    harness, client, signing_key, platform_tenant, acme
+):
+    """켜 놓았는데 「밀림」이 늘기만 하면 플러그인이 안 돌고 있는 것이다 — 화면이 그것을 읽어야 한다."""
+    result = install_evented(harness, signing_key, EVENTED_SUMMARIZE_ONLY)
+    submit(client, acme["service"])
+    drive(harness)
+
+    [row] = client.get("/v1/platform/plugins", headers=auth(acme["platform_admin"])).json()["plugins"]
+    # 화면의 트리거 칸(`triggerCell`)이 읽는 것 전부.
+    assert {"event", "event_roles", "events_pending", "last_event_at", "schedule", "last_run_at"} <= set(row)
+    assert row["event"] == "job.finished" and row["event_roles"] == ["summarize"]
+    assert row["events_pending"] == 1 and row["last_event_at"] is None
+
+    cursor = client.post("/v1/plugin/events", headers=auth(result.token)).json()["cursor"]
+    client.post("/v1/plugin/events", json={"ack": cursor}, headers=auth(result.token))
+    [row] = client.get("/v1/platform/plugins", headers=auth(acme["platform_admin"])).json()["plugins"]
+    assert row["events_pending"] == 0 and row["last_event_at"] is not None

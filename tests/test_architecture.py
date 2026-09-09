@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -326,8 +327,7 @@ def test_the_job_creating_call_stamps_the_origin():
 def test_only_one_place_decides_what_the_origin_means(path):
     """**출처 칸을 읽고 판정하는 곳은 `plugins.may_wake_plugins` 하나다.**
 
-    트리거는 아직 없다. 그래서 이 검사는 **아직 안 쓰인 코드를 지키는 것이 아니라,
-    앞으로 쓰일 때 어디를 지나야 하는지를 지금 정해 두는 것**이다. 트리거를 짜는
+    이 판정을 묻는 곳은 이벤트 트리거(`plugins.pull_events`)다. 다음 트리거를 짜는
     사람이 `job["origin_plugin"]` 을 직접 읽어 자기 규칙을 세우면 여기서 실패한다 —
     그때 규칙이 두 벌이 되고, 둘은 반드시 어긋난다.
 
@@ -363,3 +363,50 @@ def test_only_one_place_decides_whether_a_service_is_switched_on(path):
         assert pattern not in source, (
             f"{path.name} 이 서비스 상태를 직접 판정한다 — auth.active_service 를 쓸 것"
         )
+
+
+# ── 이벤트 아웃박스 — 쓰는 곳은 DB 트리거 하나, 내주기 전에 판정을 묻는다 ────────
+
+
+def test_only_the_finish_trigger_writes_plugin_events():
+    """**잡을 종결시키는 경로가 여덟 개 남짓이라, 파이썬에서 하나씩 삽입하면 반드시 하나가 빠진다.**
+
+    정산·실패·취소·크래시 복구·동기 임베딩·종결 실패 — 저마다 다른 함수에서 `status`
+    를 종결로 바꾼다. 그래서 아웃박스는 `jobs.status` 의 전이를 보는 SQLite 트리거가
+    쓴다: 새 종결 경로가 생겨도 빠지지 않고, 종결과 같은 트랜잭션이다. 누군가 편의로
+    파이썬에서 직접 넣기 시작하면 쓰는 경로가 둘이 되고, 그때부터 "종결은 한 번인데
+    이벤트가 둘" 이 가능해진다.
+    """
+    needle = re.compile(r"INSERT\s+INTO\s+plugin_events", re.I)
+    writers = [
+        path.name for path in SOURCES if needle.search(path.read_text(encoding="utf-8"))
+    ]
+    assert writers == ["store.py"], f"트리거 정의 말고도 이벤트를 쓰는 파일이 있다: {writers}"
+
+    source = (APP / "store.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    [trigger_fn] = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_finish_trigger_sql"
+    ]
+    assert len(needle.findall(ast.get_source_segment(source, trigger_fn))) == 1
+    assert len(needle.findall(source)) == 1, "store.py 안에서도 트리거 정의 밖에서 이벤트를 쓴다"
+
+
+def test_the_event_trigger_asks_the_recursion_judgment():
+    """`pull_events` 는 내주기 전에 `may_wake_plugins` 를 묻는다.
+
+    안 물으면 플러그인이 만든 잡의 종결이 플러그인을 다시 깨우고, 그 고리는 예산이
+    다 탈 때까지 안 멈춘다. 위의 검사는 판정을 **다른 곳에서** 하지 못하게 막고,
+    이 검사는 판정을 **아예 안 하는** 트리거를 막는다 — 둘은 다른 실패다.
+    """
+    source = (APP / "plugins.py").read_text(encoding="utf-8")
+    [pull] = [
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "pull_events"
+    ]
+    asked = {
+        node.func.id for node in ast.walk(pull)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "may_wake_plugins" in asked, "이벤트 트리거가 재귀 방지 판정을 안 묻는다"

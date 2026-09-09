@@ -1740,6 +1740,8 @@ async def platform_plugins(request: Request) -> Response:
             ctx.store, bundle, actor=principal.token_id, data_dir=ctx.data_dir,
             trust_dir=ctx.plugin_trust_dir, tenant_id=ctx.plugin_tenant,
             host_version=ctx.version, now=ctx.now,
+            # 이벤트 구독의 역할 필터를 실제 역할 목록에 대고 본다 — 오타는 설치에서 거른다.
+            known_roles=ctx.config.roles,
         )
     except plugin_mod.PluginError as exc:
         # 거부 사유는 사람이 읽고 고칠 수 있어야 한다 — 코드만 던지면 못 고친다.
@@ -1809,6 +1811,52 @@ async def plugin_tick(request: Request) -> Response:
         "due": tick.due,
         "scheduled_for": tick.scheduled_for,
         "next_run_at": tick.next_run_at,
+    })
+
+
+async def plugin_events(request: Request) -> Response:
+    """플러그인이 "내가 못 본 종결이 있나" 를 묻는다. **플러그인 자신의 토큰으로.**
+
+    본문은 `{"ack": <직전에 받은 cursor>, "limit": <최대 건수>}` 이고 둘 다 선택이다.
+    ack 없이 다시 물으면 같은 배치를 다시 받는다(at-least-once). 판단과 근거는
+    `plugins.pull_events` 에 있다 — 여기는 신원과 인자만 다룬다.
+
+    `active_service` 를 지난다 — 끄면 이 경로도 401 이다(`plugin_tick` 과 같다).
+    플러그인 id 를 본문에서 받지 않는다 — 토큰에서 유도하므로 남의 이벤트를 가져갈
+    인자가 존재하지 않는다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    active_service(ctx.store, principal)
+
+    plugin_id = ctx.store.plugin_id_for_service(principal.scope(), principal.service_id)
+    if plugin_id is None:
+        raise ApiError("not_found", status=404)
+
+    body = await _body(request)
+    ack = body.get("ack")
+    if ack is not None and (isinstance(ack, bool) or not isinstance(ack, int) or ack < 0):
+        raise ApiError("invalid_field", status=400, params={"field": "ack"})
+    limit = body.get("limit", 50)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ApiError("invalid_field", status=400, params={"field": "limit"})
+
+    # 노드의 경계는 스케줄러가 디스패치 때 본 것과 같은 출처(클러스터)에서 읽는다 —
+    # 훅이 "모델이 본 프롬프트" 를 고르는 기준이 디스패치와 어긋나면 안 된다.
+    boundaries = {
+        name: state.node.data_boundary for name, state in ctx.cluster.nodes.items()
+    }
+    pull = plugin_mod.pull_events(
+        ctx.store, plugin_id, ack=ack, limit=limit, now=ctx.now(), boundaries=boundaries,
+    )
+    if pull is None:
+        # 구독을 선언하지 않은 플러그인에게 빈 목록을 주면 "아직 없다" 로 읽는다.
+        raise ApiError("plugin_no_event_trigger", status=409)
+    return _ok(request, {
+        "id": plugin_id,
+        "events": pull.events,
+        "cursor": pull.cursor,
+        "pending": pull.pending,
     })
 
 
@@ -1948,6 +1996,7 @@ def _routes(ctx: AppContext) -> list[Any]:
         Route(f"{v}/platform/plugins/{{plugin_id}}", platform_plugin_delete,
               methods=["DELETE"], name="platform_plugin_delete"),
         Route(f"{v}/plugin/tick", plugin_tick, methods=["POST"], name="plugin_tick"),
+        Route(f"{v}/plugin/events", plugin_events, methods=["POST"], name="plugin_events"),
         Route(f"{v}/platform/diagnostics", platform_diagnostics, name="platform_diagnostics"),
         Route(f"{v}/platform/notifications", platform_notifications,
               methods=["GET", "POST"], name="platform_notifications"),

@@ -645,7 +645,63 @@ CREATE TABLE IF NOT EXISTS node_leases (
     expires_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_node_leases ON node_leases(node, expires_at);
+
+-- 잡 종결 이벤트 — 플러그인 `event` 트리거의 아웃박스.
+--
+-- **쓰는 곳은 아래 트리거 하나다**(`_FINISH_TRIGGER`). 잡을 종결시키는 경로가
+-- 여덟 개 남짓이라(정산·실패·취소·크래시 복구·동기 임베딩·…) 파이썬에서 하나씩
+-- 삽입하면 새 종결 경로가 생길 때마다 하나가 빠진다. DB 가 `jobs.status` 의 전이를
+-- 보고 넣으면 빠뜨릴 경로가 없고, 종결과 같은 트랜잭션이라 "끝났는데 이벤트가 없는"
+-- 상태도 없다.
+--
+-- 본문(프롬프트·응답)을 **복제하지 않는다.** 행은 잡을 가리키기만 하고 내용은 읽을
+-- 때 `jobs` 에서 합친다 — 그래서 보존·파기가 잡과 함께 간다(`ON DELETE CASCADE`).
+-- 두 벌 두면 파기가 한 벌만 지우는 날이 온다.
+--
+-- `id` 는 종결 순서다. SQLite 는 라이터를 직렬화하므로 커밋 순서와 같고, 그래서
+-- 플러그인의 커서("여기까지 봤다")가 성립한다.
+CREATE TABLE IF NOT EXISTS plugin_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    job_id    TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    role      TEXT NOT NULL,
+    status    TEXT NOT NULL,                     -- 종결 당시의 상태. 잡은 그 뒤 검토로 바뀔 수 있다
+    ts        REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_events_tenant ON plugin_events(tenant_id, id);
+CREATE INDEX IF NOT EXISTS idx_plugin_events_job ON plugin_events(job_id);
 """
+
+
+def _finish_trigger_sql() -> tuple[str, str]:
+    """`jobs` 가 종결로 **넘어가는** 순간 `plugin_events` 에 한 줄.
+
+    상태 목록은 `TERMINAL_STATUSES` 에서 만든다 — 손으로 두 벌 적으면 어긋난다
+    (보존 정리가 정확히 그렇게 `needs_review` 를 놓쳤다). 그래서 트리거는
+    `IF NOT EXISTS` 가 아니라 **기동마다 지우고 다시 만든다**: 상수가 바뀌면 옛 DB
+    의 트리거도 따라와야 한다.
+
+    `OLD` 가 이미 종결이면 안 넣는다 — 검토 판정(needs_review → failed)은 새
+    종결이 아니라 같은 종결의 정정이다. 종결에서 큐로 되돌아갔다 다시 끝나면
+    그것은 새 종결이고 이벤트도 새로 난다.
+    """
+    terminal = ", ".join(f"'{status}'" for status in sorted(TERMINAL_STATUSES))
+    return (
+        "DROP TRIGGER IF EXISTS plugin_events_on_finish",
+        "CREATE TRIGGER plugin_events_on_finish "
+        "AFTER UPDATE OF status ON jobs FOR EACH ROW "
+        f"WHEN NEW.status IN ({terminal}) AND OLD.status NOT IN ({terminal}) "
+        "BEGIN "
+        "INSERT INTO plugin_events(tenant_id, job_id, role, status, ts) "
+        "VALUES (NEW.tenant_id, NEW.id, NEW.role, NEW.status, "
+        "COALESCE(NEW.finished_at, (julianday('now') - 2440587.5) * 86400.0)); "
+        "END",
+    )
+
+
+#: 트리거 문장. 모듈 수준에 두는 이유는 `test_architecture` 가 "이벤트를 쓰는 곳은
+#: 이 트리거뿐" 을 검사할 때 이름으로 가리킬 수 있게 하기 위해서다.
+_FINISH_TRIGGER = _finish_trigger_sql()
 
 #: ADD COLUMN 전용 마이그레이션. 추가·NULL 기본값만 허용하고 재작성·삭제는 금지한다.
 #: SQLite 의 ADD COLUMN 은 메타데이터 연산이라 WAL 라이브 DB 에서 안전하다.
@@ -678,6 +734,12 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("plugins", "schedule_tz", "TEXT"),
     ("plugins", "next_run_at", "REAL"),
     ("plugins", "last_run_at", "REAL"),
+    # 이벤트 트리거. 같은 이유로 옛 행은 NULL 이다. `event_cursor` 는 "여기까지
+    # 봤다" — 켤 때 그 시점의 마지막 이벤트로 잡히고, 플러그인의 ack 로만 전진한다.
+    ("plugins", "event", "TEXT"),
+    ("plugins", "event_roles", "TEXT"),
+    ("plugins", "event_cursor", "INTEGER"),
+    ("plugins", "last_event_at", "REAL"),
 )
 
 #: 컬럼이 생긴 **뒤에** 만들어야 하는 인덱스. `_SCHEMA` 에 두면 옛 DB 에서
@@ -839,6 +901,9 @@ class SqliteStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
         self._migrate()
+        # 트리거는 스키마 뒤, 그리고 **매번** — `_finish_trigger_sql` 참고.
+        for statement in _FINISH_TRIGGER:
+            self._conn.execute(statement)
         self._conn.commit()
 
     # -- 스키마 --------------------------------------------------------------
@@ -2185,13 +2250,16 @@ class SqliteStore:
 
     def save_plugin(self, row: Mapping[str, Any]) -> None:
         """설치된 플러그인을 기록한다. 같은 id 의 재설치는 덮어쓴다(업그레이드)."""
+        values = dict(row)
+        values.setdefault("event", None)
+        values.setdefault("event_roles", None)
         self._conn.execute(
             "INSERT INTO plugins(id, version, name, kind, tenant_id, service_id, endpoint, "
             "manifest_json, bundle_sha256, signature_state, last_error, installed_by, installed_at, "
-            "schedule, schedule_tz) "
+            "schedule, schedule_tz, event, event_roles) "
             "VALUES(:id, :version, :name, :kind, :tenant_id, :service_id, :endpoint, "
             ":manifest_json, :bundle_sha256, :signature_state, :last_error, :installed_by, :installed_at, "
-            ":schedule, :schedule_tz) "
+            ":schedule, :schedule_tz, :event, :event_roles) "
             "ON CONFLICT(id) DO UPDATE SET "
             "version=excluded.version, name=excluded.name, kind=excluded.kind, "
             "endpoint=excluded.endpoint, manifest_json=excluded.manifest_json, "
@@ -2201,8 +2269,11 @@ class SqliteStore:
             # 판올림이 스케줄을 바꿀 수 있다 — 그것이 새 버전이 가져오는 것이다.
             # 다만 **예정과 이력(`next_run_at`·`last_run_at`)은 안 건드린다.**
             # 여기서 덮으면 판올림이 예정을 지우고, 지워진 예정은 다시 안 온다.
-            "schedule=excluded.schedule, schedule_tz=excluded.schedule_tz",
-            dict(row),
+            # 이벤트 쪽도 같다 — 선언(`event`·`event_roles`)은 따라오고
+            # 커서·이력(`event_cursor`·`last_event_at`)은 그대로다.
+            "schedule=excluded.schedule, schedule_tz=excluded.schedule_tz, "
+            "event=excluded.event, event_roles=excluded.event_roles",
+            values,
         )
         self._conn.commit()
 
@@ -2278,6 +2349,92 @@ class SqliteStore:
             "GROUP BY origin_plugin", params
         )
         return {row["origin_plugin"]: row["n"] for row in rows}
+
+    # -- 플러그인 이벤트 (잡 종결 아웃박스) ------------------------------------
+    #
+    # 쓰기는 `plugin_events_on_finish` 트리거뿐이다. 여기는 읽기와 커서다.
+    #
+    # **테넌트 스코프 인자가 `str | None` 인 이유.** 플러그인은 지금 플랫폼 테넌트에
+    # 산다(§3-4). 그 플러그인이 자기 테넌트의 잡만 본다면 볼 것이 없다 — 소비자의
+    # 잡은 다른 테넌트에 있다. 그래서 플랫폼 테넌트의 플러그인은 테넌트를 가로질러
+    # 보고(`None`), 보통 테넌트에 설치된 플러그인은 자기 테넌트만 본다. 그 판정은
+    # `plugins.pull_events` 가 하고, 여기는 받은 대로 거른다. `route_counts` 가
+    # 메트릭을 위해 가로지르는 것과 같은 소수 경로다.
+
+    def _plugin_event_where(
+        self, after: int, tenant_id: str | None, roles: Sequence[str] | None,
+    ) -> tuple[str, list[Any]]:
+        conditions = ["e.id > ?"]
+        params: list[Any] = [int(after)]
+        if tenant_id is not None:
+            conditions.append("e.tenant_id = ?")
+            params.append(tenant_id)
+        if roles:
+            conditions.append(f"e.role IN ({','.join('?' * len(roles))})")
+            params.extend(roles)
+        return " AND ".join(conditions), params
+
+    def plugin_events_after(
+        self, after: int, *, tenant_id: str | None, roles: Sequence[str] | None, limit: int,
+    ) -> list[tuple[int, float, str, JobRow]]:
+        """커서 다음의 종결 이벤트를 종결 순서로 — (이벤트 id, 시각, 종결 당시 상태, 잡).
+
+        잡 본문은 여기서 합친다. 이벤트 행에 복제해 두지 않았으므로(스키마 주석)
+        잡이 파기됐으면 이벤트도 함께 사라져 있고, 그래서 고아 처리가 없다.
+        """
+        where, params = self._plugin_event_where(after, tenant_id, roles)
+        rows = self._conn.execute(
+            "SELECT e.id AS event_id, e.ts AS event_ts, e.status AS event_status, j.* "
+            f"FROM plugin_events e JOIN jobs j ON j.id = e.job_id WHERE {where} "
+            "ORDER BY e.id LIMIT ?",
+            [*params, int(limit)],
+        )
+        return [
+            (int(row["event_id"]), float(row["event_ts"]), str(row["event_status"]), _row_to_job(row))
+            for row in rows
+        ]
+
+    def count_plugin_events_after(
+        self, after: int, *, tenant_id: str | None, roles: Sequence[str] | None,
+    ) -> int:
+        """커서 뒤에 몇 건이 남았는가. 화면의 「밀림」이고 플러그인의 "더 있나" 다."""
+        where, params = self._plugin_event_where(after, tenant_id, roles)
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS n FROM plugin_events e WHERE {where}", params
+        ).fetchone()
+        return int(row["n"])
+
+    def latest_plugin_event_id(self) -> int:
+        """지금까지의 마지막 이벤트 id. 없으면 0 — 커서를 여기 두면 "지금부터" 다."""
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS n FROM plugin_events"
+        ).fetchone()
+        return int(row["n"])
+
+    def set_plugin_event_cursor(self, plugin_id: str, cursor: int | None) -> None:
+        """커서를 정한다. 켤 때(지금부터)·끌 때(없음)·설치할 때(없음) 부른다."""
+        self._conn.execute(
+            "UPDATE plugins SET event_cursor = ? WHERE id = ?", (cursor, plugin_id)
+        )
+        self._conn.commit()
+
+    def ack_plugin_events(self, plugin_id: str, cursor: int, *, now: float) -> bool:
+        """플러그인이 "여기까지 처리했다". **앞으로만 간다.**
+
+        CAS 다 — 복제본 둘이 서로 다른 배치를 들고 ack 하면 뒤처진 쪽의 ack 가
+        커서를 되돌려 앞선 쪽이 처리한 것을 다시 내보낸다. `event_cursor < ?` 를
+        UPDATE 조건에 넣으면 뒤처진 ack 는 그냥 진다(rowcount 0). 없는 이벤트를
+        ack 할 수도 없다 — 큰 수를 보내 미래를 건너뛰는 실수를 막는다.
+        """
+        with self._tx():
+            row = self._conn.execute(
+                "UPDATE plugins SET event_cursor = ?, last_event_at = ? "
+                "WHERE id = ? AND event IS NOT NULL "
+                "AND (event_cursor IS NULL OR event_cursor < ?) "
+                "AND ? <= (SELECT COALESCE(MAX(id), 0) FROM plugin_events)",
+                (int(cursor), now, plugin_id, int(cursor), int(cursor)),
+            )
+        return row.rowcount > 0
 
     # -- 테넌트 설정 -----------------------------------------------------------
 
@@ -3178,12 +3335,15 @@ class SqliteStore:
             raise ScopeViolation("테넌트 파기는 PlatformScope 를 요구한다")
 
         counts: dict[str, int] = {}
-        # **한 트랜잭션이다.** 테이블 아홉 개를 지우다 중간에 실패하면 절반만
+        # **한 트랜잭션이다.** 테이블 열 개를 지우다 중간에 실패하면 절반만
         # 파기된 테넌트가 남고, DEK 는 아직 살아 있어 crypto-shredding 도 안 된다.
+        #
+        # `plugin_events` 는 잡을 지우면 cascade 로도 지워지지만 여기 적어 둔다 —
+        # 지운 수가 감사에 남아야 하고, 목록에 없는 표는 다음 사람이 "빠진 것" 으로 읽는다.
         with self._tx():
             for table in (
-                "jobs", "usage", "filter_events", "role_overrides", "tenant_guard_rules",
-                "tenant_settings", "eval_fixtures", "tokens", "services",
+                "plugin_events", "jobs", "usage", "filter_events", "role_overrides",
+                "tenant_guard_rules", "tenant_settings", "eval_fixtures", "tokens", "services",
             ):
                 counts[table] = self._conn.execute(
                     f"DELETE FROM {table} WHERE tenant_id = ?", (tenant_id,)

@@ -736,10 +736,10 @@ async function renderPlugins() {
     p.signature,
     p.active ? t('ui.plugin_active') : t('ui.plugin_inactive'),
     (p.allow_roles || []).join(', '),
-    // 이 플러그인이 만든 잡 수. 트리거가 없는 지금도 "얼마나 쓰고 있나" 를 답한다.
+    // 이 플러그인이 만든 잡 수. "얼마나 쓰고 있나" 를 답한다.
     String(p.jobs_created || 0),
-    // 스케줄이 있는데 아직 한 번도 안 돌았으면 그 사실이 보여야 한다.
-    p.schedule ? p.schedule + (p.last_run_at ? '' : ' · ' + t('ui.plugin_never_ran')) : '',
+    // 트리거. 안 돌고 있는 것이 보여야 한다 — 스케줄은 "아직 안 돎", 이벤트는 밀린 건수로.
+    triggerCell(p),
     p.files_present ? '' : t('ui.plugin_missing_files'),
     el('div', { class: 'row' }, [
       el('button', {
@@ -770,10 +770,31 @@ async function renderPlugins() {
     card(t('ui.plugins'), rows.length
       ? [table(
           [t('ui.plugin'), t('ui.plugin_signature'), t('ui.status'), t('ui.role'),
-           t('ui.plugin_jobs'), t('ui.plugin_schedule'), '', ''],
+           t('ui.plugin_jobs'), t('ui.plugin_trigger'), '', ''],
           rows)]
       : [el('p', { class: 'muted', text: t('ui.plugin_none') })]),
   ];
+}
+
+/** 트리거 칸. 스케줄이면 cron(한 번도 안 돌았으면 그 사실), 이벤트면 구독한 것과 밀린 건수.
+ *
+ * 밀린 건수는 서버가 커서 뒤를 세어 준 값이다(`events_pending`). 켜 놓았는데 이 수가
+ * 늘기만 하면 플러그인이 안 돌고 있는 것이고, 그것이 이 칸이 존재하는 이유다.
+ */
+function triggerCell(p) {
+  const parts = [];
+  if (p.schedule) {
+    parts.push(p.schedule + (p.last_run_at ? '' : ' · ' + t('ui.plugin_never_ran')));
+  }
+  if (p.event) {
+    const roles = (p.event_roles && p.event_roles.length) ? p.event_roles.join(', ') : '*';
+    let text = p.event + ' (' + roles + ')';
+    if (p.events_pending !== null && p.events_pending !== undefined) {
+      text += ' · ' + t('ui.plugin_events_pending', { n: p.events_pending });
+    }
+    parts.push(text);
+  }
+  return parts.join(' / ');
 }
 
 

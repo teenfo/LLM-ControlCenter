@@ -82,6 +82,26 @@ def _plugin_tick_worker(db_path: str, plugin_id: str, due_at: float, barrier, re
         store.close()
 
 
+def _plugin_ack_worker(db_path: str, plugin_id: str, barrier, results) -> None:
+    """복제본이 저마다 다른 배치를 처리하고 **동시에** ack 한다.
+
+    `barrier.wait()` 가 돌려주는 자리 번호(0..N-1)가 복제본마다 다르므로 그것을
+    커서로 쓴다 — 넷이 1·2·3·4 를 한꺼번에 ack 한다. 뒤처진 ack 가 커서를 되돌리면
+    앞선 복제본이 처리한 이벤트가 다시 나간다.
+    """
+    store = SqliteStore(db_path)
+    try:
+        slot = barrier.wait()
+        won = store.ack_plugin_events(plugin_id, slot + 1, now=1.0)
+        results.put(("ok", (slot + 1, bool(won))))
+    except sqlite3.Error as exc:
+        results.put(("sqlite_error", f"{type(exc).__name__}: {exc}"))
+    except Exception as exc:                       # pragma: no cover - 진단용
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        store.close()
+
+
 def _tx_rollback_worker(db_path: str, results) -> None:
     """`_tx()` 안에서 중간에 터진다. 앞선 쓰기가 남으면 안 된다."""
     store = SqliteStore(db_path)
@@ -275,6 +295,44 @@ def test_only_one_replica_claims_a_scheduled_tick(shared_db):
 
     verify = SqliteStore(shared_db)
     assert verify.get_plugin("acme.digest")["next_run_at"] == due_at + 86400
+    verify.close()
+
+
+def test_the_event_cursor_never_moves_backwards_across_replicas(shared_db):
+    """이벤트 트리거의 at-least-once 는 커서가 단조 증가할 때만 성립한다.
+
+    복제본 넷이 서로 다른 배치를 들고 동시에 ack 한다. 순차로는 못 잰다 — 순차면
+    작은 값이 먼저 와서 CAS 를 지나지도 않는다. 넷이 **같은 커서를 읽은 채** 겹쳐야
+    `event_cursor < ?` 조건이 실제로 일한다.
+    """
+    store = SqliteStore(shared_db)
+    store.save_plugin({
+        "id": "acme.digest", "version": "1.0.0", "name": "digest", "kind": "external",
+        "tenant_id": "acme", "service_id": "acme.digest", "endpoint": None,
+        "manifest_json": "{}", "bundle_sha256": "0" * 64, "signature_state": "signed",
+        "last_error": None, "installed_by": "t", "installed_at": 0.0,
+        "schedule": None, "schedule_tz": None, "event": "job.finished", "event_roles": None,
+    })
+    store.set_plugin_event_cursor("acme.digest", 0)
+    for n in range(WORKERS):                       # 종결 이벤트 N 건 — 트리거가 쌓는다
+        job_id = store.create_job(
+            ACME, service_id="acme-web", role="summarize", lane="interactive", status="running",
+        )
+        store.update_job(ACME, job_id, status="ok", finished_at=float(n))
+    assert store.latest_plugin_event_id() == WORKERS
+    store.close()
+
+    outcomes = run_workers(_plugin_ack_worker, shared_db, "acme.digest")
+
+    failures = [o for kind, o in outcomes if kind != "ok"]
+    assert not failures, f"워커가 오류를 냈다: {failures}"
+    acks = dict(o for _, o in outcomes)            # {ack 한 커서: 이겼는가}
+    assert acks[WORKERS] is True, "가장 앞선 ack 는 어떤 순서로 겹쳐도 이긴다"
+
+    verify = SqliteStore(shared_db)
+    assert verify.get_plugin("acme.digest")["event_cursor"] == WORKERS, (
+        "뒤처진 ack 가 커서를 되돌렸다"
+    )
     verify.close()
 
 

@@ -176,6 +176,12 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
         "컨트롤 플레인은 플러그인을 부르러 나가지 않는다.",
         "service", True,
     ),
+    "plugin_events": (
+        "잡 종결 이벤트 풀 — 플러그인이 자기 토큰으로 \"못 본 종결이 있나\" 를 묻는다. "
+        "모델이 본 프롬프트(마스킹본)와 나간 응답을 종결 순서로 준다. "
+        "at-least-once 이고 커서는 `ack` 로만 앞으로 간다. 플러그인이 만든 잡의 종결은 안 준다.",
+        "service", True,
+    ),
     "platform_diagnostics": ("진단 번들 — 비밀은 마스킹, 프롬프트 본문은 미포함.", "platform_admin", False),
     "platform_notifications": ("알림 채널 현황과 테스트 발송.", "platform_admin", False),
     "metrics": ("Prometheus/OpenMetrics 노출. 테넌트 이름은 라벨에 없다.", "platform_admin", False),
