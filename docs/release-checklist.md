@@ -29,9 +29,9 @@
 ## 1. 출하 전 — 만드는 쪽에서
 
 - [ ] `.venv/bin/pytest -q` 전부 통과 · `.venv/bin/python -m pyflakes app/ tests/` 클린
-- [ ] **도커 데몬이 있는 곳에서** `docker compose build` 한 번. 이 판의 리허설은 데몬이 없는
-      환경에서 했고, Dockerfile 의 의존성 레이어가 깨져 있던 것을 시뮬레이션으로 잡아 고쳤다
-      (§5). 실제 `docker build` 는 아직 아무도 안 돌렸다 — **출하 전에 반드시 한 번**
+- [x] **도커 데몬이 있는 곳에서** `docker build` 한 번. 0.1.0 은 2026-09-10 hosub 에서 빌드해
+      (이미지 228MB) 컨테이너가 uid 10001 로 뜨고 `/healthz` 가 응답하는 것까지 봤다. 이 판의
+      첫 리허설은 데몬이 없는 환경이라 의존성 레이어가 깨진 것을 시뮬레이션으로 먼저 잡았다(§5)
 - [ ] `./bundle.sh` — 같은 이유로 도커 데몬이 있는 곳에서. 없으면 `image.tar` 없이
       소스만 담기고, 설치처는 `docker compose up -d --build` 로 직접 빌드해야 한다
 - [ ] 번들을 빈 디렉터리에 풀어 `./preflight.sh` 가 도는지 (스크립트 실행 권한이 tar 를 지났는지)
@@ -117,6 +117,7 @@
 | 번들 이름 | README·deployment 가 `llm-controlcenter-<ver>.tgz` 라고 적었지만 `bundle.sh` 는 `llm-controlcenter-airgap-<ver>-<날짜>.tgz` 를 만든다. 문서를 고쳤다 |
 | 빌드 컨텍스트 | `.dockerignore` 가 없어 `.venv`·`keys`·`data` 가 데몬에 올라가는 구조였다. 추가했다 |
 | `./preflight.sh` | 이 환경에서는 "도커 데몬에 연결할 수 없습니다" 로 실패하는 것이 **맞다** |
+| **hosub 에서 실제 빌드 → `.62` 에 설치** (2026-09-10) | 번들(73MB, 이미지 포함) 전송 → `docker load` → `preflight` 통과 → `compose up` → 4초 만에 `/healthz` → `doctor` 통과. 유예 모드 배너가 고친 문구로 찍혔다 |
 
 ---
 
@@ -130,4 +131,5 @@
 - **플러그인은 플랫폼 테넌트 전용이고 토큰 회전 경로가 없다** ([plugin-exploration §11](plugin-exploration.md))
 - **가드 2단·라우팅 분류기는 인증(certify)이 끝나야 판정한다.** 기동 직후 `doctor` 가
   `model_not_certified` 를 경고하는 것은 정상이고, 스케줄러가 자동 인증한다
-- **실제 `docker build` 는 아직 아무도 안 돌렸다** — §1 의 첫 체크 항목이 그것이다
+- **첫 설치처(2026-09-10)는 2코어·4GB 노트북이고 Wi-Fi 로 붙어 있다.** 컨트롤 플레인은
+  31MB 로 돌지만, 유선이 가능해지면 옮기는 편이 낫다 — 게이트웨이의 가용성이 무선 품질에 매인다
