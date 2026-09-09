@@ -53,7 +53,7 @@ LCC_URL=http://localhost:8610 LCC_TOKEN=any python clients/client.py "요약할 
 ## 설치
 
 ```sh
-tar xzf llm-controlcenter-<ver>.tgz && cd llm-controlcenter
+tar xzf llm-controlcenter-airgap-<ver>-<날짜>.tgz && cd llm-controlcenter   # ./bundle.sh 가 만든 것
 ./preflight.sh                 # 포트·디스크·메모리·도커 — 실패 사유를 사람 말로
 docker compose up -d
 docker compose logs controlcenter
@@ -231,6 +231,7 @@ LCC_AIRGAP=1 docker compose up -d
 | [docs/topology.md](docs/topology.md) | 서버 구조도 · 데이터 경계 |
 | [docs/capacity.md](docs/capacity.md) | 규모 산정 · 증설 트리거 |
 | [docs/deployment.md](docs/deployment.md) | 배포 프로파일 · 업그레이드 |
+| [docs/release-checklist.md](docs/release-checklist.md) | **1차 배포 체크리스트** — 출하 전 · 설치 당일 · 첫 주 · 되돌리기 · 리허설 기록 |
 | [docs/reference/llm-platform-overview.md](docs/reference/llm-platform-overview.md) | 설계의 출발점이 된 레퍼런스 시스템 |
 
 ---

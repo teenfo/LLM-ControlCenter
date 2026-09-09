@@ -1,0 +1,24 @@
+# 빌드 컨텍스트에서 뺀다. Dockerfile 이 COPY 하는 것은 app·config·locales·static·
+# clients 뿐이지만, 컨텍스트는 통째로 데몬에 올라간다 — .venv(수십 MB)는 빌드를
+# 느리게 하고, keys·data·backups 는 **애초에 올라가서는 안 되는 것**이다.
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+bundle
+data
+keys
+backups
+*.db
+*.db-wal
+*.db-shm
+*.tgz
+tests
+docs
+.claude
+.pytest_cache
+.ruff_cache

@@ -15,9 +15,18 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 의존성만 먼저 넣는다. 앱 코드가 바뀌어도 이 레이어는 다시 안 받는다.
-COPY pyproject.toml README.md ./
-COPY app/__init__.py app/__init__.py
-RUN pip install --no-cache-dir . && rm -rf app
+#
+# **`pip install .` 을 쓰지 않는다.** pyproject 가 패키지 디렉터리를 이름으로
+# 나열하므로(`app.providers`·번들 자산) 소스가 없는 이 레이어에서는 메타데이터
+# 생성부터 죽는다 — 실제로 `package directory 'app/providers' does not exist` 로
+# 빌드가 실패했다(1차 배포 리허설). 휠 검증은 전체 트리에서 빌드하므로 이 실패를
+# 못 봤다. 목록은 pyproject 한 곳에서 읽는다: 여기 다시 적으면 두 벌이 되고, 두 벌은
+# 어긋난다. 앱은 WORKDIR 의 소스 트리로 돈다(`python -m app`) — 설치된 패키지가
+# 필요 없다.
+COPY pyproject.toml ./
+RUN python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+ && pip install --no-cache-dir -r /tmp/requirements.txt \
+ && rm /tmp/requirements.txt
 
 COPY app/ app/
 COPY config/ config/

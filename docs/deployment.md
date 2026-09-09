@@ -85,7 +85,7 @@ sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.ta
 ## 3. 설치
 
 ```bash
-tar xzf llm-controlcenter-<ver>.tgz && cd llm-controlcenter
+tar xzf llm-controlcenter-airgap-<ver>-<날짜>.tgz && cd llm-controlcenter   # ./bundle.sh 가 만든 것
 ./preflight.sh                          # 포트·디스크·메모리·도커 버전. 실패 사유를 사람 말로
 docker compose --profile tls up -d      # 공개망에 붙는다면 tls 프로파일로
 ```

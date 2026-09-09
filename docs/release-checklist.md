@@ -1,0 +1,133 @@
+# 1차 배포 체크리스트
+
+이 문서는 **순서표**다. 설명은 [deployment.md](deployment.md) · [README](../README.md) ·
+런북에 있고, 여기서는 그것을 언제 어떤 순서로 하는지만 적는다. 같은 내용을 두 곳에 적으면
+둘은 어긋나므로, 문장이 길어질 것 같으면 여기가 아니라 저쪽에 쓰고 여기서는 가리킨다.
+
+판은 `pyproject.toml` 의 `version` 이다. 다섯 곳(pyproject · `app.__version__` ·
+`main.VERSION` · `compose.yml` 기본 태그 · `bundle.sh` 기본값)이 같은 값인지는
+`test_every_version_string_agrees` 가 본다 — 한 곳만 올리면 이미지 태그와 `/healthz` 가
+서로 다른 판을 말한다.
+
+---
+
+## 0. 이번 판의 범위 — 먼저 읽을 것
+
+| 무엇 | 어디 |
+|---|---|
+| 되는 것 (기능마다 계약·고정 테스트·상태) | [feature-spec.md](feature-spec.md) |
+| 하기로 했지만 아직 없는 것 | feature-spec §13 · [README 부채 표](../README.md#열어두는-부채) 첫 절 |
+| 하지 않기로 한 것과 그 근거 | [README 부채 표](../README.md#열어두는-부채) 둘째 절 · [design-decisions.md](design-decisions.md) |
+| 배포 프로파일 (Starter · Standard) | [deployment.md §2](deployment.md) — Scale(Postgres·Helm)은 이 판에 없다 |
+| 서버 대수 · 사양 | [README](../README.md#서버는-몇-대인가) · [capacity.md](capacity.md) |
+
+`--demo` 는 배포가 아니다 — 시드 테넌트 둘과 목 노드로 뜨는 시연 프로파일이다. 실사용
+설치는 `bootstrap` 이 만드는 첫 테넌트에서 시작한다.
+
+---
+
+## 1. 출하 전 — 만드는 쪽에서
+
+- [ ] `.venv/bin/pytest -q` 전부 통과 · `.venv/bin/python -m pyflakes app/ tests/` 클린
+- [ ] **도커 데몬이 있는 곳에서** `docker compose build` 한 번. 이 판의 리허설은 데몬이 없는
+      환경에서 했고, Dockerfile 의 의존성 레이어가 깨져 있던 것을 시뮬레이션으로 잡아 고쳤다
+      (§5). 실제 `docker build` 는 아직 아무도 안 돌렸다 — **출하 전에 반드시 한 번**
+- [ ] `./bundle.sh` — 같은 이유로 도커 데몬이 있는 곳에서. 없으면 `image.tar` 없이
+      소스만 담기고, 설치처는 `docker compose up -d --build` 로 직접 빌드해야 한다
+- [ ] 번들을 빈 디렉터리에 풀어 `./preflight.sh` 가 도는지 (스크립트 실행 권한이 tar 를 지났는지)
+- [ ] 태그 — `v<version>`. 태그는 되돌리기 어려우니 사람이 붙인다
+
+---
+
+## 2. 설치 당일 — 설치처에서
+
+순서가 계약이다. 특히 **5번의 값은 그 자리에서 딱 한 번 보인다.**
+
+1. **호스트 준비** — [deployment §2.2 체크리스트](deployment.md): 절전·뚜껑 억제, 부팅 시
+   자동 기동, LUKS. 데모 노트북이라도 5번(디스크 암호화)은 넘어가지 않는다
+2. **번들 풀기 + 점검**
+   ```sh
+   tar xzf llm-controlcenter-airgap-<ver>-<날짜>.tgz && cd llm-controlcenter
+   ./preflight.sh        # 고장 0건이어야 한다. 경고는 읽고 넘어간다
+   ```
+   `./keys` 소유권 경고가 나오면 preflight 가 알려 주는 `chown` 을 **먼저** 한다 — 안 하면
+   컨테이너가 마스터 KEK 를 못 써서 `restart: unless-stopped` 아래에서 조용히 크래시 루프가 된다
+3. **에어갭이면** `docker load -i image.tar` (+ `image-nginx.tar`) 뒤 `LCC_AIRGAP=1`
+4. **기동** — 신뢰 네트워크 안이 아니면 반드시 tls 프로파일이다. 없으면 플랫폼 관리 면이 그대로 열린다
+   ```sh
+   docker compose --profile tls up -d      # 인증서는 ./tls/ 에 미리
+   ```
+5. **최초 기동 값 회수** — `docker compose logs controlcenter`
+   - 마스터 KEK → **백업과 다른 곳**에. 잃으면 기존 암호문은 영구히 못 연다
+   - 플랫폼 관리자 토큰 · 첫 테넌트의 관리자 토큰 · 서비스 토큰
+   - 유예 모드 안내가 찍힌다 — 차단 규칙이 마스킹으로 낮춰져 도는 상태다(§3)
+6. **노드 등록** — 관제 UI 에서 URL · `data_boundary` · 용량 ([deployment §3.2](deployment.md)).
+   등록 즉시 프로브가 돌고, 실패하면 그 화면에서 안다. `internal` 노드는 사설망 전제,
+   `external` 은 TLS·인증 필수 ([deployment §7](deployment.md))
+7. **첫 소비자 연결** — `GET /v1/integration` 이 그 토큰 기준의 통합 가이드를 준다.
+   노드도 토큰도 없이 먼저 붙여 보려면 `/v1/client/` 의 단일 파일 클라이언트와 목 서버
+8. **진단** — `./doctor.sh --probe`. 갓 설치한 시스템에서 "확인이 필요한 항목" 둘은 정상이다:
+   유예 모드가 켜져 있다는 것과 감사를 아직 내보낸 적이 없다는 것
+
+---
+
+## 3. 첫 주
+
+- [ ] **유예 모드 해제** — 관제 UI 가드 탭에서 며칠 오탐률을 본 뒤. 유예 중에는 화면·API·`doctor`
+      가 계속 알린다 ([README](../README.md#도입-첫날에-막히지-않습니다))
+- [ ] **백업 주기** — `./backup.sh /mnt/<nas>/llmcc` 를 cron 에. 백업에는 원문 암호문도 KEK 도
+      없다 ([deployment §8](deployment.md)). **복원 리허설을 한 번 한다** — 절차가 없으면 백업은 없는 것과 같다
+      ```sh
+      ./restore.sh /mnt/<nas>/llmcc/llmcc-backup-<stamp>.tgz    # 스키마 게이트 → "restore" 입력
+      ```
+- [ ] **감사 내보내기** — `python -m app audit-export --out <다른 저장소>/audit.jsonl` 을 정기 실행.
+      체인은 조작을 드러낼 뿐 막지 못하고, 재계산은 밖의 사본과 대조할 때만 걸린다
+      ([runbook-audit-integrity.md](runbook-audit-integrity.md))
+- [ ] **알림 채널** — `LCC_NOTIFY_WEBHOOK` 또는 `LCC_SMTP_*` 를 넣고 관제 UI 에서 테스트 발송.
+      없으면 "사람이 모르면 조용히 멈추는 지점" 이 전부 조용하다
+- [ ] **메트릭** — `GET /metrics` 를 기존 Prometheus 에 물린다. 테넌트 이름은 라벨에 없다
+
+---
+
+## 4. 되돌리기
+
+| 상황 | 방법 | 근거 |
+|---|---|---|
+| 새 판이 문제 | 이미지 태그를 이전 판으로. 스키마가 ADD COLUMN 전용이라 구버전이 신버전 DB 를 읽는다 | [deployment §5](deployment.md) |
+| 데이터가 문제 | `./restore.sh <백업>` — 역할 오버라이드가 백업 시점으로 되돌아간다는 경고를 읽는다 | [deployment §8](deployment.md) |
+| KEK 유출 | `python -m app rotate-kek` — 암호문 재암호화 없음 | [runbook-key-compromise.md](runbook-key-compromise.md) |
+| 감사 체인 어긋남 | `doctor` 가 자리를 지목한다 | [runbook-audit-integrity.md](runbook-audit-integrity.md) |
+
+---
+
+## 5. 이 판(0.1.0)에서 실제로 돌려 본 것 — 2026-09-09 리허설
+
+측정 > 추정. 아래는 테스트가 아니라 **번들을 풀고 스크립트를 순서대로 돌린** 기록이다.
+도커 데몬이 없는 환경이라 컨테이너 경로는 못 돌렸고, 그 자리는 시뮬레이션으로 대신했다.
+
+| 항목 | 결과 |
+|---|---|
+| `./bundle.sh` → 빈 디렉터리에 풀기 → `python -m app bootstrap` | 통과. `data/`·`keys/` 가 번들 루트에 생기고 `master.key` 는 600 |
+| `./backup.sh` → DB 삭제 → `./restore.sh` → `doctor` | 통과. 백업에 암호문 0건·KEK 없음. 복원이 설정 7개를 되돌리고 `.before-restore` 사본을 남김 |
+| 살아 있는 서버(`serve --demo`)에 앞문으로: `/healthz` · UI · `/v1/meta` · `/v1/generate`(목 노드) · 플러그인 설치→켜기→이벤트 풀→끄기 | 통과. 끈 플러그인은 401, 켠 직후 밀림 0, 종결 1건이 도착 |
+| `doctor --bundle` | 토큰 유출 없음 |
+| 스케줄 트리거 판에서 만든 DB 를 현재 코드로 열기 | 마이그레이션 자동. 이벤트 표·트리거가 생기고 옛 플러그인 행이 그대로 읽힘 |
+| **Dockerfile 의존성 레이어** (pyproject 만 있는 상태에서 `pip install .`) | **깨져 있었다** — `package directory 'app/providers' does not exist`. 휠 검증은 전체 트리에서 빌드해 이 실패를 못 봤다. pyproject 에서 목록만 읽어 설치하도록 고쳤고 `test_the_dockerfile_dependency_layer_does_not_build_the_package` 가 지킨다 |
+| 유예 모드 배너 | **거짓말을 하고 있었다** — "audit 로 낮춰집니다" 라고 찍혔는데 코드는 마스킹이다. 고쳤고 배너 검사에 못박았다 |
+| 번들 이름 | README·deployment 가 `llm-controlcenter-<ver>.tgz` 라고 적었지만 `bundle.sh` 는 `llm-controlcenter-airgap-<ver>-<날짜>.tgz` 를 만든다. 문서를 고쳤다 |
+| 빌드 컨텍스트 | `.dockerignore` 가 없어 `.venv`·`keys`·`data` 가 데몬에 올라가는 구조였다. 추가했다 |
+| `./preflight.sh` | 이 환경에서는 "도커 데몬에 연결할 수 없습니다" 로 실패하는 것이 **맞다** |
+
+---
+
+## 6. 알고 넘어가는 것
+
+첫 배포에서 특히 설명이 필요한 것만 — 전체는 [README 부채 표](../README.md#열어두는-부채).
+
+- **관리 신원은 토큰뿐이다.** IdP·MFA 가 없다. 관리자 퇴사는 토큰 폐기로 사람이 처리한다
+- **컨트롤 플레인은 1대다**(SPOF). 의도한 선택이고 Scale 프로파일에서 푼다
+- **토큰 처리율은 보여 주기만 하고 한도로 걸지 않는다.** 설치처 분포를 본 뒤 건다
+- **플러그인은 플랫폼 테넌트 전용이고 토큰 회전 경로가 없다** ([plugin-exploration §11](plugin-exploration.md))
+- **가드 2단·라우팅 분류기는 인증(certify)이 끝나야 판정한다.** 기동 직후 `doctor` 가
+  `model_not_certified` 를 경고하는 것은 정상이고, 스케줄러가 자동 인증한다
+- **실제 `docker build` 는 아직 아무도 안 돌렸다** — §1 의 첫 체크 항목이 그것이다

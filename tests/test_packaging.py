@@ -191,10 +191,18 @@ def test_bootstrap_is_safe_to_rerun(store, vault_with_key):
 
 def test_bootstrap_starts_in_grace_mode_and_says_so(store, vault_with_key):
     """도입 첫날 막히지 않되, **유예를 조용히 두지 않는다.**"""
+    from app.guard import GRACE_FALLBACK
+
     result = bootstrap(store, vault_with_key)
     assert store.platform_setting(GRACE_KEY) is True
     assert any("유예" in w for w in result.warnings)
-    assert "유예" in result.banner()
+    banner = result.banner()
+    assert "유예" in banner
+    # 설치자가 처음 읽는 문장이다. 코드는 block → full 인데 배너가 "audit 로" 라고
+    # 말하고 있었다 — README 검사(`test_the_readme_describes_the_grace_mode_that_was_actually_built`)
+    # 는 README 만 봤고, 배너는 아무도 안 봤다.
+    assert "audit 로" not in banner, "유예는 audit 가 아니라 마스킹으로 낮춘다 — 배너가 거짓말을 한다"
+    assert GRACE_FALLBACK in banner
 
 
 def test_bootstrap_warns_when_there_is_no_key(store):
@@ -1313,3 +1321,111 @@ def test_the_wheel_content_matches_the_source(tmp_path):
     assert not stale, (
         f"휠 안의 파일이 소스와 다르다(낡은 빌드 트리가 이겼다): {stale}"
     )
+
+
+# ── Dockerfile — 의존성 레이어가 소스 트리 없이 서야 한다 ─────────────────────────
+
+
+def _dependency_layer() -> str:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    return dockerfile[: dockerfile.index("COPY app/ app/")]
+
+
+def test_the_dockerfile_dependency_layer_does_not_build_the_package():
+    """**`pip install .` 은 소스가 없는 레이어에서 죽는다.**
+
+    pyproject 가 패키지 디렉터리를 이름으로 나열하므로(`app.providers`·번들 자산)
+    그것들이 없는 의존성 레이어에서는 메타데이터 생성부터 실패한다 — 실제로
+    `package directory 'app/providers' does not exist` 로 죽었다(1차 배포 리허설).
+    휠 검증(`test_the_wheel_content_matches_the_source`)은 전체 트리에서 빌드하므로
+    이 실패를 못 본다. 의존성 레이어는 pyproject 에서 목록만 읽어 설치한다.
+    """
+    layer = _dependency_layer()
+    assert not re.search(r"pip install[^\n]* \.(\s|\\|$)", layer), (
+        "의존성 레이어가 패키지를 빌드한다 — 소스 트리가 없어 죽는다"
+    )
+    assert "tomllib" in layer and "pyproject.toml" in layer, (
+        "의존성 목록은 pyproject 한 곳에서 읽어야 한다 — 여기 다시 적으면 두 벌이 된다"
+    )
+
+
+def test_the_dockerfile_installs_exactly_what_pyproject_declares(tmp_path):
+    """Dockerfile 안의 추출 명령을 **실제로 돌려** pyproject 의 목록과 대조한다."""
+    import tomllib
+
+    match = re.search(r'python -c "([^"]+)"', _dependency_layer())
+    assert match, "의존성 추출 명령을 못 찾았다"
+
+    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
+    listed = subprocess.run(
+        [sys.executable, "-c", match.group(1)],
+        capture_output=True, text=True, cwd=tmp_path, check=True,
+    ).stdout.split()
+    declared = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["dependencies"]
+    assert listed == declared
+
+
+def test_the_build_context_leaves_out_keys_and_data():
+    """`.dockerignore` 가 없으면 keys·data·백업이 컨텍스트로 데몬에 올라간다."""
+    ignored = set((ROOT / ".dockerignore").read_text(encoding="utf-8").split())
+    assert {"keys", "data", "backups", ".venv", ".git"} <= ignored
+
+
+# ── 버전 — 다섯 곳에 적혀 있다 ───────────────────────────────────────────────
+
+
+def test_every_version_string_agrees():
+    """pyproject · `app.__version__` · `main.VERSION` · compose 기본 태그 · bundle 기본값.
+
+    한 곳만 올리면 이미지 태그와 `/healthz` 가 서로 다른 판을 말하고, 번들 이름은
+    또 다른 판을 말한다 — 손으로 관리하는 값은 반드시 어긋난다.
+    """
+    import tomllib
+
+    import app
+    from app.main import VERSION
+
+    declared = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+    compose = re.search(
+        r"llm-controlcenter:\$\{LCC_VERSION:-([^}]+)\}",
+        (ROOT / "compose.yml").read_text(encoding="utf-8"),
+    )
+    bundle = re.search(
+        r'VERSION="\$\{LCC_VERSION:-([^}]+)\}"',
+        (ROOT / "bundle.sh").read_text(encoding="utf-8"),
+    )
+    assert compose and bundle, "compose.yml 이나 bundle.sh 의 기본 버전을 못 찾았다"
+    versions = {
+        "pyproject": declared, "app.__version__": app.__version__, "main.VERSION": VERSION,
+        "compose.yml": compose.group(1), "bundle.sh": bundle.group(1),
+    }
+    assert len(set(versions.values())) == 1, f"버전이 어긋난다: {versions}"
+
+
+# ── 배포 체크리스트 — 가리키는 것이 실재해야 한다 ───────────────────────────────
+
+
+def test_the_release_checklist_points_at_things_that_exist():
+    """순서표가 없는 스크립트·문서·테스트를 가리키면 설치 당일에 그 줄에서 멈춘다."""
+    text = (ROOT / "docs" / "release-checklist.md").read_text(encoding="utf-8")
+
+    scripts = set(re.findall(r"\./([a-z-]+\.sh)", text))
+    assert scripts, "체크리스트가 스크립트를 하나도 안 가리킨다"
+    for script in scripts:
+        assert (ROOT / script).is_file(), f"없는 스크립트를 가리킨다: {script}"
+
+    for doc in set(re.findall(r"\]\((?!http)([^)#]+\.md)", text)):
+        target = (ROOT / "docs" / doc).resolve()
+        assert target.is_file(), f"없는 문서를 가리킨다: {doc}"
+
+    tests_dir = ROOT / "tests"
+    names = " ".join(p.read_text(encoding="utf-8") for p in tests_dir.glob("test_*.py"))
+    for cited in set(re.findall(r"`(test_[a-z0-9_]+)`", text)):
+        assert f"def {cited}(" in names, f"없는 테스트를 인용한다: {cited}"
+
+    # README 가 이 문서를 가리켜야 사람이 찾는다.
+    assert "docs/release-checklist.md" in (ROOT / "README.md").read_text(encoding="utf-8")

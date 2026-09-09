@@ -265,9 +265,12 @@ def bootstrap(
 
     if grace_mode:
         store.set_platform_setting(GRACE_KEY, True)
+        # **배너가 실제 동작을 말해야 한다.** 예전 문구는 "audit 로 낮춰집니다" 였는데
+        # 코드는 block → full(마스킹)이다 — 설치자가 처음 읽는 문장이 제품이 하지
+        # 않는 일을 말하고 있었다(1차 배포 리허설에서 발견).
         result.warnings.append(
-            "가드 유예 모드로 시작합니다 — 차단 규칙이 audit 로 낮춰집니다. "
-            "오탐률을 확인한 뒤 관제 UI 에서 해제하세요."
+            "가드 유예 모드로 시작합니다 — 차단(block) 규칙이 마스킹(full)으로 낮춰져 "
+            "요청을 세우지 않습니다. 오탐률을 확인한 뒤 관제 UI 에서 해제하세요."
         )
 
     store.set_platform_setting(BOOTSTRAP_MARK, store.schema_version)

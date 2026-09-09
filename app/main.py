@@ -730,8 +730,8 @@ async def session(request: Request) -> Response:
             for name, role in ctx.config.roles.items()
             if role.routing is not None
         },
-        # **유예를 조용히 두면 그게 더 나쁘다.** 차단 규칙이 audit 로 낮춰진 채
-        # 도는 것을 모르면 관리자는 필터가 지키고 있다고 믿는다.
+        # **유예를 조용히 두면 그게 더 나쁘다.** 차단 규칙이 마스킹으로 낮춰진 채
+        # 도는 것을 모르면 관리자는 필터가 막고 있다고 믿는다.
         "guard_grace_mode": ctx.guard.grace_mode,
     })
 
