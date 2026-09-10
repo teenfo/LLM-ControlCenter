@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import (
+    RedirectResponse,
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
@@ -1699,6 +1700,13 @@ async def ui_index(request: Request) -> Response:
     가져온다. 정적 파일로 그냥 내보내던 것과 같은 노출 범위다.
     """
     ctx: AppContext = request.app.state.ctx
+    if not request.url.path.endswith("/"):
+        # `/ui` 는 `/ui/` 로 보낸다. index.html 의 `style.css` · `app.js` 는 **상대 경로**라
+        # 슬래시 없이 서빙하면 브라우저가 `/style.css` 를 찾다 404 를 받고, 스크립트가 안 돌아
+        # 로그인 폼이 숨겨진 채 빈 화면이 뜬다 — 첫 공개 배포에서 그대로 겪었다.
+        # 상대 경로 자체는 유지한다. 프록시가 접두사를 붙여도 자산이 따라가게 하려는 것이다.
+        query = f"?{request.url.query}" if request.url.query else ""
+        return RedirectResponse(url=f"{request.url.path}/{query}", status_code=308)
     path = ctx.static_dir / "index.html"
     if not path.is_file():
         raise ApiError("not_found", status=404)

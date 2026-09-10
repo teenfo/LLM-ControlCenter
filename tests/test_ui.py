@@ -292,6 +292,23 @@ def test_the_grace_banner_on_screen_says_what_the_code_does():
         assert GRACE_FALLBACK in text, f"{path.name}: 실제 강등 등급({GRACE_FALLBACK})을 말하지 않는다"
 
 
+def test_the_index_without_a_trailing_slash_redirects_to_one(client):
+    """`/ui` 를 그대로 서빙하면 상대 경로 자산이 `/style.css` 로 풀려 빈 화면이 뜬다.
+
+    첫 공개 배포에서 사용자가 `/ui` 를 쳤고 아무것도 안 나왔다. 자산 경로를 절대 경로로
+    바꾸는 대신 슬래시로 보낸다 — 접두사 뒤에 두는 프록시에서도 자산이 따라가야 한다.
+    """
+    response = client.get("/ui", follow_redirects=False)
+    assert response.status_code == 308
+    assert response.headers["location"] == "/ui/"
+    assert client.get("/ui?x=1", follow_redirects=False).headers["location"] == "/ui/?x=1"
+
+    served = client.get("/ui/")
+    assert served.status_code == 200
+    assert 'href="style.css"' in served.text, "자산 참조는 상대 경로로 남아야 한다"
+    assert client.get("/ui/style.css").status_code == 200
+
+
 def test_the_login_screen_asks_for_an_account_first():
     """토큰 칸은 접혀 있다.
 
