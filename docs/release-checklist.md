@@ -120,6 +120,7 @@
 | `./preflight.sh` | 이 환경에서는 "도커 데몬에 연결할 수 없습니다" 로 실패하는 것이 **맞다** |
 | **hosub 에서 실제 빌드 → `.62` 에 설치** (2026-09-10) | 번들(73MB, 이미지 포함) 전송 → `docker load` → `preflight` 통과 → `compose up` → 4초 만에 `/healthz` → `doctor` 통과. 유예 모드 배너가 고친 문구로 찍혔다 |
 | **계정 로그인 판으로 `.62` 업그레이드** (2026-09-10, 같은 날 두 번째 판) | 새 번들 sha 검증 → `backup.sh` → 옛 이미지를 `0.1.0-pre-accounts` 로 태그(되돌리기용) → `docker load` → 파일 교체(`.env`·`keys/`·데이터 볼륨은 그대로) → `compose up --force-recreate` → 4초 만에 `/healthz` → `doctor` 통과. **이미 부트스트랩된 설치라 admin 계정이 안 생긴다** — `account create admin --role platform_admin --generate` 로 만들었고 API 로그인·로그아웃이 200. 첫 설치의 관리자 토큰 둘은 회전으로 폐기해(옛 값 401) 회전 경로도 실물에서 확인했다 |
+| **공개 진입점** (2026-09-10) | 번들 nginx 대신 같은 망의 hosub 에 이미 있던 Caddy 에 사이트 하나를 얹었다 — DuckDNS 가 `*.hosub.duckdns.org` 를 같은 IP 로 돌려줘 새 도메인·토큰·포트포워딩이 없었고, 인증서는 Caddy 가 HTTP-01 로 30초 만에 받았다. `/v1/platform/*` 404 와 본문 4MB 규칙을 [deployment §3](deployment.md) 의 Caddy 블록대로 옮겼고 `/healthz` 200 · 플랫폼 면 404 · 관리 면 401 을 확인했다 |
 
 ---
 

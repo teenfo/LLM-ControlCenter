@@ -95,6 +95,29 @@ docker compose --profile tls up -d      # 공개망에 붙는다면 tls 프로�
 노출을 줄이는 것은 프록시의 몫이다 — 신뢰 네트워크 안이 아니라면 프로파일을 켠다.
 차단 규칙은 번들의 [`tls/nginx.conf`](../tls/nginx.conf) 에 들어 있다(topology §2).
 
+**앞단 프록시가 이미 있는 설치처**(Caddy·Traefik·기존 nginx)는 번들 프록시 대신 그것을 써도
+된다. 단, `tls/nginx.conf` 의 두 규칙을 **그대로 옮겨야** 한다 — `/v1/platform/*` 은 404, 본문
+상한은 4MB. 규칙을 옮기지 않으면 topology §2 표의 오른쪽 열이 비어 있는 채로 공개망에 붙는다.
+Caddy 라면 이 한 블록이다(공유기가 80·443 을 그 호스트로 보내고 있으면 인증서는 Caddy 가
+Let's Encrypt 에서 자동으로 받는다):
+
+```caddyfile
+controlcenter.example.com {
+    request_body { max_size 4MB }
+    route {
+        @platform path /v1/platform/*
+        respond @platform "not found" 404
+        reverse_proxy 192.168.0.62:8610 {
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+}
+```
+
+플랫폼 관리(노드 등록 · 테넌트 · 모델 승인 · 관리자 계정)는 그 뒤에도 설치처 안에서 —
+LAN 이나 VPN 으로 앱 포트에 직접 — 한다. 공개 주소에서 플랫폼 탭이 404 로 보이는 것은
+고장이 아니라 이 규칙이다.
+
 ### 3.1 부트스트랩 (최초 기동)
 
 1. **마스터 KEK 생성** → `/keys` 에 저장, **1회만 표시**하고 백업 안내
