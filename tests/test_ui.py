@@ -278,6 +278,20 @@ def test_the_login_screen_has_real_fallback_text():
         assert text.strip() != key, f"{key} 의 폴백이 키 자체다"
 
 
+def test_the_grace_banner_on_screen_says_what_the_code_does():
+    """유예는 block → full(마스킹)이지 audit 가 아니다.
+
+    부트스트랩 배너의 같은 거짓말은 1차 배포 리허설에서 잡아 고쳤는데(`test_packaging`),
+    화면 배너는 아무도 안 봤다 — 계정 로그인 스모크의 스크린샷에서 드러났다.
+    """
+    from app.guard import GRACE_FALLBACK
+
+    for path in sorted(LOCALES.glob("*.json")):
+        text = json.loads(path.read_text(encoding="utf-8"))["ui.grace_mode"]
+        assert "audit" not in text, f"{path.name}: 유예를 audit 라고 말한다"
+        assert GRACE_FALLBACK in text, f"{path.name}: 실제 강등 등급({GRACE_FALLBACK})을 말하지 않는다"
+
+
 def test_the_login_screen_asks_for_an_account_first():
     """토큰 칸은 접혀 있다.
 

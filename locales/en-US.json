@@ -176,7 +176,7 @@
   "ui.test_notify": "Send test",
   "ui.diagnostics": "Diagnostic bundle",
   "ui.download": "Download",
-  "ui.grace_mode": "Guard grace mode — blocking rules are downgraded to audit and do not block.",
+  "ui.grace_mode": "Guard grace mode — blocking rules are downgraded to masking (full) and do not stop requests.",
   "ui.grace_mode_off": "End grace mode",
   "ui.plugins": "Plugins",
   "ui.plugin": "Plugin",
