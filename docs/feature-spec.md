@@ -1029,19 +1029,26 @@
 상태   구현됨
 
 ### OPS-8  관제 UI
-정의   빌드 단계 없는 정적 화면. 노드 그리드·큐·예산·감사·가드를 한 곳에서 본다.
+정의   빌드 단계 없는 정적 화면. 좌측 아이콘 레일 · 상태 필이 있는 헤더 · 카드 본문 · 우측 드로어 · 토스트로
+       노드·테넌트·모델·규칙·작업·사용량·알림·설정을 한 곳에서 본다(2026-09 디자인 핸드오프 구조).
+       레일 항목은 세션의 역할로 결정된다 — 플랫폼 면(노드·테넌트·모델·알림)은 플랫폼 관리자에게만 보인다.
+       라이트·다크 테마는 OS 설정을 따르고 레일 버튼으로 뒤집는다(선택은 `localStorage` 의 테마 키 하나뿐).
 표면   `GET /ui` · `static/`
-구현   `app/main.py:ui_index` · `static/app.js` `static/index.html`
-계약   빌드 없이 서빙된다 · 외부 자산과 프레임워크 번들을 안 쓴다
+구현   `app/main.py:ui_index` · `static/app.js` `static/index.html` `static/style.css`
+계약   빌드 없이 서빙된다 · 외부 자산(CDN·웹폰트)과 프레임워크 번들을 안 쓴다
        서버 데이터를 HTML 로 쓰지 않는다(XSS) · 토큰은 세션 스토리지에만 둔다
        `index.html` 이 `app.js` 참조에 버전을 박는다 — 업그레이드 후 캐시된 옛 JS 가 새 API 를 안 때린다
        화면이 쓰는 모든 문자열이 모든 로케일에 있고, 안 쓰는 문자열은 없다
+       레일은 역할이 쓸 수 있는 페이지만 내놓는다 · 드로어·토스트는 `#view` 밖에 살아 자동 갱신에 지워지지 않는다
+       1회 표시 값(발급 토큰)은 드로어에서만 보여 주고 목록에는 남기지 않는다
 고정   `test_ui.py::test_the_ui_is_served_without_a_build_step`
        `test_ui.py::test_no_external_assets`
        `test_ui.py::test_server_data_is_never_written_as_html`
        `test_ui.py::test_the_token_is_kept_in_session_storage_only`
        `test_ui.py::test_every_ui_string_the_screen_uses_exists_in_every_locale`
        `test_ui.py::test_no_dead_ui_strings`
+       `test_ui.py::test_the_rail_offers_only_the_pages_the_role_can_use`
+       `test_ui.py::test_the_drawer_and_toast_live_outside_the_view`
 상태   구현됨
 
 ### OPS-9  클러스터 상태 조회

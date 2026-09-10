@@ -67,10 +67,50 @@ def test_server_data_is_never_written_as_html():
 
 
 def test_the_token_is_kept_in_session_storage_only():
-    """공용 PC 에 토큰이 남지 않게 — 탭을 닫으면 지워져야 한다."""
+    """공용 PC 에 토큰이 남지 않게 — 탭을 닫으면 지워져야 한다.
+
+    localStorage 는 **테마 선택 하나**에만 쓴다. 그 줄들은 전부 THEME_KEY 를 지나야 한다 —
+    토큰이 거기로 새는 순간 이 검사가 잡는다.
+    """
     code = strip_comments((STATIC / "app.js").read_text(encoding="utf-8"))
     assert "sessionStorage" in code
-    assert "localStorage" not in code
+    for line in code.splitlines():
+        if "localStorage" in line:
+            assert "THEME_KEY" in line, f"localStorage 가 테마 밖에서 쓰였다: {line.strip()}"
+    assert "TOKEN_KEY" not in "".join(l for l in code.splitlines() if "localStorage" in l)
+
+
+def test_the_rail_offers_only_the_pages_the_role_can_use():
+    """레일은 세션의 역할로 그린다 — 플랫폼 면은 플랫폼 관리자에게만, 계정 탭은 계정 세션에만.
+
+    화면이 숨긴 것과 무관하게 서버는 역할을 따로 검사하지만, 못 쓰는 진입점이 보이면
+    사람은 그것을 고장으로 읽는다(첫 공개 접속에서 그랬다).
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    pages = source[source.index("const PAGES = ["):source.index("function pagesFor")]
+    for platform_only in ("'nodes'", "'tenants'", "'models'", "'alerts'"):
+        entry = pages[pages.index(platform_only):]
+        entry = entry[:entry.index("}")]
+        assert "platform: true" in entry and "is_platform_admin" in entry, platform_only
+    for tenant in ("'jobs'", "'usage'"):
+        entry = pages[pages.index(tenant):]
+        entry = entry[:entry.index("}")]
+        assert "is_tenant_admin" in entry, tenant
+    settings = source[source.index("async function renderSettings"):source.index("async function renderConnections")]
+    assert "s.account" in settings, "내 계정 탭이 계정 세션 조건 없이 열린다"
+
+
+def test_the_drawer_and_toast_live_outside_the_view():
+    """드로어의 폼과 발급된 토큰은 #view 밖에 있어야 자동 갱신이 지우지 않는다."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    view_start = html.index('id="view"')
+    for element in ('id="drawer"', 'id="drawer-body"', 'id="toast"'):
+        assert element in html
+        assert html.index(element) > html.index("</main>"), f"{element} 가 main 안에 있다"
+    assert view_start < html.index("</main>")
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    reveal = source[source.index("function revealOnce"):source.index("async function rotateToken")]
+    assert "openDrawer" in reveal, "발급 토큰이 #view 에 그려지면 다음 갱신이 지운다"
 
 
 def test_the_ui_only_opens_the_raw_prompt_one_job_at_a_time():

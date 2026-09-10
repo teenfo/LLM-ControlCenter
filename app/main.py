@@ -96,7 +96,7 @@ from .pipeline import (
 from .scheduler import Scheduler
 from .store import AlreadyExists, PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 #: 요청 본문의 절대 상한(바이트).
 #:

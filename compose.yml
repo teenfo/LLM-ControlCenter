@@ -16,7 +16,7 @@ name: llm-controlcenter
 services:
   controlcenter:
     build: .
-    image: llm-controlcenter:${LCC_VERSION:-0.2.0}
+    image: llm-controlcenter:${LCC_VERSION:-0.3.0}
     restart: unless-stopped
     # 데모 노트북에서 전원만 켜면 뜨게 하려면 restart 정책이 필요하다.
     ports:
