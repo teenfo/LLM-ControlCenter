@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hmac
 import json
+import hashlib
 import os
 import time
 from dataclasses import dataclass
@@ -95,7 +96,7 @@ from .pipeline import (
 from .scheduler import Scheduler
 from .store import AlreadyExists, PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -158,6 +159,8 @@ class AppContext:
     notifier: Notifier
     scheduler: Scheduler | None = None
     version: str = VERSION
+    #: 화면 자산의 캐시 키 — `버전-내용해시`. 같은 버전을 다시 올려도 자산이 바뀌면 키가 바뀐다.
+    asset_version: str = ""
     #: 에어갭이면 클라우드 티어를 자동 비활성화하고 그 사실을 표시한다.
     #: **설정에 남아 있는데 조용히 실패하는 것이 최악이다.**
     airgap: bool = False
@@ -247,6 +250,7 @@ def build_app(
         accountant=accountant, evaluator=evaluator, registrar=registrar,
         notifier=notifier, scheduler=scheduler, version=version, airgap=airgap, now=now,
         static_dir=static_dir or STATIC_DIR, client_dir=client_dir or CLIENT_DIR,
+        asset_version=asset_version(static_dir or STATIC_DIR, version),
         data_dir=Path(data_dir) if data_dir else Path("data"),
         plugin_trust_dir=(
             Path(plugin_trust_dir) if plugin_trust_dir
@@ -1693,6 +1697,41 @@ async def platform_evals(request: Request) -> Response:
     return _ok(request, {"results": [r.as_metrics() for r in results]})
 
 
+#: 캐시 키에 들어가는 화면 자산. index.html 은 매번 재검증하므로 여기 없다.
+_ASSETS = ("app.js", "style.css")
+
+
+def asset_version(static_dir: Path, version: str) -> str:
+    """화면 자산의 캐시 키 — `0.2.0-1a2b3c4d`.
+
+    버전만 쓰면 **같은 버전을 다시 올렸을 때** 브라우저가 옛 `app.js` 를 새 API 에 대고
+    돌린다 — 0.1.0 을 하루에 세 번 재배포하면서 실제로 의심하게 됐다. 내용 해시를 붙이면
+    자산이 바뀔 때만 키가 바뀌고, 안 바뀌면 캐시가 그대로 맞다.
+    """
+    digest = hashlib.sha256()
+    for name in _ASSETS:
+        path = static_dir / name
+        digest.update(name.encode("utf-8"))
+        digest.update(path.read_bytes() if path.is_file() else b"")
+    return f"{version}-{digest.hexdigest()[:8]}"
+
+
+class VersionedStaticFiles(StaticFiles):
+    """캐시 키(`?v=`)가 붙은 자산은 오래 캐시하고, 안 붙은 요청은 매번 재검증하게 한다.
+
+    키가 내용 해시를 품으므로 "붙은 것은 불변" 이 성립한다. 붙지 않은 요청(누군가 손으로
+    친 `/ui/app.js`)까지 오래 캐시하면 업그레이드 뒤 그 탭만 옛 화면을 본다.
+    """
+
+    def file_response(self, full_path, stat_result, scope, status_code: int = 200) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        versioned = b"v=" in scope.get("query_string", b"")
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if versioned else "no-cache"
+        )
+        return response
+
+
 async def ui_index(request: Request) -> Response:
     """관제 UI 의 첫 화면. **`app.js` 참조에 버전을 박아 내보낸다.**
 
@@ -1710,8 +1749,10 @@ async def ui_index(request: Request) -> Response:
     path = ctx.static_dir / "index.html"
     if not path.is_file():
         raise ApiError("not_found", status=404)
-    html = path.read_text(encoding="utf-8").replace("__VERSION__", ctx.version)
-    return HTMLResponse(html)
+    key = ctx.asset_version or asset_version(ctx.static_dir, ctx.version)
+    html = path.read_text(encoding="utf-8").replace("__VERSION__", key)
+    # 첫 화면은 매번 재검증한다 — 여기 박힌 자산 키가 새 판을 가리키게 하는 유일한 길이다.
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 async def metrics(request: Request) -> Response:
@@ -2136,5 +2177,7 @@ def _routes(ctx: AppContext) -> list[Any]:
         # 대고 돌리고, 그 증상은 "일부 화면만 이상하다" 로 나타나서 원인을 찾기 어렵다.
         routes.append(Route("/ui", ui_index, name="ui_index"))
         routes.append(Route("/ui/", ui_index, name="ui_index_slash"))
-        routes.append(Mount("/ui", StaticFiles(directory=ctx.static_dir, html=True), name="ui"))
+        routes.append(Mount(
+            "/ui", VersionedStaticFiles(directory=ctx.static_dir, html=True), name="ui",
+        ))
     return routes

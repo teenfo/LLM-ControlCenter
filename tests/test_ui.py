@@ -305,7 +305,7 @@ def test_the_index_without_a_trailing_slash_redirects_to_one(client):
 
     served = client.get("/ui/")
     assert served.status_code == 200
-    assert 'href="style.css"' in served.text, "자산 참조는 상대 경로로 남아야 한다"
+    assert 'href="style.css?v=' in served.text, "자산 참조는 상대 경로로 남아야 한다"
     assert client.get("/ui/style.css").status_code == 200
 
 
@@ -476,10 +476,45 @@ def test_the_served_index_substitutes_the_real_version(client):
     """플레이스홀더가 그대로 나가면 버전이 안 바뀌어 캐시버스팅이 아니다."""
     from app.main import VERSION
 
-    response = client.get("/ui")
+    response = client.get("/ui/")
     assert response.status_code == 200
     assert "__VERSION__" not in response.text
-    assert f"app.js?v={VERSION}" in response.text
+    # 키는 `버전-내용해시` 다. 버전만 있으면 같은 버전을 다시 올린 날 옛 JS 가 새 API 에 대고 돈다.
+    assert re.search(rf'app\.js\?v={re.escape(VERSION)}-[0-9a-f]{{8}}"', response.text), response.text[-400:]
+    assert re.search(rf'style\.css\?v={re.escape(VERSION)}-[0-9a-f]{{8}}"', response.text)
+
+
+def test_asset_cache_keys_follow_the_content(tmp_path):
+    """자산이 바뀌면 키가 바뀌고, 안 바뀌면 그대로다 — 그래야 캐시가 맞을 때는 맞고 틀릴 때는 틀린다."""
+    import shutil
+
+    from app.main import VERSION, asset_version
+
+    copy = tmp_path / "static"
+    shutil.copytree(STATIC, copy)
+    baseline = asset_version(copy, VERSION)
+    assert baseline.startswith(VERSION + "-") and baseline == asset_version(copy, VERSION)
+
+    with (copy / "app.js").open("a", encoding="utf-8") as handle:
+        handle.write("\n// 한 줄 바뀜\n")
+    assert asset_version(copy, VERSION) != baseline
+
+    # 다른 버전 문자열은 내용이 같아도 다른 키다 — 판이 다르면 캐시도 다르다.
+    assert asset_version(STATIC, VERSION) != asset_version(STATIC, VERSION + ".1")
+
+
+def test_versioned_assets_are_immutable_and_the_index_is_not(client):
+    """키가 붙은 자산은 1년, 첫 화면과 맨 자산은 매번 재검증. 업그레이드 뒤 강제 새로고침이 필요 없어야 한다."""
+    index = client.get("/ui/")
+    assert index.headers["cache-control"] == "no-cache"
+
+    keyed = client.get("/ui/app.js?v=whatever")
+    assert keyed.status_code == 200
+    assert "immutable" in keyed.headers["cache-control"]
+
+    bare = client.get("/ui/app.js")
+    assert bare.status_code == 200
+    assert bare.headers["cache-control"] == "no-cache"
 
 
 def test_the_ui_refreshes_itself():
