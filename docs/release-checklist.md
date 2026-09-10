@@ -130,6 +130,7 @@
 | **공개 진입점** (2026-09-10) | 번들 nginx 대신 같은 망의 hosub 에 이미 있던 Caddy 에 사이트 하나를 얹었다 — DuckDNS 가 `*.hosub.duckdns.org` 를 같은 IP 로 돌려줘 새 도메인·토큰·포트포워딩이 없었고, 인증서는 Caddy 가 HTTP-01 로 30초 만에 받았다. `/v1/platform/*` 404 와 본문 4MB 규칙을 [deployment §3](deployment.md) 의 Caddy 블록대로 옮겼고 `/healthz` 200 · 플랫폼 면 404 · 관리 면 401 을 확인했다 |
 | **공개 첫 접속이 빈 화면** (2026-09-10) | 사용자가 `/ui` 를 쳤고 아무것도 안 나왔다. index.html 의 자산 참조가 상대 경로라 슬래시 없이 서빙되면 `/style.css` 가 404 다 — 스크립트가 안 돌아 로그인 폼이 숨겨진 채로 남는다. 프록시에 `redir /ui /ui/ 308` 을 먼저 넣어 그 자리에서 풀고, 앱에도 같은 리다이렉트를 넣어(`6b0843f`, `test_the_index_without_a_trailing_slash_redirects_to_one`) 재배포했다. 리허설은 늘 `/ui/` 로만 쳤기 때문에 못 봤다 |
 | **공개 주소에서 관제가 비어 보임 · 비밀번호 폼이 지워짐** (2026-09-10) | 둘 다 첫 실사용이 드러냈다. ① 공개 진입점의 `/v1/platform/*` 404 를 화면이 "표시할 항목이 없음" 으로 그렸다 — 세션을 열 때 HEAD 로 한 번 묻고 막혔으면 배너와 탭 본문이 이유를 말하게 했다(`test_the_screen_explains_a_blocked_platform_surface`). 이 설치는 **프로토타입 단계라 관제 전체를 밖에서 써야 한다는 운영자 결정으로 차단을 풀었다** — 남는 통제는 계정 잠금 · TLS · 앱 역할 검사. ② 15초 자동 갱신이 입력 중인 폼을 다시 그려 치던 글자를 지웠다 — 폼을 만지는 중이면 조용한 갱신은 기다린다(`test_auto_refresh_does_not_paint_over_a_form_being_edited`) |
+| **0.2.0 으로 올림** (2026-09-10) | 0.1.0 을 하루에 세 번 재배포하고서야 버전 규율이 없다는 것을 알았다. 버전을 올리고 자산 캐시 키를 `버전-내용해시` 로 바꿨다(`test_asset_cache_keys_follow_the_content` · `test_versioned_assets_are_immutable_and_the_index_is_not`). `.62` 는 `.env` 의 `LCC_VERSION` 을 함께 올려 `docker compose up --force-recreate` 로 새 태그의 이미지를 받았고, `/healthz` 0.2.0 · `app.js?v=0.2.0-2b5fc2a9` · `/ui/` no-cache · 키 있는 자산 immutable 을 공개 주소에서 확인했다. 0.1.0 이미지는 태그 그대로 남아 되돌리기는 `.env` 한 줄이다 |
 
 ---
 
