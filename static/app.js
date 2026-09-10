@@ -202,6 +202,9 @@ function renderBanners(extra) {
   }
   // 유예를 조용히 두면 그게 더 나쁘다 — 필터가 지키고 있다고 믿게 된다.
   if (s.guard_grace_mode) warnings.push([t('ui.grace_mode'), 'bad']);
+  // 공개 진입점은 /v1/platform/* 를 404 로 막는다(topology §2). "표시할 항목이 없음" 으로
+  // 보이면 사용자는 제품이 비었다고 읽는다 — 막힌 것은 막혔다고 말한다.
+  if (state.platformBlocked) warnings.push([t('ui.platform_blocked'), 'bad']);
   for (const line of extra || []) warnings.push(line);
 
   for (const [text, cls] of warnings) {
@@ -215,13 +218,13 @@ function tabsFor(session) {
   const tabs = [];
   if (session.is_platform_admin) {
     tabs.push(
-      { id: 'overview', label: t('ui.overview'), render: renderPlatformOverview },
-      { id: 'nodes', label: t('ui.nodes'), render: renderNodes },
-      { id: 'tenants', label: t('ui.tenants'), render: renderTenants },
-      { id: 'models', label: t('ui.models'), render: renderModels },
-      { id: 'baseline', label: t('ui.baseline'), render: renderBaseline },
-      { id: 'notify', label: t('ui.notifications'), render: renderNotifications },
-      { id: 'plugins', label: t('ui.plugins'), render: renderPlugins },
+      { id: 'overview', label: t('ui.overview'), render: renderPlatformOverview, platform: true },
+      { id: 'nodes', label: t('ui.nodes'), render: renderNodes, platform: true },
+      { id: 'tenants', label: t('ui.tenants'), render: renderTenants, platform: true },
+      { id: 'models', label: t('ui.models'), render: renderModels, platform: true },
+      { id: 'baseline', label: t('ui.baseline'), render: renderBaseline, platform: true },
+      { id: 'notify', label: t('ui.notifications'), render: renderNotifications, platform: true },
+      { id: 'plugins', label: t('ui.plugins'), render: renderPlugins, platform: true },
     );
   }
   if (session.is_tenant_admin) {
@@ -234,7 +237,7 @@ function tabsFor(session) {
     );
   }
   if (session.is_platform_admin) {
-    tabs.push({ id: 'accounts', label: t('ui.accounts'), render: renderAccounts });
+    tabs.push({ id: 'accounts', label: t('ui.accounts'), render: renderAccounts, platform: true });
   }
   if (!tabs.length) {
     tabs.push({ id: 'status', label: t('ui.dashboard'), render: renderConsumerStatus });
@@ -268,6 +271,9 @@ let refreshGeneration = 0;
 
 async function refresh(options) {
   const quiet = options && options.quiet;
+  // 조용한(자동) 갱신은 폼을 만지는 중이면 기다린다 — 입력 위를 덮어쓰는 갱신은 갱신이
+  // 아니라 방해다. 수동 새로고침은 사용자의 뜻이니 그대로 그린다.
+  if (quiet && editingInView()) return;
   const tabs = tabsFor(state.session);
   const tab = tabs.find((x) => x.id === state.tab) || tabs[0];
   state.tab = tab.id;
@@ -275,6 +281,12 @@ async function refresh(options) {
 
   const generation = ++refreshGeneration;
   const view = $('view');
+  if (tab.platform && state.platformBlocked) {
+    // 이 주소에서는 안 열리는 면이다. 404 를 받아 "없음" 을 그리는 대신 이유를 그린다.
+    renderBanners();
+    view.replaceChildren(el('p', { class: 'muted', text: t('ui.platform_blocked') }));
+    return;
+  }
   // 자동 갱신은 화면을 비우지 않는다 — 15초마다 깜빡이면 읽을 수가 없다.
   if (!quiet) view.replaceChildren(el('p', { class: 'muted', text: t('ui.loading') }));
   try {
@@ -288,6 +300,29 @@ async function refresh(options) {
       view.replaceChildren(el('p', { class: 'muted', text: t('ui.empty') }));
     }
   }
+}
+
+/** 사용자가 화면의 폼을 만지는 중인가.
+ *
+ *  자동 갱신이 그 위를 다시 그리면 치던 글자가 사라진다 — 비밀번호 변경 폼에서 실제로
+ *  겪었다. 포커스가 폼 칸에 있거나, 어떤 칸이든 기본값에서 벗어나 있으면 편집 중으로 본다.
+ *  제출이 끝나 칸이 비워지면 다시 기본값이라 갱신이 재개된다. 수동 새로고침은 그대로 그린다. */
+function editingInView() {
+  const view = $('view');
+  const active = document.activeElement;
+  if (active && view.contains(active) && ['INPUT', 'SELECT', 'TEXTAREA'].includes(active.tagName)) {
+    return true;
+  }
+  for (const field of view.querySelectorAll('input, textarea, select')) {
+    if (field.tagName === 'SELECT') {
+      if (Array.from(field.options).some((o) => o.selected !== o.defaultSelected)) return true;
+    } else if (field.type === 'checkbox' || field.type === 'radio') {
+      if (field.checked !== field.defaultChecked) return true;
+    } else if (field.value !== field.defaultValue) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function startAutoRefresh() {
@@ -1309,12 +1344,30 @@ async function loadSession() {
   state.strings = state.session.strings || {};
   document.documentElement.lang = state.session.locale;
   applyStaticStrings();
+  state.platformBlocked = await platformSurfaceBlocked();
 
   const who = state.session.account
     ? t('ui.signed_in_as', { name: state.session.account }) + ' · '
     : '';
   $('who').textContent = who + state.session.tenant.name + ' · ' + state.session.role;
   $('version').textContent = 'v' + state.session.version;
+}
+
+/** 플랫폼 관리 면이 이 주소에서 열리는가.
+ *
+ *  앱은 이 경로에 404 를 내지 않는다 — 플랫폼 관리자면 200, 아니면 403 이다. 404 는 앞단
+ *  프록시(번들 nginx · Caddy)가 공개 경로에서 그 면을 감춘 것이다(topology §2). 한 번만 묻고
+ *  세션에 기억한다. 물음 자체가 실패하면 막힌 것으로 단정하지 않는다. */
+async function platformSurfaceBlocked() {
+  if (!state.session || !state.session.is_platform_admin) return false;
+  try {
+    const response = await fetch('/v1/platform/overview', {
+      method: 'HEAD', headers: { Authorization: 'Bearer ' + state.token },
+    });
+    return response.status === 404;
+  } catch (_) {
+    return false;
+  }
 }
 
 async function connect(token) {

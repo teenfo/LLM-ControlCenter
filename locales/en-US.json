@@ -219,5 +219,6 @@
   "ui.account_reset_done": "Reset. That account's sessions were signed out.",
   "ui.account_none": "No accounts",
   "ui.last_login": "Last login",
-  "ui.disabled": "Disabled"
+  "ui.disabled": "Disabled",
+  "ui.platform_blocked": "Platform administration is not reachable at this address. The public entry point blocks /v1/platform/* — use the on-site address or a VPN."
 }

@@ -309,6 +309,45 @@ def test_the_index_without_a_trailing_slash_redirects_to_one(client):
     assert client.get("/ui/style.css").status_code == 200
 
 
+def test_auto_refresh_does_not_paint_over_a_form_being_edited():
+    """15초마다 탭을 다시 그리는 갱신이 **치던 글자를 지웠다** — 비밀번호 변경 폼에서 실제로.
+
+    포커스가 폼 칸에 있거나 어떤 칸이든 기본값에서 벗어나 있으면 자동 갱신은 기다린다.
+    수동 새로고침은 사용자의 뜻이니 그대로 그린다.
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "function editingInView" in source
+    body = source[source.index("async function refresh("):source.index("function editingInView")]
+    assert "quiet && editingInView()" in body, "조용한 갱신이 편집 여부를 묻지 않는다"
+    guard = source[source.index("function editingInView"):source.index("function startAutoRefresh")]
+    for needle in ("document.activeElement", "defaultValue", "defaultChecked", "defaultSelected"):
+        assert needle in guard, needle
+
+
+def test_the_screen_explains_a_blocked_platform_surface():
+    """공개 진입점은 /v1/platform/* 를 404 로 막는다(topology §2).
+
+    그 404 를 "표시할 항목이 없음" 으로 그리면 사용자는 제품이 비었다고 읽는다 — 첫 공개
+    접속에서 그렇게 읽었다. 세션을 열 때 한 번 묻고, 막혔으면 배너와 탭 본문이 이유를 말한다.
+    """
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "platformSurfaceBlocked" in source
+    assert "t('ui.platform_blocked')" in source
+    probe = source[source.index("async function platformSurfaceBlocked"):source.index("async function connect")]
+    assert "'/v1/platform/overview'" in probe and "'HEAD'" in probe
+    assert "response.status === 404" in probe
+    for locale in ("ko-KR", "en-US"):
+        text = json.loads((LOCALES / f"{locale}.json").read_text(encoding="utf-8"))["ui.platform_blocked"]
+        assert "/v1/platform/" in text
+
+
+def test_the_platform_probe_answers_head(client, acme):
+    """화면의 탐침은 HEAD 다. 앱이 이 경로에 404 를 내지 않아야 404 가 프록시의 신호가 된다."""
+    assert client.head("/v1/platform/overview", headers=auth(acme["platform_admin"])).status_code == 200
+    assert client.head("/v1/platform/overview", headers=auth(acme["tenant_admin"])).status_code == 403
+    assert client.head("/v1/platform/overview").status_code == 401
+
+
 def test_the_login_screen_asks_for_an_account_first():
     """토큰 칸은 접혀 있다.
 

@@ -219,5 +219,6 @@
   "ui.account_reset_done": "재설정했습니다. 그 계정의 세션은 끊겼습니다.",
   "ui.account_none": "계정이 없습니다",
   "ui.last_login": "마지막 로그인",
-  "ui.disabled": "정지됨"
+  "ui.disabled": "정지됨",
+  "ui.platform_blocked": "플랫폼 관리 면은 이 주소에서 열리지 않습니다. 공개 진입점은 /v1/platform/* 를 막습니다 — 설치처 안의 주소나 VPN 으로 접속하세요."
 }

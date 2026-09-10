@@ -122,6 +122,7 @@
 | **계정 로그인 판으로 `.62` 업그레이드** (2026-09-10, 같은 날 두 번째 판) | 새 번들 sha 검증 → `backup.sh` → 옛 이미지를 `0.1.0-pre-accounts` 로 태그(되돌리기용) → `docker load` → 파일 교체(`.env`·`keys/`·데이터 볼륨은 그대로) → `compose up --force-recreate` → 4초 만에 `/healthz` → `doctor` 통과. **이미 부트스트랩된 설치라 admin 계정이 안 생긴다** — `account create admin --role platform_admin --generate` 로 만들었고 API 로그인·로그아웃이 200. 첫 설치의 관리자 토큰 둘은 회전으로 폐기해(옛 값 401) 회전 경로도 실물에서 확인했다 |
 | **공개 진입점** (2026-09-10) | 번들 nginx 대신 같은 망의 hosub 에 이미 있던 Caddy 에 사이트 하나를 얹었다 — DuckDNS 가 `*.hosub.duckdns.org` 를 같은 IP 로 돌려줘 새 도메인·토큰·포트포워딩이 없었고, 인증서는 Caddy 가 HTTP-01 로 30초 만에 받았다. `/v1/platform/*` 404 와 본문 4MB 규칙을 [deployment §3](deployment.md) 의 Caddy 블록대로 옮겼고 `/healthz` 200 · 플랫폼 면 404 · 관리 면 401 을 확인했다 |
 | **공개 첫 접속이 빈 화면** (2026-09-10) | 사용자가 `/ui` 를 쳤고 아무것도 안 나왔다. index.html 의 자산 참조가 상대 경로라 슬래시 없이 서빙되면 `/style.css` 가 404 다 — 스크립트가 안 돌아 로그인 폼이 숨겨진 채로 남는다. 프록시에 `redir /ui /ui/ 308` 을 먼저 넣어 그 자리에서 풀고, 앱에도 같은 리다이렉트를 넣어(`6b0843f`, `test_the_index_without_a_trailing_slash_redirects_to_one`) 재배포했다. 리허설은 늘 `/ui/` 로만 쳤기 때문에 못 봤다 |
+| **공개 주소에서 관제가 비어 보임 · 비밀번호 폼이 지워짐** (2026-09-10) | 둘 다 첫 실사용이 드러냈다. ① 공개 진입점의 `/v1/platform/*` 404 를 화면이 "표시할 항목이 없음" 으로 그렸다 — 세션을 열 때 HEAD 로 한 번 묻고 막혔으면 배너와 탭 본문이 이유를 말하게 했다(`test_the_screen_explains_a_blocked_platform_surface`). 이 설치는 **프로토타입 단계라 관제 전체를 밖에서 써야 한다는 운영자 결정으로 차단을 풀었다** — 남는 통제는 계정 잠금 · TLS · 앱 역할 검사. ② 15초 자동 갱신이 입력 중인 폼을 다시 그려 치던 글자를 지웠다 — 폼을 만지는 중이면 조용한 갱신은 기다린다(`test_auto_refresh_does_not_paint_over_a_form_being_edited`) |
 
 ---
 
