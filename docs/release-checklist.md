@@ -119,6 +119,7 @@
 | 빌드 컨텍스트 | `.dockerignore` 가 없어 `.venv`·`keys`·`data` 가 데몬에 올라가는 구조였다. 추가했다 |
 | `./preflight.sh` | 이 환경에서는 "도커 데몬에 연결할 수 없습니다" 로 실패하는 것이 **맞다** |
 | **hosub 에서 실제 빌드 → `.62` 에 설치** (2026-09-10) | 번들(73MB, 이미지 포함) 전송 → `docker load` → `preflight` 통과 → `compose up` → 4초 만에 `/healthz` → `doctor` 통과. 유예 모드 배너가 고친 문구로 찍혔다 |
+| **계정 로그인 판으로 `.62` 업그레이드** (2026-09-10, 같은 날 두 번째 판) | 새 번들 sha 검증 → `backup.sh` → 옛 이미지를 `0.1.0-pre-accounts` 로 태그(되돌리기용) → `docker load` → 파일 교체(`.env`·`keys/`·데이터 볼륨은 그대로) → `compose up --force-recreate` → 4초 만에 `/healthz` → `doctor` 통과. **이미 부트스트랩된 설치라 admin 계정이 안 생긴다** — `account create admin --role platform_admin --generate` 로 만들었고 API 로그인·로그아웃이 200. 첫 설치의 관리자 토큰 둘은 회전으로 폐기해(옛 값 401) 회전 경로도 실물에서 확인했다 |
 
 ---
 
