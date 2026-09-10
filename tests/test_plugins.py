@@ -27,18 +27,25 @@ from app.plugins import (
     host_satisfies,
 )
 from app.identity import new_salt
+from app.main import VERSION
 from app.store import JobRow, TenantScope
 
 from tests.conftest import auth
 
 PLATFORM = "_platform"
 
-MANIFEST = """
+#: 테스트 번들이 요구하는 호스트 범위 — **지금 판의 마이너 범위**를 따라간다.
+#: 0.1.0 → 0.2.0 으로 올릴 때 `>=0.1,<0.2` 로 박아 둔 번들이 진짜로 거절됐다(그것이 이
+#: 필드의 뜻이다). 범위를 박아 두면 판을 올릴 때마다 여기가 먼저 깨진다.
+_MAJOR, _MINOR = (int(part) for part in VERSION.split(".")[:2])
+HOST_RANGE = f">={_MAJOR}.{_MINOR},<{_MAJOR}.{_MINOR + 1}"
+
+MANIFEST = f"""
 [plugin]
 id = "acme.daily-digest"
 name = "일일 요약"
 version = "1.0.0"
-requires_host = ">=0.1,<0.2"
+requires_host = "{HOST_RANGE}"
 description = "전날 사용량을 요약해 보낸다"
 
 [service]
@@ -73,7 +80,7 @@ def bundle(manifest: str = MANIFEST, *, key=None, extra: dict[str, bytes] | None
 def do_install(harness, raw: bytes, **overrides):
     kwargs = dict(
         actor="tester", data_dir=harness.data_dir, trust_dir=harness.trust_dir,
-        tenant_id=PLATFORM, host_version="0.1.0", now=harness.clock,
+        tenant_id=PLATFORM, host_version=VERSION, now=harness.clock,
     )
     kwargs.update(overrides)
     return plugins.install(harness.store, raw, **kwargs)
