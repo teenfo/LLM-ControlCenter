@@ -30,6 +30,7 @@
   "error.boundary_impossible": "This request cannot reach any node within its allowed data boundary.",
   "error.administrative_wait_timeout": "Timed out waiting for an available node.",
   "error.node_unreachable": "Cannot reach node '{node}'.",
+  "error.node_busy": "Node '{node}' has {running} running job(s). Drain it first and delete it once idle.",
   "error.backend_unavailable": "Backend unavailable. Please retry later.",
   "error.job_not_found": "Job not found.",
   "error.model_in_use": "Model '{model}' cannot be deleted: {reason}",
@@ -276,5 +277,6 @@
   "ui.locale": "Locale",
   "ui.kind": "Kind",
   "ui.timeout": "Timeout",
-  "ui.max_prompt_chars": "Max prompt (chars)"
+  "ui.max_prompt_chars": "Max prompt (chars)",
+  "ui.confirm_delete_node": "Delete node {node}? Refused while jobs are running. To undo, register it again."
 }

@@ -194,7 +194,12 @@ class Cluster:
         # DB 선언으로 덮는다. 반대로 하면 관제 UI 에서 고친 노드가 재기동 때마다
         # YAML 값으로 되돌아간다.
         self._nodes: dict[str, NodeState] = {}
+        # 지운 노드는 YAML 시드에 남아 있어도 되살리지 않는다(묘비). 묘비 조회 실패는
+        # 기동을 막지 않는다 — 그때는 시드가 그대로 들어오고, 그것은 삭제 전과 같다.
+        tombstoned = self._tombstoned_nodes()
         for name, node in config.nodes.items():
+            if name in tombstoned:
+                continue
             self._install(node, providers)
         for declaration in self._load_declarations():
             self._install(declaration, providers)
@@ -704,6 +709,30 @@ class Cluster:
             self.record_failure(node.name, str(exc))
             reachable = False
         return state, reachable
+
+    def _tombstoned_nodes(self) -> set[str]:
+        try:
+            return self._store.tombstoned_nodes()
+        except Exception:
+            return set()
+
+    def remove_node(self, node: str, *, actor: str = "") -> None:
+        """노드를 클러스터에서 뺀다. **실행 중인 잡이 있으면 거절한다.**
+
+        드레이닝이 "신규만 막고 돌던 것은 끝낸다" 라면 삭제는 그 뒤에 오는 결정이다.
+        잡이 도는 노드를 지우면 그 잡의 리스가 유령이 되고 결과가 돌아올 곳이 없다 —
+        그래서 409 로 돌려보내고, 먼저 드레이닝하라고 말한다.
+
+        YAML 시드 노드도 지운다. 묘비가 남아 재기동해도 돌아오지 않는다.
+        """
+        if node not in self._nodes:
+            raise ApiError("not_found", status=404)
+        running = self.occupancy().running(node)
+        if running:
+            raise ApiError("node_busy", status=409, params={"node": node, "running": running})
+        # **먼저 영속화한다** — 메모리에서만 빼면 재기동 한 번에 돌아온다(등록과 같은 순서).
+        self._store.delete_node(node, actor=actor)
+        del self._nodes[node]
 
     def drain(self, node: str, *, force: bool = False) -> None:
         """노드를 비활성화한다.

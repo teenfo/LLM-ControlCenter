@@ -666,6 +666,17 @@ CREATE TABLE IF NOT EXISTS node_leases (
 );
 CREATE INDEX IF NOT EXISTS idx_node_leases ON node_leases(node, expires_at);
 
+-- 삭제한 노드의 묘비. **YAML 시드가 재기동마다 되살리는 것을 막는다.**
+--
+-- 노드는 `config/nodes.yaml` 시드와 DB 선언 두 곳에서 온다. DB 행만 지우면 시드에
+-- 있던 노드는 다음 기동에 돌아오고, 관리자는 지운 노드가 왜 다시 있는지 알 수 없다.
+-- 다시 등록하면(`save_node`) 묘비는 지운다 — 등록이 삭제보다 나중의 결정이다.
+CREATE TABLE IF NOT EXISTS node_tombstones (
+    name       TEXT PRIMARY KEY,
+    deleted_by TEXT,
+    deleted_at REAL NOT NULL
+);
+
 -- 잡 종결 이벤트 — 플러그인 `event` 트리거의 아웃박스.
 --
 -- **쓰는 곳은 아래 트리거 하나다**(`_FINISH_TRIGGER`). 잡을 종결시키는 경로가
@@ -2264,6 +2275,8 @@ class SqliteStore:
                 actor, self._now(),
             ),
         )
+        # 등록은 삭제보다 나중의 결정이다 — 묘비가 있으면 지운다.
+        self._conn.execute("DELETE FROM node_tombstones WHERE name = ?", (declaration["name"],))
         self._conn.commit()
 
     def list_nodes(self) -> list[dict[str, Any]]:
@@ -2287,10 +2300,30 @@ class SqliteStore:
             for row in self._conn.execute("SELECT * FROM nodes ORDER BY name")
         ]
 
-    def delete_node(self, name: str) -> bool:
-        cur = self._conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
-        self._conn.commit()
-        return cur.rowcount > 0
+    def delete_node(self, name: str, *, actor: str = "") -> None:
+        """노드 선언과 그 부속(헬스·설치 요청·리스)을 지우고 묘비를 남긴다.
+
+        선언 행이 없어도 지운다 — YAML 시드 노드는 DB 에 행이 없고, 그 노드를 지우는
+        수단이 바로 묘비다. 한 트랜잭션이다: 부속만 지워지고 선언이 남으면 노드는
+        "헬스 기록이 없는 채로" 되살아난다.
+        """
+        with self._tx():
+            self._conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
+            self._conn.execute("DELETE FROM node_health WHERE node = ?", (name,))
+            self._conn.execute("DELETE FROM model_requests WHERE node = ?", (name,))
+            self._conn.execute("DELETE FROM node_leases WHERE node = ?", (name,))
+            self._conn.execute(
+                "INSERT INTO node_tombstones(name, deleted_by, deleted_at) VALUES(?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET deleted_by=excluded.deleted_by, "
+                "deleted_at=excluded.deleted_at",
+                (name, actor, self._now()),
+            )
+
+    def tombstoned_nodes(self) -> set[str]:
+        """삭제된 노드 이름. 기동 때 YAML 시드에서 이것을 뺀다."""
+        return {
+            row["name"] for row in self._conn.execute("SELECT name FROM node_tombstones")
+        }
 
     # -- 플러그인 -------------------------------------------------------------
     #

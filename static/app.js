@@ -737,6 +737,18 @@ async function renderNodes() {
             } catch (err) { showError(err); }
           },
         }),
+        // 삭제는 드레이닝 뒤의 결정이다 — 실행 중인 잡이 있으면 서버가 409 로 거절한다.
+        el('button', {
+          type: 'button', class: 'sm danger', text: t('ui.delete'),
+          onclick: async () => {
+            if (!confirm(t('ui.confirm_delete_node', { node: n.node }))) return;
+            try {
+              await api('/v1/platform/nodes/' + encodeURIComponent(n.node), { method: 'DELETE' });
+              toast(t('ui.deleted'));
+              refresh();
+            } catch (err) { showError(err); }
+          },
+        }),
         n.disabled_by_airgap ? el('span', { class: 'muted right', text: t('ui.airgap_on') }) : null,
       ]),
     ]);

@@ -23,6 +23,7 @@ from app.config import (
     Thresholds,
 )
 from app.cost import CostAccountant
+from app.i18n import ApiError
 from app.store import SqliteStore, TenantScope
 
 ACME = TenantScope("acme")
@@ -1132,3 +1133,53 @@ def test_a_permanent_reason_is_reported_even_when_the_node_is_also_down(store, c
     )
     assert result.rejections["out"] == "boundary_internal_only"
     assert result.outcome == FAIL
+
+
+async def test_a_deleted_seed_node_stays_deleted_across_restarts(tmp_path, clock):
+    """YAML 시드 노드를 지우면 **재기동해도 돌아오지 않는다**(묘비).
+
+    DB 행만 지우면 시드에 있던 노드는 다음 기동에 되살아나고, 관리자는 지운 노드가
+    왜 다시 있는지 알 수 없다. 다시 등록하면 묘비는 지워진다 — 등록이 나중의 결정이다.
+    """
+    path = tmp_path / "cc.db"
+    config = two_tier_config()
+    seeded = next(iter(config.nodes))
+
+    store = SqliteStore(path, now=clock)
+    first = Cluster(config, store, now=clock)
+    first.remove_node(seeded, actor="platform_admin")
+    assert seeded not in first.nodes
+    store.close()
+
+    reopened = SqliteStore(path, now=clock)
+    try:
+        second = Cluster(config, reopened, now=clock)
+        assert seeded not in second.nodes, "지운 시드 노드가 재기동에서 되살아났다"
+
+        await second.register_node(
+            {"name": seeded, "provider": "mock", "data_boundary": "internal",
+             "max_concurrent": 1, "tags": ["internal"], "models": ["small"]},
+            actor="platform_admin",
+        )
+        assert seeded in second.nodes
+    finally:
+        reopened.close()
+
+    again = SqliteStore(path, now=clock)
+    try:
+        third = Cluster(config, again, now=clock)
+        assert seeded in third.nodes, "다시 등록한 노드가 묘비에 막혔다"
+    finally:
+        again.close()
+
+
+def test_removing_a_busy_node_is_refused(cluster, store, clock):
+    """드레이닝은 신규만 막지만, 삭제는 비어 있어야 한다 — 도는 잡의 리스가 유령이 된다."""
+    assert store.try_acquire_node_lease(
+        lease_id="l-1", node="in-1", mem_gb=0.0, now=clock(), ttl_seconds=600,
+        max_concurrent=2, mem_budget_gb=None,
+    )
+    with pytest.raises(ApiError) as excinfo:
+        cluster.remove_node("in-1")
+    assert excinfo.value.code == "node_busy"
+    assert "in-1" in cluster.nodes

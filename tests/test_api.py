@@ -1438,3 +1438,43 @@ def test_retarget_over_http_moves_the_request(harness, client, acme):
     nodes_pending = {x["node"] for x in after["install_requests"] if x["model"] == r["model"]}
     assert target in nodes_pending
     assert r["node"] not in nodes_pending, "원래 노드가 대기로 되돌아왔다 — 거부가 유지되지 않는다"
+
+
+# ── 노드 삭제 ──────────────────────────────────────────────────────────────
+
+
+def test_an_idle_node_can_be_deleted(harness, client, acme):
+    """삭제는 드레이닝 뒤에 오는 결정이다 — 비어 있는 노드는 지워지고 감사에 남는다."""
+    response = client.delete("/v1/platform/nodes/in-2", headers=auth(acme["platform_admin"]))
+    assert response.status_code == 200
+    assert response.json() == {"node": "in-2", "deleted": True}
+    assert harness.cluster.state("in-2") is None
+    assert "in-2" not in {n["node"] for n in harness.cluster.snapshot()}
+    rows = harness.store._conn.execute(
+        "SELECT * FROM admin_audit WHERE action='delete_node'"
+    ).fetchall()
+    assert rows and rows[-1]["target"] == "in-2"
+
+
+def test_deleting_a_busy_node_is_refused(harness, client, clock, acme):
+    """잡이 도는 노드를 지우면 그 잡의 리스가 유령이 된다 — 409 로 돌려보낸다."""
+    assert harness.store.try_acquire_node_lease(
+        lease_id="lease-1", node="in-1", mem_gb=0.0, now=clock(), ttl_seconds=600,
+        max_concurrent=2, mem_budget_gb=None,
+    )
+    response = client.delete("/v1/platform/nodes/in-1", headers=auth(acme["platform_admin"]))
+    assert response.status_code == 409
+    assert response.json()["code"] == "node_busy"
+    assert harness.cluster.state("in-1") is not None
+
+
+def test_deleting_an_unknown_node_is_not_found(client, acme):
+    response = client.delete("/v1/platform/nodes/nope", headers=auth(acme["platform_admin"]))
+    assert response.status_code == 404
+
+
+def test_tenant_admin_cannot_delete_nodes(harness, client, acme):
+    """노드는 테넌트 공유 자원이다 — 남의 테넌트도 쓰는 노드를 지울 수 없어야 한다."""
+    response = client.delete("/v1/platform/nodes/in-1", headers=auth(acme["tenant_admin"]))
+    assert response.status_code == 403
+    assert harness.cluster.state("in-1") is not None

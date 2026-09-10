@@ -159,6 +159,10 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "platform_tenant_purge": ("테넌트 파기 + DEK 폐기(crypto-shredding). 되돌릴 수 없다.", "platform_admin", False),
     "platform_nodes": ("노드 목록·등록. 등록 즉시 프로브한다.", "platform_admin", False),
     "platform_node_drain": ("노드 드레이닝·복귀. 즉시 차단이 아니라 신규만 막는다.", "platform_admin", False),
+    "platform_node_delete": (
+        "노드 삭제. 실행 중인 잡이 있으면 거절된다 — 먼저 드레이닝한다. 시드 노드도 지워지고 재기동에 돌아오지 않는다.",
+        "platform_admin", False,
+    ),
     "platform_models": ("모델 설치 요청 목록.", "platform_admin", False),
     "platform_model_approve": ("모델 설치 승인·거부. 공유 노드 디스크를 쓰므로 플랫폼 권한이다.", "platform_admin", False),
     "platform_model_retarget": (

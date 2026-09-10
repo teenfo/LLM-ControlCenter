@@ -96,7 +96,7 @@ from .pipeline import (
 from .scheduler import Scheduler
 from .store import AlreadyExists, PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -1521,6 +1521,15 @@ async def platform_node_drain(request: Request) -> Response:
     return _ok(request, {"node": node, "action": action})
 
 
+async def platform_node_delete(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    node = request.path_params["node"]
+    # 실행 중인 잡이 있으면 클러스터가 409 로 거절한다 — 먼저 드레이닝한다.
+    ctx.cluster.remove_node(node, actor=principal.token_id)
+    ctx.store.audit(principal.token_id, "delete_node", target=node)
+    return _ok(request, {"node": node, "deleted": True})
+
+
 async def platform_models(request: Request) -> Response:
     ctx, principal = _platform_admin(request)
     if request.method == "GET":
@@ -2134,6 +2143,8 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["GET", "POST"], name="platform_nodes"),
         Route(f"{v}/platform/nodes/{{node}}/drain", platform_node_drain,
               methods=["POST"], name="platform_node_drain"),
+        Route(f"{v}/platform/nodes/{{node}}", platform_node_delete,
+              methods=["DELETE"], name="platform_node_delete"),
         Route(f"{v}/platform/models", platform_models,
               methods=["GET", "POST"], name="platform_models"),
         Route(f"{v}/platform/models/{{request_id}}/approve", platform_model_approve,

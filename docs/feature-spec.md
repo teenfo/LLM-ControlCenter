@@ -458,14 +458,17 @@
 
 ### CLUSTER-1  노드 등록과 프로브
 정의   GPU 노드·클라우드 API 를 등록하면 즉시 프로브해 재고와 헬스를 확인한다.
-표면   `GET/POST /v1/platform/nodes` · `config/nodes.yaml` 이 시드
+표면   `GET/POST /v1/platform/nodes` · `DELETE /v1/platform/nodes/{node}` · `config/nodes.yaml` 이 시드
 구현   `app/cluster.py:Cluster.probe` `NodeState`
 계약   **DB 가 YAML 시드를 이긴다** — 등록한 노드는 재시작해도 살아남는다
        망가진 노드 행 하나가 기동을 막지 않는다 · 죽은 노드 프로브가 N배 시간을 먹지 않는다(병렬)
+       삭제는 비어 있을 때만(실행 중이면 409) · 지운 노드는 시드에 있어도 재기동에 돌아오지 않는다(묘비)
 고정   `test_cluster.py::test_a_registered_node_survives_a_restart`
        `test_cluster.py::test_the_database_wins_over_the_yaml_seed`
        `test_cluster.py::test_probing_dead_nodes_does_not_take_n_times_the_timeout`
        `test_cluster.py::test_a_broken_node_row_does_not_stop_startup`
+       `test_api.py::test_deleting_a_busy_node_is_refused`
+       `test_cluster.py::test_a_deleted_seed_node_stays_deleted_across_restarts`
 상태   구현됨
 
 ### CLUSTER-2  헬스 상태 전이
@@ -1460,6 +1463,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_account_disable` | `POST /v1/platform/accounts/{username}/disable` | AUTH-9 |
 | `platform_nodes` | `GET/POST /v1/platform/nodes` | CLUSTER-1 |
 | `platform_node_drain` | `POST /v1/platform/nodes/{node}/drain` | CLUSTER-8 |
+| `platform_node_delete` | `DELETE /v1/platform/nodes/{node}` | CLUSTER-1 |
 | `platform_models` | `GET /v1/platform/models` | CLUSTER-11 |
 | `platform_model_approve` | `POST /v1/platform/models/{id}/approve` | CLUSTER-11 |
 | `platform_model_retarget` | `POST /v1/platform/models/{id}/retarget` | CLUSTER-11 |
