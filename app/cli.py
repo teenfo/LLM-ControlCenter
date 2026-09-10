@@ -13,15 +13,26 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+from .auth import (
+    ROLE_PLATFORM_ADMIN,
+    ROLE_TENANT_ADMIN,
+    create_account,
+    reset_password,
+    set_account_enabled,
+)
 from .bootstrap import (
     GRACE_KEY,
+    PLATFORM_TENANT,
     bootstrap,
+    generate_admin_password,
     demo_seed,
     KeyDirectoryUnwritable,
     ensure_master_key,
@@ -41,7 +52,7 @@ from .keyrotation import (
     rotate_master_kek,
     vault_from_file,
 )
-from .i18n import Translator
+from .i18n import ApiError, Translator
 from .models import ModelRegistrar
 from .notify import Notifier, channels_from_env
 from .observability import configure_logging, diagnostic_bundle
@@ -557,6 +568,130 @@ def cmd_audit_export(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── 계정 ────────────────────────────────────────────────────────────────────
+#
+# 관제 UI 로그인이 막혔을 때(비밀번호 분실 · 관리자 전원 정지 · 계정 기능 이전에 설치한
+# 시스템) 콘솔에서 푸는 길이다. 판단은 전부 `auth` 의 계정 절에 있고 여기는 인자만 모은다.
+
+
+def _os_user() -> str:
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        # 컨테이너에는 passwd 항목이 없을 수 있다. 감사에 "누가" 는 남겨야 한다.
+        return f"uid{os.getuid()}"
+
+
+def _password_for(args: argparse.Namespace) -> str | None:
+    """비밀번호를 **argv 로 받지 않는다** — `ps` 와 셸 히스토리에 남는다.
+
+    `--generate` → 무작위 · 환경 변수(`--password-env`) → 터미널이면 두 번 입력 → 없으면 None.
+    """
+    if getattr(args, "generate", False):
+        return generate_admin_password()
+    value = os.environ.get(args.password_env or "", "")
+    if value:
+        return value
+    if sys.stdin.isatty():
+        first = getpass.getpass("비밀번호: ")
+        if first != getpass.getpass("비밀번호 (확인): "):
+            print("두 입력이 다릅니다.", file=sys.stderr)
+            return None
+        return first
+    return None
+
+
+def _no_password_message(args: argparse.Namespace) -> str:
+    return (
+        f"비밀번호가 없습니다. 환경 변수 {args.password_env} 로 주거나, 터미널에서 입력하거나, "
+        "--generate 로 무작위 생성하세요. argv 로는 받지 않습니다."
+    )
+
+
+def cmd_account(args: argparse.Namespace) -> int:
+    """관제 UI 계정 관리 — 생성 · 목록 · 비밀번호 재설정 · 정지 · 해제."""
+    data_dir = Path(args.data or DEFAULT_DATA_DIR)
+    db_path = data_dir / "controlcenter.db"
+    if not db_path.exists():
+        print(f"DB 가 없습니다: {db_path} — `bootstrap` 을 먼저 실행하세요.", file=sys.stderr)
+        return 2
+
+    store = SqliteStore(db_path)
+    actor = f"cli:{_os_user()}"
+    try:
+        if args.action == "list":
+            rows = store.list_accounts()
+            if not rows:
+                print("  계정이 없습니다. `account create <아이디>` 로 만듭니다.")
+                return 0
+            print(f"  {'아이디':<20} {'역할':<15} {'테넌트':<14} {'상태':<4} 마지막 로그인")
+            for row in rows:
+                last = (
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(row["last_login_at"]))
+                    if row["last_login_at"] else "-"
+                )
+                state = "정지" if row["disabled_at"] else "활성"
+                print(
+                    f"  {row['username']:<20} {row['role']:<15} {row['tenant_id']:<14} "
+                    f"{state:<4} {last}"
+                )
+            return 0
+
+        if args.action == "create":
+            password = _password_for(args)
+            if password is None:
+                print(_no_password_message(args), file=sys.stderr)
+                return 2
+            role = args.role
+            tenant_id = args.tenant or (PLATFORM_TENANT if role == ROLE_PLATFORM_ADMIN else "")
+            if not tenant_id:
+                print("tenant_admin 계정에는 --tenant 가 필요합니다.", file=sys.stderr)
+                return 2
+            # 세션 토큰이 걸릴 서비스. 플랫폼은 bootstrap 이 만든 console, 테넌트는 관행상 <테넌트>-app.
+            service_id = args.service or (
+                "console" if tenant_id == PLATFORM_TENANT else f"{tenant_id}-app"
+            )
+            name = create_account(
+                store, args.username, password,
+                role=role, tenant_id=tenant_id, service_id=service_id, actor=actor,
+            )
+            print(f"  계정 {name} 을(를) 만들었습니다 — 역할 {role} · 테넌트 {tenant_id} · 서비스 {service_id}")
+            if args.generate:
+                _print_generated(password)
+            return 0
+
+        if args.action == "reset-password":
+            password = _password_for(args)
+            if password is None:
+                print(_no_password_message(args), file=sys.stderr)
+                return 2
+            revoked = reset_password(store, args.username, password, actor=actor)
+            print(f"  {args.username} 의 비밀번호를 재설정했습니다. 끊은 세션 {revoked}개.")
+            if args.generate:
+                _print_generated(password)
+            return 0
+
+        enabled = args.action == "enable"
+        revoked = set_account_enabled(store, args.username, enabled, actor=actor)
+        if enabled:
+            print(f"  {args.username} 을(를) 다시 켰습니다. 로그인할 수 있습니다.")
+        else:
+            print(f"  {args.username} 을(를) 정지했습니다. 끊은 세션 {revoked}개. 로그인이 막힙니다.")
+        return 0
+    except ApiError as exc:
+        # 사람이 콘솔에서 치는 명령이다 — 코드가 아니라 문장으로 끝낸다. 로케일은 기본값.
+        message = Translator.from_dir(bundled("locales")).t(f"error.{exc.code}", **exc.params)
+        print(f"  실패: {message}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+
+
+def _print_generated(password: str) -> None:
+    print(f"  비밀번호  {password}")
+    print("  이 값은 **지금 한 번만** 표시됩니다. 첫 로그인 뒤 바꾸세요.")
+
+
 def _demo_banner(handles: dict[str, Any], host: str, port: int) -> str:
     base = f"http://{host if host != '0.0.0.0' else 'localhost'}:{port}"
     lines = [
@@ -565,6 +700,7 @@ def _demo_banner(handles: dict[str, Any], host: str, port: int) -> str:
         "  데모 프로파일 — 목 프로바이더로 GPU 없이 전체를 시연합니다.",
         "-" * 72,
         f"  관제 UI     {base}/ui/",
+        "              로그인은 위 최초 기동 배너의 admin 계정 — 토큰은 '토큰으로 접속' 으로도 됩니다",
         f"  통합 가이드  {base}/v1/integration",
         "",
         "  시연 가능:  테넌시 격리 · 가드 1단(패턴) · 배치 라우팅 ·",
@@ -661,6 +797,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="체인이 이미 어긋나 있어도 내보낸다",
     )
     export.set_defaults(func=cmd_audit_export)
+
+    account = sub.add_parser(
+        "account",
+        help="관제 UI 계정 — 생성·목록·비밀번호 재설정·정지·해제",
+        description=(
+            "관제 UI 는 아이디·비밀번호로 로그인합니다. 부트스트랩이 admin 계정을 만들지만, "
+            "비밀번호를 잃었거나 관리자를 전부 정지했거나 계정 기능 이전에 설치한 "
+            "시스템이면 여기서 풉니다. 비밀번호는 argv 로 받지 않습니다 — 환경 변수, "
+            "터미널 입력, 또는 --generate 입니다."
+        ),
+    )
+    actions = account.add_subparsers(dest="action", required=True)
+
+    def password_options(sub_parser: argparse.ArgumentParser) -> None:
+        sub_parser.add_argument(
+            "--password-env", default="LCC_ACCOUNT_PASSWORD",
+            help="비밀번호를 담은 환경 변수 이름",
+        )
+        sub_parser.add_argument(
+            "--generate", action="store_true",
+            help="무작위 비밀번호를 만들어 한 번 표시한다",
+        )
+
+    create = actions.add_parser("create", help="계정을 만든다")
+    create.add_argument("username", help="소문자·숫자·._- 3~32자")
+    create.add_argument(
+        "--role", choices=(ROLE_PLATFORM_ADMIN, ROLE_TENANT_ADMIN), default=ROLE_TENANT_ADMIN,
+    )
+    create.add_argument("--tenant", help="tenant_admin 이 속할 테넌트. platform_admin 은 생략")
+    create.add_argument(
+        "--service", help="세션 토큰이 걸릴 서비스. 기본은 console(플랫폼) 또는 <테넌트>-app",
+    )
+    password_options(create)
+
+    actions.add_parser("list", help="계정 목록 (해시는 없다)")
+
+    reset = actions.add_parser("reset-password", help="비밀번호를 재설정하고 그 계정의 세션을 전부 끊는다")
+    reset.add_argument("username")
+    password_options(reset)
+
+    disable = actions.add_parser("disable", help="계정을 정지한다 — 로그인이 막히고 세션이 끊긴다")
+    disable.add_argument("username")
+
+    enable = actions.add_parser("enable", help="정지한 계정을 다시 켠다")
+    enable.add_argument("username")
+
+    account.set_defaults(func=cmd_account)
 
     return parser
 

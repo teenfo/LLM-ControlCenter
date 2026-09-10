@@ -72,6 +72,7 @@ button {
 button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #06121c; font-weight: 600; }
 button.danger { border-color: var(--bad); color: var(--bad); }
+button.link { background: none; border: none; color: var(--accent); text-decoration: underline; padding: .25rem 0; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 
 /* -- 셸 -- */

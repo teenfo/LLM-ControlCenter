@@ -34,18 +34,28 @@ from starlette.staticfiles import StaticFiles
 from . import meta as meta_mod
 from .bootstrap import GRACE_KEY, PLATFORM_TENANT
 from .auth import (
+    ROLE_PLATFORM_ADMIN,
     ROLE_SERVICE,
+    ROLE_TENANT_ADMIN,
     Principal,
     RateLimiter,
+    account_session,
     active_service,
     authenticate,
     bearer_from_header,
+    change_password,
+    create_account,
     issue_token,
     limits_for,
+    login as account_login,
+    logout as account_logout,
+    normalize_username,
     require_can_issue,
     require_platform_admin,
     require_tenant_admin,
+    reset_password,
     rotate_token,
+    set_account_enabled,
 )
 from .cli_paths import bundled
 from .cluster import Cluster
@@ -719,6 +729,8 @@ async def session(request: Request) -> Response:
         # 안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.
         "guard_locale_pack": guard_pack_for(tenant["locale"]) if tenant else None,
         "raw_prompt_storage": ctx.vault.enabled,
+        # 계정 세션이면 그 아이디. 화면이 "누구로 들어왔나" 와 비밀번호 변경을 그린다.
+        "account": account_session(ctx.store, principal),
         # **배선만 되고 인증이 안 된 분류기는 안 붙은 것과 결과가 같다.**
         # "붙었는가" 를 답하면 화면이 거짓말을 한다.
         "guard_classifier_ready": classifier_ready,
@@ -1908,6 +1920,102 @@ async def platform_notifications(request: Request) -> Response:
     })
 
 
+# ── 계정 ────────────────────────────────────────────────────────────────────
+#
+# 계정은 토큰을 대신하지 않는다 — 토큰을 발급하는 사람용 앞문이다(`auth` 의 계정 절).
+# 그래서 여기 라우트는 신원과 인자만 다루고, 판단(잠금·타이밍·감사)은 전부 `auth` 에 있다.
+
+
+async def login(request: Request) -> Response:
+    """아이디·비밀번호 → 세션 토큰. **인증 없이 부르는 유일한 쓰기 경로다.**
+
+    응답의 토큰은 만료가 있는 관리자 토큰이고, 관제 UI 는 그것을 지금까지의 토큰과
+    똑같이 쓴다. 실패 이유는 가르지 않는다 — 가르면 계정 목록을 알아내는 방법이 된다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    body = await _body(request)
+    token_id, raw, expires_at, account = account_login(
+        ctx.store, _need(body, "username"), _need(body, "password"), now=ctx.now,
+    )
+    return _ok(request, {
+        "token": raw,
+        "token_id": token_id,
+        "expires_at": expires_at,
+        "username": account["username"],
+        "role": account["role"],
+        "tenant": account["tenant_id"],
+    })
+
+
+async def logout(request: Request) -> Response:
+    """세션 토큰 폐기. 서비스 토큰은 대상이 아니다 — 그건 토큰 폐기 API 의 일이다."""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    if not account_logout(ctx.store, principal):
+        raise ApiError("account_session_required", status=403)
+    return _ok(request, {"logged_out": True})
+
+
+async def session_password(request: Request) -> Response:
+    """자기 비밀번호 변경. 지금 세션만 남기고 나머지는 끊는다."""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    body = await _body(request)
+    revoked = change_password(
+        ctx.store, principal, _need(body, "current_password"), _need(body, "new_password"),
+    )
+    return _ok(request, {"changed": True, "sessions_revoked": revoked})
+
+
+async def platform_accounts(request: Request) -> Response:
+    """계정 목록·생성. **해시는 목록에 없다** — 스토어가 애초에 안 내준다."""
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        return _ok(request, {"accounts": [dict(row) for row in ctx.store.list_accounts()]})
+
+    body = await _body(request)
+    role = str(body.get("role") or ROLE_TENANT_ADMIN)
+    tenant_id = str(body.get("tenant_id") or (PLATFORM_TENANT if role == ROLE_PLATFORM_ADMIN else ""))
+    if not tenant_id:
+        raise ApiError("missing_field", status=400, params={"field": "tenant_id"})
+    # 세션 토큰이 걸릴 서비스. 플랫폼은 bootstrap 이 만든 console, 테넌트는 관행상 <테넌트>-app.
+    service_id = str(
+        body.get("service_id")
+        or ("console" if tenant_id == PLATFORM_TENANT else f"{tenant_id}-app")
+    )
+    name = create_account(
+        ctx.store, _need(body, "username"), _need(body, "password"),
+        role=role, tenant_id=tenant_id, service_id=service_id, actor=principal.token_id,
+    )
+    return _ok(request, {
+        "username": name, "role": role, "tenant_id": tenant_id, "service_id": service_id,
+    }, status=201)
+
+
+async def platform_account_password(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    body = await _body(request)
+    revoked = reset_password(
+        ctx.store, request.path_params["username"], _need(body, "password"),
+        actor=principal.token_id,
+    )
+    return _ok(request, {"reset": True, "sessions_revoked": revoked})
+
+
+async def platform_account_disable(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    body = await _body(request)
+    disabled = bool(body.get("disabled", True))
+    revoked = set_account_enabled(
+        ctx.store, request.path_params["username"], not disabled, actor=principal.token_id,
+    )
+    return _ok(request, {
+        "username": normalize_username(request.path_params["username"]),
+        "disabled": disabled,
+        "sessions_revoked": revoked,
+    })
+
+
 # ── 라우트 ──────────────────────────────────────────────────────────────────
 
 
@@ -1921,6 +2029,10 @@ def _routes(ctx: AppContext) -> list[Any]:
     v = f"/{meta_mod.API_VERSION}"
     routes: list[Any] = [
         Route("/healthz", healthz, name="healthz"),
+        # 계정 — 사람의 앞문. 로그인만 인증 없이 열려 있다.
+        Route(f"{v}/login", login, methods=["POST"], name="login"),
+        Route(f"{v}/logout", logout, methods=["POST"], name="logout"),
+        Route(f"{v}/session/password", session_password, methods=["POST"], name="session_password"),
         # 계약 자기 서빙
         Route(f"{v}/session", session, name="session"),
         Route(f"{v}/meta", meta_endpoint, name="meta"),
@@ -1989,6 +2101,12 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["POST"], name="platform_grace_mode"),
         Route(f"{v}/platform/evals", platform_evals,
               methods=["GET", "POST"], name="platform_evals"),
+        Route(f"{v}/platform/accounts", platform_accounts,
+              methods=["GET", "POST"], name="platform_accounts"),
+        Route(f"{v}/platform/accounts/{{username}}/password", platform_account_password,
+              methods=["POST"], name="platform_account_password"),
+        Route(f"{v}/platform/accounts/{{username}}/disable", platform_account_disable,
+              methods=["POST"], name="platform_account_disable"),
         Route(f"{v}/platform/plugins", platform_plugins,
               methods=["GET", "POST"], name="platform_plugins"),
         Route(f"{v}/platform/plugins/{{plugin_id}}/activate", platform_plugin_activate,

@@ -118,6 +118,23 @@
 
 ---
 
+### AUTH-9  로컬 관리자 계정
+정의   관제 UI 는 아이디·비밀번호로 로그인한다. 비밀번호가 맞으면 만료 12시간의 관리자 토큰(세션)을 발급하고, 그 뒤는 토큰과 같은 인증 경로를 지난다.
+표면   `POST /v1/login` · `POST /v1/logout` · `POST /v1/session/password` · `GET/POST /v1/platform/accounts` · `POST /v1/platform/accounts/{username}/password` · `POST /v1/platform/accounts/{username}/disable`
+       `python -m app account` · 관제 UI 로그인 화면 · 내 계정 탭 · 관리자 계정 탭
+구현   `app/auth.py:login` `logout` `change_password` `create_account` `reset_password` `set_account_enabled` `hash_password` · `app/cli.py:cmd_account` · `app/bootstrap.py:bootstrap` 이 `admin` 계정을 만든다
+계약   비밀번호는 scrypt 해시만 저장된다 · 세션은 `note = login:<아이디>` 인 토큰이라 강제 지점이 하나다(`authenticate`)
+       실패 이유를 가르지 않는다(없는 아이디·틀린 비밀번호·정지 계정·정지 테넌트가 같은 401) · 아이디 단위 5회/15분 잠금은 없는 아이디도 센다
+       비밀번호 변경은 다른 세션을, 재설정·정지는 모든 세션을 끊는다 · 기본 자격증명은 없다(부트스트랩이 무작위 비밀번호를 1회 표시)
+       비밀번호는 argv 로 받지 않는다(환경 변수·터미널 입력·`--generate`)
+고정   `test_accounts.py::test_the_plaintext_password_is_never_stored`
+       `test_accounts.py::test_login_failure_does_not_say_why`
+       `test_accounts.py::test_login_locks_after_five_failures_and_reopens_after_the_window`
+       `test_accounts.py::test_changing_the_password_ends_the_other_sessions`
+       `test_accounts.py::test_a_session_is_a_token_that_expires`
+       `test_architecture.py::test_only_hash_password_writes_password_hashes`
+상태   구현됨
+
 ## 2. 요청 파이프라인
 
 주 모듈: `pipeline.py` `tokens.py` `completion.py`
@@ -1292,8 +1309,8 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 "하지 않기로 한 것" 은 여기가 아니라 [README 부채 표](../README.md#열어두는-부채) 의 두 번째 절에 있습니다.
 
 ### AUTH-8  관리 신원 연동
-정의   IdP(OIDC/SAML) 연동 · MFA · 관리 세션 만료.
-없어서   관리자의 퇴사는 IdP 에서 일어나는데, 이 제품의 토큰은 거기 이어질 길이 없습니다. 사람이 손으로 폐기해야 합니다.
+정의   IdP(OIDC/SAML) 연동 · MFA.
+없어서   관리자 신원은 로컬 계정(AUTH-9)뿐입니다. 관리자의 퇴사는 IdP 에서 일어나는데, 이 제품의 계정은 거기 이어질 길이 없어 사람이 손으로 정지해야 합니다.
 판정   D12
 상태   미구현
 
@@ -1348,7 +1365,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | PIPE-3 멱등성 키 | 키가 작업을 식별함. 페이로드를 비교하지 않고 `/v1/embed` 는 미적용 | 부분 | D7 / G3 |
 | ROUTE-4 라우팅 정확도 | 계측 도구는 있으나 픽스처가 번들에 없음. 안 재면 맞는지 아무도 모름 | 부분 | L1 |
 | OPS-10 토큰 처리율 | 보여주기만 하고 한도로 걸지 않음. 설치처 분포를 모르는 채 건 한도는 꺼짐 | 부분 | D8 |
-| AUTH-8 관리 신원 연동 | 없음 | 미구현 | D12 |
+| AUTH-8 관리 신원 연동 | 로컬 계정(AUTH-9)만 있음. IdP·MFA 없음 | 미구현 | D12 |
 | PIPE-7 선언적 체인 실행 | 없음 | 미구현 | L2 |
 | PIPE-8 스트리밍 응답 | 없음 | 미구현 | G7 |
 | CLUSTER-14 테넌트별 클라우드 키 | 없음 | 미구현 | D5 |
@@ -1388,11 +1405,13 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 |---|---|---|
 | `generate` | `POST /v1/generate` | PIPE-1 PIPE-2 |
 | `embed` | `POST /v1/embed` | PIPE-5 |
+| `logout` | `POST /v1/logout` | AUTH-9 |
+| `session_password` | `POST /v1/session/password` | AUTH-9 |
 | `job_get` | `GET /v1/jobs/{job_id}` | PIPE-4 |
 | `job_cancel` | `DELETE /v1/jobs/{job_id}` | PIPE-4 |
 | `roles` | `GET /v1/roles` | AUTH-6 |
 | `status` | `GET /v1/status` | OPS-9 |
-| `session` | `GET /v1/session` | META-1 OPS-8 |
+| `session` | `GET /v1/session` | META-1 OPS-8 AUTH-9 |
 | `meta` | `GET /v1/meta` | META-1 |
 | `integration` | `GET /v1/integration` | META-3 |
 | `openapi_json` | `GET /v1/openapi.json` | META-2 |
@@ -1429,6 +1448,9 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 |---|---|---|
 | `platform_tenants` | `GET/POST /v1/platform/tenants` | DATA-1 |
 | `platform_tenant_purge` | `DELETE /v1/platform/tenants/{id}` | DATA-4 CRYPTO-3 |
+| `platform_accounts` | `GET/POST /v1/platform/accounts` | AUTH-9 |
+| `platform_account_password` | `POST /v1/platform/accounts/{username}/password` | AUTH-9 |
+| `platform_account_disable` | `POST /v1/platform/accounts/{username}/disable` | AUTH-9 |
 | `platform_nodes` | `GET/POST /v1/platform/nodes` | CLUSTER-1 |
 | `platform_node_drain` | `POST /v1/platform/nodes/{node}/drain` | CLUSTER-8 |
 | `platform_models` | `GET /v1/platform/models` | CLUSTER-11 |
@@ -1454,6 +1476,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | 라우트 이름 | 경로 | 기능 |
 |---|---|---|
 | `healthz` | `GET /healthz` | META-5 |
+| `login` | `POST /v1/login` | AUTH-9 |
 | `ui_index` | `GET /ui` | OPS-8 |
 | `ui_index_slash` | `GET /ui/` | OPS-8 |
 | `ui` | `/ui` 정적 자산 | OPS-8 |
@@ -1469,6 +1492,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `doctor` | OPS-5 CRYPTO-2 CRYPTO-4 |
 | `rotate-kek` | CRYPTO-2 |
 | `audit-export` | CRYPTO-5 |
+| `account` | AUTH-9 (`create` · `list` · `reset-password` · `disable` · `enable`) |
 
 ---
 

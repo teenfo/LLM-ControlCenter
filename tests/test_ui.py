@@ -278,6 +278,26 @@ def test_the_login_screen_has_real_fallback_text():
         assert text.strip() != key, f"{key} 의 폴백이 키 자체다"
 
 
+def test_the_login_screen_asks_for_an_account_first():
+    """토큰 칸은 접혀 있다.
+
+    첫 화면이 토큰을 요구하면 설치자는 배너의 플랫폼 토큰을 붙여 넣고 계정은 영영 안
+    만든다 — 그러면 세션 만료도 비밀번호 변경도 없는 신원으로 관제 면을 쓰게 된다.
+    """
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    login = html[html.index('id="login"'):html.index("</section>")]
+    account = re.search(r'<div id="account-fields"([^>]*)>', login)
+    token = re.search(r'<div id="token-fields"([^>]*)>', login)
+    assert account and "hidden" not in account.group(1)
+    assert token and "hidden" in token.group(1)
+    for field in ("username", "password"):
+        assert f'id="{field}"' in login, field
+
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "'/v1/login'" in js and "'/v1/logout'" in js
+    assert "'/v1/session/password'" in js, "비밀번호 변경이 화면에 없으면 배너의 비밀번호가 영구 비밀번호가 된다"
+
+
 # ── 감사 M28 — 모델 화면이 서버의 `missing` 목록을 안 그린다 ────────────────
 
 

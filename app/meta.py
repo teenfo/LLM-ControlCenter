@@ -93,6 +93,19 @@ class RouteInfo:
 ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     # name: (summary, audience, in_guide)
     "healthz": ("컨테이너·로드밸런서용 생존 확인. 인증이 필요 없다.", "public", True),
+    "login": (
+        "아이디·비밀번호로 세션 토큰(만료 12시간)을 받는다. 인증 없이 부르는 유일한 쓰기 경로 — "
+        "실패 5회면 15분 잠긴다.",
+        "public", False,
+    ),
+    "logout": ("세션 토큰 폐기. 서비스 토큰에는 쓸 수 없다.", "consumer", False),
+    "session_password": ("자기 비밀번호 변경. 다른 세션은 전부 끊긴다.", "consumer", False),
+    "platform_accounts": (
+        "관리자 계정 목록·생성. 비밀번호는 scrypt 해시만 저장하고 목록에 나가지 않는다.",
+        "platform_admin", False,
+    ),
+    "platform_account_password": ("계정 비밀번호 재설정. 그 계정의 세션이 전부 끊긴다.", "platform_admin", False),
+    "platform_account_disable": ("계정 정지·해제. 정지하면 세션도 끊긴다.", "platform_admin", False),
     "session": ("이 토큰의 신원·권한·로케일 문자열. 관제 UI 가 렌더 전에 쓴다.", "consumer", False),
     "meta": ("기계가 읽는 계약 — 역할·한도·오류 코드·엔드포인트. 토큰마다 다르다.", "consumer", True),
     "integration": ("사람이 읽는 통합 가이드(마크다운).", "consumer", True),

@@ -19,7 +19,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from .auth import ROLE_PLATFORM_ADMIN, ROLE_SERVICE, ROLE_TENANT_ADMIN, issue_token
+from .auth import (
+    ROLE_PLATFORM_ADMIN,
+    ROLE_SERVICE,
+    ROLE_TENANT_ADMIN,
+    hash_password,
+    issue_token,
+)
 from .crypto import ENV_MASTER_KEY, KeyVault, generate_master_key
 from .identity import new_salt
 from .store import SqliteStore, TenantScope
@@ -34,6 +40,9 @@ PLATFORM_TENANT = "_platform"
 
 BOOTSTRAP_MARK = "bootstrapped_at"
 
+#: 부트스트랩이 만드는 관제 UI 계정의 아이디. 비밀번호는 무작위다.
+ADMIN_USERNAME = "admin"
+
 
 @dataclass
 class BootstrapResult:
@@ -44,6 +53,9 @@ class BootstrapResult:
     platform_admin_token: str | None = None
     tenant_admin_token: str | None = None
     service_token: str | None = None
+    #: 관제 UI 로그인용 계정. 비밀번호는 무작위이고 **여기서 한 번만** 보인다.
+    admin_username: str | None = None
+    admin_password: str | None = None
     tenant_id: str = ""
     already_done: bool = False
     warnings: list[str] = field(default_factory=list)
@@ -75,6 +87,12 @@ class BootstrapResult:
             lines += [
                 "  마스터 KEK        (없음) — 원문을 보관하지 않습니다.",
                 f"    {ENV_MASTER_KEY} 를 설정하면 원문 암호화 보관이 켜집니다.",
+                "",
+            ]
+        if self.admin_username:
+            lines += [
+                f"  관제 UI 계정        {self.admin_username} / {self.admin_password}",
+                "    관제 UI 에 이 아이디·비밀번호로 로그인합니다. 첫 로그인 뒤 비밀번호를 바꾸세요.",
                 "",
             ]
         lines += [
@@ -245,6 +263,15 @@ def bootstrap(
     _, result.platform_admin_token = issue_token(
         store, TenantScope(PLATFORM_TENANT), "console",
         role=ROLE_PLATFORM_ADMIN, note="bootstrap", actor="bootstrap",
+    )
+    # 관제 UI 로그인용 계정. 토큰을 대신하지 않고 토큰을 발급하는 앞문이다(`auth` 계정 절).
+    # 비밀번호는 무작위이고 배너에 한 번만 보인다 — 기본 자격증명은 여기에도 없다.
+    result.admin_username = ADMIN_USERNAME
+    result.admin_password = generate_admin_password()
+    store.create_account(
+        ADMIN_USERNAME, role=ROLE_PLATFORM_ADMIN, tenant_id=PLATFORM_TENANT,
+        service_id="console", password_hash=hash_password(result.admin_password),
+        created_by="bootstrap",
     )
 
     # 첫 테넌트. 로케일이 곧 가드 로케일 팩을 정한다.

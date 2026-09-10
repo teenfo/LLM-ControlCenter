@@ -410,3 +410,34 @@ def test_the_event_trigger_asks_the_recursion_judgment():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "may_wake_plugins" in asked, "이벤트 트리거가 재귀 방지 판정을 안 묻는다"
+
+
+def test_only_hash_password_writes_password_hashes():
+    """`accounts.password_hash` 에 들어가는 값은 전부 `hash_password(...)` 의 결과다.
+
+    평문이나 다른 해시가 들어가는 호출이 하나라도 생기면 로그인이 조용히 영영 실패하거나
+    — 더 나쁘게 — 평문이 표에 남는다. 스토어 메서드 둘의 인자를 AST 로 본다.
+    """
+    checked = 0
+    offenders = []
+    for path in SOURCES:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in ("create_account", "set_account_password"):
+                continue
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "self":
+                continue  # 스토어 자신의 내부 호출은 해시를 만들지 않는다
+            value = next((kw.value for kw in node.keywords if kw.arg == "password_hash"), None)
+            if value is None and node.func.attr == "set_account_password" and len(node.args) >= 2:
+                value = node.args[1]
+            checked += 1
+            if not (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "hash_password"
+            ):
+                offenders.append(f"{path.relative_to(APP)}:{node.lineno}")
+    assert checked >= 3, "계정 해시를 쓰는 호출을 하나도 못 읽었다 — 형식이 바뀌었다"
+    assert not offenders, f"hash_password 를 거치지 않고 해시 칸을 쓰는 호출: {offenders}"

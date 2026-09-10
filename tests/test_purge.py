@@ -180,7 +180,7 @@ def test_tenant_purge_removes_every_scoped_table(harness, client, acme):
     )
 
     for table in ("plugin_events", "jobs", "usage", "filter_events", "tenant_guard_rules",
-                  "tenant_settings", "tokens", "services"):
+                  "tenant_settings", "tokens", "accounts", "services"):
         left = harness.store._conn.execute(
             f"SELECT COUNT(*) AS n FROM {table} WHERE tenant_id = 'acme'"
         ).fetchone()["n"]

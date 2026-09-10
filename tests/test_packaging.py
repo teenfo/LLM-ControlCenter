@@ -163,6 +163,24 @@ def test_no_default_credentials_exist(store, vault_with_key):
         assert not any(
             weak in token.lower() for weak in ("admin", "password", "changeme", "default")
         )
+    # 관제 UI 계정도 같다 — 아이디는 admin 이지만 비밀번호는 무작위이고 배너에만 한 번 보인다.
+    assert first.admin_username == "admin"
+    assert first.admin_password and len(first.admin_password) > 20
+    assert not any(
+        weak in first.admin_password.lower() for weak in ("admin", "password", "changeme", "default")
+    )
+    assert first.admin_password in first.banner()
+    assert first.admin_password not in tokens
+
+
+def test_the_bootstrap_admin_account_can_log_in(store, vault_with_key, clock):
+    """배너의 계정으로 실제로 들어가진다 — 그리고 그 세션은 플랫폼 관리자 토큰이다."""
+    from app.auth import ROLE_PLATFORM_ADMIN, authenticate, login
+
+    first = bootstrap(store, vault_with_key)
+    _, raw, _, account = login(store, "admin", first.admin_password, now=clock)
+    assert account["role"] == ROLE_PLATFORM_ADMIN
+    assert authenticate(store, raw, now=clock).is_platform_admin
 
 
 def test_bootstrap_tokens_differ_between_installs(clock, vault_with_key):
@@ -185,8 +203,10 @@ def test_bootstrap_is_safe_to_rerun(store, vault_with_key):
 
     assert again.already_done is True
     assert again.platform_admin_token is None
+    assert again.admin_password is None
     assert "이미 부트스트랩" in again.banner()
     assert first.platform_admin_token not in again.banner()
+    assert first.admin_password not in again.banner()
 
 
 def test_bootstrap_starts_in_grace_mode_and_says_so(store, vault_with_key):
@@ -583,6 +603,7 @@ def test_bootstrap_command_runs_end_to_end(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "최초 기동" in result.stdout
+    assert "관제 UI 계정" in result.stdout
     assert (tmp_path / "keys" / "master.key").exists()
 
     # 재실행은 새 자격증명을 만들지 않는다.
@@ -593,6 +614,46 @@ def test_bootstrap_command_runs_end_to_end(tmp_path):
         env={**os.environ, "PYTHONPATH": str(ROOT)},
     )
     assert "이미 부트스트랩" in again.stdout
+
+
+def test_the_account_command_manages_console_accounts(tmp_path):
+    """콘솔에서 계정을 만들고 잠그는 길. **비밀번호는 argv 가 아니라 환경 변수로 간다.**"""
+    base_env = {k: v for k, v in os.environ.items() if k != "LCC_ACCOUNT_PASSWORD"}
+    base_env["PYTHONPATH"] = str(ROOT)
+    prefix = [sys.executable, "-m", "app", "--data", str(tmp_path / "data"), "--keys", str(tmp_path / "keys")]
+
+    def run(*more: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*prefix, *more], cwd=ROOT, capture_output=True, text=True, timeout=60,
+            env={**base_env, **env}, stdin=subprocess.DEVNULL,
+        )
+
+    assert run("bootstrap").returncode == 0
+
+    created = run("account", "create", "ops", "--tenant", "default", LCC_ACCOUNT_PASSWORD="correct horse battery")
+    assert created.returncode == 0, created.stderr
+    listed = run("account", "list")
+    assert "ops" in listed.stdout and "admin" in listed.stdout
+    assert "correct horse battery" not in listed.stdout
+
+    weak = run("account", "create", "ops2", "--tenant", "default", LCC_ACCOUNT_PASSWORD="short")
+    assert weak.returncode == 1 and "10자" in weak.stderr, weak.stderr
+
+    # 비밀번호가 어디에도 없고 터미널도 아니면 묻지 않고 멈춘다. argv 로 받는 길은 없다.
+    nothing = run("account", "create", "ops3", "--tenant", "default")
+    assert nothing.returncode == 2 and "argv" in nothing.stderr, nothing.stderr
+    assert "--password" not in run("account", "create", "--help").stdout.replace("--password-env", "")
+
+    disabled = run("account", "disable", "ops")
+    assert disabled.returncode == 0 and "정지" in disabled.stdout
+    assert "정지" in run("account", "list").stdout
+    assert run("account", "enable", "ops").returncode == 0
+
+    generated = run("account", "reset-password", "ops", "--generate")
+    assert generated.returncode == 0 and "한 번만" in generated.stdout, generated.stderr
+
+    missing = run("account", "disable", "nobody")
+    assert missing.returncode == 1 and "Traceback" not in missing.stderr
 
 
 def test_doctor_reports_grace_mode_as_a_warning_not_a_failure(tmp_path):

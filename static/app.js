@@ -233,8 +233,15 @@ function tabsFor(session) {
       { id: 'data', label: t('ui.data'), render: renderData },
     );
   }
+  if (session.is_platform_admin) {
+    tabs.push({ id: 'accounts', label: t('ui.accounts'), render: renderAccounts });
+  }
   if (!tabs.length) {
     tabs.push({ id: 'status', label: t('ui.dashboard'), render: renderConsumerStatus });
+  }
+  // 계정으로 들어왔을 때만 — 서비스 토큰에는 바꿀 비밀번호가 없다.
+  if (session.account) {
+    tabs.push({ id: 'account', label: t('ui.account'), render: renderAccount });
   }
   return tabs;
 }
@@ -1154,7 +1161,148 @@ async function renderConsumerStatus() {
   ];
 }
 
+// ── 계정 ──────────────────────────────────────────────────────────────────
+
+/** 내 계정 — 비밀번호 변경. 다른 기기의 세션은 서버가 끊는다. */
+async function renderAccount() {
+  const current = el('input', { type: 'password', autocomplete: 'current-password' });
+  const next = el('input', { type: 'password', autocomplete: 'new-password' });
+  const again = el('input', { type: 'password', autocomplete: 'new-password' });
+  const note = el('p', { class: 'muted' });
+  const form = el('form', {
+    onsubmit: async (event) => {
+      event.preventDefault();
+      note.textContent = '';
+      if (next.value !== again.value) { note.textContent = t('ui.password_mismatch'); return; }
+      try {
+        await api('/v1/session/password', {
+          method: 'POST',
+          body: { current_password: current.value, new_password: next.value },
+        });
+        current.value = ''; next.value = ''; again.value = '';
+        note.textContent = t('ui.password_changed');
+      } catch (err) { showError(err); }
+    },
+  }, [
+    el('label', { text: t('ui.current_password') }), current,
+    el('label', { text: t('ui.new_password') }), next,
+    el('label', { text: t('ui.confirm_password') }), again,
+    el('button', { type: 'submit', text: t('ui.change_password') }),
+    note,
+  ]);
+  return [
+    card(t('ui.account'), [
+      el('p', { text: t('ui.signed_in_as', { name: state.session.account }) }),
+      form,
+    ]),
+  ];
+}
+
+/** 관리자 계정 — 목록·만들기·정지·비밀번호 재설정. 해시는 서버가 애초에 안 내준다. */
+async function renderAccounts() {
+  const data = await api('/v1/platform/accounts');
+  renderBanners();
+  const accounts = data.accounts || [];
+
+  const rows = accounts.map((a) => [
+    a.username,
+    a.role,
+    a.tenant_id,
+    a.last_login_at ? when(a.last_login_at) : '',
+    a.disabled_at ? t('ui.disabled') : '',
+    el('button', {
+      text: a.disabled_at ? t('ui.account_enable') : t('ui.account_disable'),
+      onclick: async () => {
+        try {
+          await api('/v1/platform/accounts/' + encodeURIComponent(a.username) + '/disable',
+            { method: 'POST', body: { disabled: !a.disabled_at } });
+          refresh();
+        } catch (err) { showError(err); }
+      },
+    }),
+  ]);
+
+  const username = el('input', { type: 'text', autocomplete: 'off', spellcheck: 'false' });
+  const password = el('input', { type: 'password', autocomplete: 'new-password' });
+  const role = el('select', {}, [
+    el('option', { value: 'platform_admin', text: 'platform_admin' }),
+    el('option', { value: 'tenant_admin', text: 'tenant_admin' }),
+  ]);
+  const tenant = el('input', { type: 'text', autocomplete: 'off', spellcheck: 'false' });
+  const created = el('p', { class: 'muted' });
+  const createForm = el('form', {
+    onsubmit: async (event) => {
+      event.preventDefault();
+      try {
+        await api('/v1/platform/accounts', {
+          method: 'POST',
+          body: {
+            username: username.value.trim(), password: password.value, role: role.value,
+            tenant_id: tenant.value.trim() || undefined,
+          },
+        });
+        username.value = ''; password.value = '';
+        created.textContent = t('ui.account_created');
+        refresh();
+      } catch (err) { showError(err); }
+    },
+  }, [
+    el('label', { text: t('ui.username') }), username,
+    el('label', { text: t('ui.password') }), password,
+    el('label', { text: t('ui.role') }), role,
+    el('label', { text: t('ui.tenants') }), tenant,
+    el('button', { type: 'submit', text: t('ui.account_create') }),
+    created,
+  ]);
+
+  const target = el('select', {}, accounts.map((a) => el('option', { value: a.username, text: a.username })));
+  const fresh = el('input', { type: 'password', autocomplete: 'new-password' });
+  const resetNote = el('p', { class: 'muted' });
+  const resetForm = el('form', {
+    onsubmit: async (event) => {
+      event.preventDefault();
+      try {
+        await api('/v1/platform/accounts/' + encodeURIComponent(target.value) + '/password',
+          { method: 'POST', body: { password: fresh.value } });
+        fresh.value = '';
+        resetNote.textContent = t('ui.account_reset_done');
+      } catch (err) { showError(err); }
+    },
+  }, [
+    el('label', { text: t('ui.username') }), target,
+    el('label', { text: t('ui.new_password') }), fresh,
+    el('button', { type: 'submit', text: t('ui.account_reset_password') }),
+    resetNote,
+  ]);
+
+  return [
+    card(t('ui.accounts'), rows.length
+      ? [table([t('ui.username'), t('ui.role'), t('ui.tenants'), t('ui.last_login'), t('ui.status'), ''], rows)]
+      : [el('p', { class: 'muted', text: t('ui.account_none') })]),
+    card(t('ui.account_create'), [createForm]),
+    card(t('ui.account_reset_password'), [resetForm]),
+  ];
+}
+
 // ── 접속 ──────────────────────────────────────────────────────────────────
+
+/** 아이디·비밀번호 → 세션 토큰. 인증 없이 부르는 유일한 경로라 `api()` 를 안 쓴다. */
+async function login(username, password) {
+  const response = await fetch('/v1/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const text = await response.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch (_) { body = { message: text }; }
+  if (!response.ok) {
+    const error = new Error((body && body.message) || response.statusText);
+    error.code = body && body.code;
+    throw error;
+  }
+  return body;
+}
 
 async function loadSession() {
   state.session = await api('/v1/session');
@@ -1162,7 +1310,10 @@ async function loadSession() {
   document.documentElement.lang = state.session.locale;
   applyStaticStrings();
 
-  $('who').textContent = state.session.tenant.name + ' · ' + state.session.role;
+  const who = state.session.account
+    ? t('ui.signed_in_as', { name: state.session.account }) + ' · '
+    : '';
+  $('who').textContent = who + state.session.tenant.name + ' · ' + state.session.role;
   $('version').textContent = 'v' + state.session.version;
 }
 
@@ -1188,19 +1339,43 @@ function disconnect() {
 
 async function boot() {
   applyStaticStrings();
+  // 기본은 계정, 토큰은 한 번 눌러 연다. 로그인 전에는 카탈로그가 비어 있으므로
+  // 두 버튼의 문구는 index.html 의 폴백 텍스트가 맡는다 — t() 로 바꾸지 않는다.
+  const setTokenMode = (on) => {
+    $('account-fields').hidden = on;
+    $('token-fields').hidden = !on;
+    $('login-mode-token').hidden = on;
+    $('login-mode-account').hidden = !on;
+  };
+  $('login-mode-token').addEventListener('click', () => setTokenMode(true));
+  $('login-mode-account').addEventListener('click', () => setTokenMode(false));
+
   $('login-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const box = $('login-error');
     box.hidden = true;
     try {
-      await connect($('token').value.trim());
+      if (!$('token-fields').hidden) {
+        await connect($('token').value.trim());
+      } else {
+        // 아이디·비밀번호 → 세션 토큰. 그 뒤는 토큰 접속과 같은 길이다.
+        const session = await login($('username').value.trim(), $('password').value);
+        $('password').value = '';
+        await connect(session.token);
+      }
     } catch (err) {
       box.textContent = err.message || String(err);
       box.hidden = false;
     }
   });
   $('refresh').addEventListener('click', () => refresh());
-  $('logout').addEventListener('click', () => disconnect());
+  $('logout').addEventListener('click', async () => {
+    // 계정 세션이면 서버의 세션 토큰도 폐기한다. 화면만 지우면 토큰은 만료까지 살아 있다.
+    if (state.session && state.session.account) {
+      try { await api('/v1/logout', { method: 'POST' }); } catch (_) { /* 이미 만료됐을 수 있다 */ }
+    }
+    disconnect();
+  });
 
   let saved = null;
   try { saved = sessionStorage.getItem(TOKEN_KEY); } catch (_) { saved = null; }

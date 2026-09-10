@@ -413,6 +413,7 @@ HTTP (Starlette)                                              main.py · meta.py
   └ 파이프라인  ① 인증 → ② 가드 → ②-b 라우팅 → ③ 저장
                 → ④ 배치 → ⑤ 실행 → ⑥ 출력 가드 → ⑦ 저장      pipeline.py
      ├ 인증      토큰 → 테넌트·서비스 · 3단 레이트리밋         auth.py · identity.py
+     │           계정 로그인은 세션 토큰을 발급하는 앞문일 뿐    auth.py (계정 절)
      ├ 역할      설정 기본값 + 테넌트 오버라이드                roles.py
      ├ 가드      1단 패턴 → 2단 내부 노드 분류                 guard.py · evals.py
      ├ 라우팅    역할 단위 옵트인. 마스킹본으로 1회 판정하고    pipeline.py · scheduler.py
@@ -789,7 +790,7 @@ usage_cutoff = min(job_cutoff, now - BUDGET_WINDOW_DAYS * 86400)
 | **인젝션 탐지는 휴리스틱이다** | 공개 탈옥 구문 패턴이라 새로운 표현은 놓친다. 전용 분류기는 후속 |
 | **죽은 워커의 슬롯이 만료까지 잡혀 있다** | 리스 만료(역할 `timeout` + 30초)가 풀어 준다. 정합성은 지켜지고 가용성만 늦는다 — §11 |
 | **클라우드 API 키가 플랫폼 단위** | 프로바이더 청구서 상 귀속·키 폐기 단위가 플랫폼이다 |
-| **관리 신원은 토큰뿐** | IdP(OIDC/SAML)·MFA·관리 세션 만료가 없다 |
+| **관리 신원은 로컬 계정뿐** | 관제 UI 계정(세션 12시간·5회 잠금)은 있지만 IdP(OIDC/SAML)·MFA 가 없다 |
 | **데이터 경계는 2값 고정** | 리전·체류 요건을 표현할 수 없다. 일반화 경로는 §13 |
 
 각 항목의 판정 근거와 해제 조건은 [design-decisions.md](design-decisions.md) 에 있다.

@@ -17,9 +17,12 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
+import math
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -384,3 +387,245 @@ def limits_for(
         service=service_row["rate_limit_per_min"] if service_row else None,
         end_user=service_row["end_user_rate_limit"] if service_row else None,
     )
+
+
+# ── 계정 ────────────────────────────────────────────────────────────────────
+#
+# 계정은 토큰을 대신하지 않는다 — **토큰을 발급하는 사람용 앞문**이다. 아이디와
+# 비밀번호가 맞으면 만료가 짧은 관리자 토큰(세션)을 발급하고, 그 뒤 모든 요청은
+# 지금처럼 `authenticate` 를 지난다. 강제 지점이 하나라는 성질을 계정이 깨지 않는다.
+# 플러그인이 새 권한 모델이 아니라 서비스였던 것과 같은 발상이다.
+#
+# 세션은 `note = "login:<아이디>"` 로 묶인 토큰이다. 그래서 로그아웃은 토큰 폐기이고,
+# 비밀번호 변경·계정 정지는 그 note 의 토큰을 전부 폐기하는 것이다 — 세션 표를 따로
+# 두지 않는다. 비밀번호는 표준 라이브러리 scrypt 해시만 저장한다.
+
+SESSION_TTL_SECONDS = 12 * 3600
+LOGIN_LOCK_AFTER = 5
+LOGIN_LOCK_SECONDS = 15 * 60
+MIN_PASSWORD_LENGTH = 10
+MAX_PASSWORD_LENGTH = 256
+ACCOUNT_ROLES = (ROLE_PLATFORM_ADMIN, ROLE_TENANT_ADMIN)
+
+_USERNAME = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
+#: log2(N), r, p — 16MB·수십 ms. 로그인 한 번에 맞는 비용이고 노트북급 호스트에서도 돈다.
+_SCRYPT = (14, 8, 1)
+_SESSION_NOTE = "login:"
+_dummy_hash_cache: str | None = None
+
+
+def normalize_username(raw: Any) -> str:
+    return str(raw or "").strip().lower()
+
+
+def validate_username(raw: Any) -> str:
+    name = normalize_username(raw)
+    if not _USERNAME.match(name):
+        raise ApiError("invalid_field", status=400, params={"field": "username"})
+    return name
+
+
+def check_password_policy(password: Any, username: str = "") -> None:
+    """길이와 '아이디와 같음' 만 본다. 규칙이 많을수록 사람은 규칙을 우회하는 비밀번호를 만든다."""
+    if (
+        not isinstance(password, str)
+        or not MIN_PASSWORD_LENGTH <= len(password) <= MAX_PASSWORD_LENGTH
+        or password.lower() == normalize_username(username)
+    ):
+        raise ApiError("weak_password", status=400, params={"min": MIN_PASSWORD_LENGTH})
+
+
+def hash_password(password: str) -> str:
+    """scrypt. 형식은 `scrypt$log2n$r$p$salt$dk` — 비용을 함께 적어 두어야 나중에 올릴 수 있다."""
+    log2n, r, p = _SCRYPT
+    salt = secrets.token_bytes(16)
+    derived = hashlib.scrypt(
+        password.encode("utf-8"), salt=salt, n=1 << log2n, r=r, p=p, dklen=32,
+    )
+    return "$".join([
+        "scrypt", str(log2n), str(r), str(p),
+        base64.b64encode(salt).decode("ascii"), base64.b64encode(derived).decode("ascii"),
+    ])
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        scheme, log2n, r, p, salt_b64, derived_b64 = encoded.split("$")
+        if scheme != "scrypt":
+            return False
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(derived_b64)
+        actual = hashlib.scrypt(
+            password.encode("utf-8"), salt=salt, n=1 << int(log2n), r=int(r), p=int(p),
+            dklen=len(expected),
+        )
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(actual, expected)
+
+
+def _dummy_hash() -> str:
+    """없는 계정에도 같은 비용을 치른다 — 응답 시간으로 계정의 존재를 알 수 없게."""
+    global _dummy_hash_cache
+    if _dummy_hash_cache is None:
+        _dummy_hash_cache = hash_password(secrets.token_urlsafe(16))
+    return _dummy_hash_cache
+
+
+def session_note(username: str) -> str:
+    return f"{_SESSION_NOTE}{username}"
+
+
+def lockout_seconds(store: SqliteStore, username: str, now: float) -> int:
+    """잠금이 남았으면 남은 초, 아니면 0.
+
+    실패는 **아이디 단위로, 없는 아이디도** 센다 — 잠금 여부로 계정의 존재를 흘리지
+    않기 위해서다. 창은 미끄러진다: 마지막 5회 중 첫 실패가 15분 지나면 풀린다.
+    """
+    since = int(now) - LOGIN_LOCK_SECONDS
+    key = f"login:{username}"
+    if store.rate_count(key, since) < LOGIN_LOCK_AFTER:
+        return 0
+    oldest = store.oldest_rate_bucket(key, since)
+    return max(1, (oldest if oldest is not None else int(now)) + LOGIN_LOCK_SECONDS - int(now))
+
+
+def login(
+    store: SqliteStore, username: Any, password: Any, *, now: Callable[[], float] = time.time,
+) -> tuple[str, str, float, Any]:
+    """아이디·비밀번호 → 세션 토큰. 반환은 (token_id, 원값, 만료, 계정 행).
+
+    실패 이유를 가르지 않는다 — 없는 아이디·틀린 비밀번호·꺼진 계정·정지된 테넌트가
+    전부 같은 401 이다. 가르면 그것이 곧 계정 목록을 알아내는 방법이 된다.
+    """
+    name = normalize_username(username)
+    moment = now()
+    remaining = lockout_seconds(store, name, moment)
+    if remaining:
+        raise ApiError(
+            "login_locked", status=429, retryable=True,
+            params={"minutes": max(1, math.ceil(remaining / 60))},
+        )
+
+    account = store.get_account(name) if _USERNAME.match(name) else None
+    encoded = account["password_hash"] if account is not None else _dummy_hash()
+    matches = verify_password(str(password or ""), encoded)
+    tenant = store.get_tenant(account["tenant_id"]) if account is not None else None
+    usable = (
+        account is not None and matches and account["disabled_at"] is None
+        and tenant is not None and tenant["status"] == "active"
+    )
+    if not usable:
+        store.bump_rate_counter(f"login:{name}", int(moment))
+        if account is not None:
+            # 실재하는 계정에 대한 실패만 감사에 남긴다. 아무 문자열이나 감사 사슬에
+            # 쌓이게 두면 그것이 곧 사슬을 잡음으로 채우는 방법이 된다.
+            store.audit(f"account:{name}", "login_failed", tenant_id=account["tenant_id"])
+        raise ApiError("invalid_credentials", status=401)
+
+    expires_at = moment + SESSION_TTL_SECONDS
+    token_id, raw = issue_token(
+        store, TenantScope(account["tenant_id"]), account["service_id"],
+        role=account["role"], expires_at=expires_at, note=session_note(name),
+        actor=f"account:{name}",
+    )
+    store.record_account_login(name, moment)
+    store.audit(f"account:{name}", "login", tenant_id=account["tenant_id"], target=token_id)
+    return token_id, raw, expires_at, account
+
+
+def account_session(store: SqliteStore, principal: Principal) -> str | None:
+    """이 주체가 계정 세션이면 그 아이디, 서비스 토큰이면 None."""
+    row = store.get_token(principal.scope(), principal.token_id)
+    note = (row["note"] or "") if row is not None else ""
+    return note[len(_SESSION_NOTE):] if note.startswith(_SESSION_NOTE) else None
+
+
+def logout(store: SqliteStore, principal: Principal) -> bool:
+    """세션 토큰을 폐기한다. 서비스 토큰은 대상이 아니다 — 그건 폐기 API 의 일이다."""
+    name = account_session(store, principal)
+    if name is None:
+        return False
+    store.revoke_token(principal.scope(), principal.token_id)
+    store.audit(f"account:{name}", "logout", tenant_id=principal.tenant_id, target=principal.token_id)
+    return True
+
+
+def revoke_sessions(store: SqliteStore, account: Any, *, keep: str | None = None) -> int:
+    return store.revoke_tokens_by_note(
+        TenantScope(account["tenant_id"]), session_note(account["username"]), keep=keep,
+    )
+
+
+def change_password(store: SqliteStore, principal: Principal, current: Any, new: Any) -> int:
+    """자기 비밀번호 변경. **다른 세션은 전부 끊는다** — 지금 이 세션만 남긴다.
+
+    비밀번호를 바꾸는 이유의 절반은 "누가 알아낸 것 같아서" 다. 그때 다른 세션이
+    살아 있으면 바꾼 의미가 없다.
+    """
+    name = account_session(store, principal)
+    if name is None:
+        raise ApiError("account_session_required", status=403)
+    account = store.get_account(name)
+    if account is None or not verify_password(str(current or ""), account["password_hash"]):
+        raise ApiError("invalid_credentials", status=401)
+    check_password_policy(new, name)
+    store.set_account_password(name, hash_password(str(new)))
+    revoked = revoke_sessions(store, account, keep=principal.token_id)
+    store.audit(
+        f"account:{name}", "change_password", tenant_id=account["tenant_id"],
+        detail={"sessions_revoked": revoked},
+    )
+    return revoked
+
+
+def create_account(
+    store: SqliteStore, username: Any, password: Any, *,
+    role: str, tenant_id: str, service_id: str, actor: str,
+) -> str:
+    """계정을 만든다. 테넌트와 서비스가 실재해야 한다 — 세션 토큰이 거기 걸린다."""
+    name = validate_username(username)
+    if role not in ACCOUNT_ROLES:
+        raise ApiError("invalid_field", status=400, params={"field": "role"})
+    check_password_policy(password, name)
+    scope = TenantScope(tenant_id)
+    if store.get_tenant(tenant_id) is None or store.get_service(scope, service_id) is None:
+        raise ApiError("not_found", status=404)
+    created = store.create_account(
+        name, role=role, tenant_id=tenant_id, service_id=service_id,
+        password_hash=hash_password(str(password)), created_by=actor,
+    )
+    if not created:
+        raise ApiError("already_exists", status=409, params={"id": name})
+    store.audit(actor, "create_account", tenant_id=tenant_id, target=name, detail={"role": role})
+    return name
+
+
+def reset_password(store: SqliteStore, username: Any, new: Any, *, actor: str) -> int:
+    """관리자가 남의 비밀번호를 재설정한다. 그 계정의 세션은 **전부** 끊는다."""
+    account = store.get_account(normalize_username(username))
+    if account is None:
+        raise ApiError("not_found", status=404)
+    check_password_policy(new, account["username"])
+    store.set_account_password(account["username"], hash_password(str(new)))
+    revoked = revoke_sessions(store, account)
+    store.audit(
+        actor, "reset_password", tenant_id=account["tenant_id"], target=account["username"],
+        detail={"sessions_revoked": revoked},
+    )
+    return revoked
+
+
+def set_account_enabled(store: SqliteStore, username: Any, enabled: bool, *, actor: str) -> int:
+    """계정을 켜고 끈다. 끄면 로그인이 막히고 살아 있던 세션도 끊긴다."""
+    account = store.get_account(normalize_username(username))
+    if account is None:
+        raise ApiError("not_found", status=404)
+    store.set_account_disabled(account["username"], not enabled)
+    revoked = 0 if enabled else revoke_sessions(store, account)
+    store.audit(
+        actor, "enable_account" if enabled else "disable_account",
+        tenant_id=account["tenant_id"], target=account["username"],
+        detail={"sessions_revoked": revoked},
+    )
+    return revoked

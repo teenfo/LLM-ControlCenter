@@ -330,6 +330,26 @@ CREATE TABLE IF NOT EXISTS tokens (
 CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_tokens_tenant ON tokens(tenant_id);
 
+-- 사람의 계정. **토큰을 대신하지 않고 토큰을 발급하는 앞문이다.**
+--
+-- 로그인이 성공하면 만료가 짧은 관리자 토큰(세션)을 발급하고, 그 뒤 모든 요청은
+-- 지금처럼 토큰 인증을 지난다 — 강제 지점은 `auth.authenticate` 하나로 남는다.
+-- 플러그인이 새 권한 모델이 아니라 서비스였던 것과 같은 발상이다.
+-- 비밀번호는 scrypt 해시만 저장한다. 원문은 어디에도 없다.
+CREATE TABLE IF NOT EXISTS accounts (
+    username            TEXT PRIMARY KEY,       -- 소문자로 정규화한 아이디
+    role                TEXT NOT NULL,          -- platform_admin | tenant_admin
+    tenant_id           TEXT NOT NULL,          -- 플랫폼 관리자는 _platform
+    service_id          TEXT NOT NULL,          -- 세션 토큰이 걸리는 서비스
+    password_hash       TEXT NOT NULL,          -- scrypt$log2n$r$p$salt$dk
+    created_at          REAL NOT NULL,
+    created_by          TEXT,
+    disabled_at         REAL,                   -- 끈 계정. 로그인이 막히고 세션이 폐기된다
+    last_login_at       REAL,
+    password_changed_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_tenant ON accounts(tenant_id);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id                TEXT PRIMARY KEY,
     tenant_id         TEXT NOT NULL,
@@ -1153,6 +1173,35 @@ class SqliteStore:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def get_token(self, scope: TenantScope, token_id: str) -> sqlite3.Row | None:
+        """토큰 한 건(해시 제외). 세션 토큰인지(`note`)를 볼 때 쓴다."""
+        where, params = self._scoped_where(scope, "id = ?")
+        params.append(token_id)
+        return self._conn.execute(
+            f"SELECT id, service_id, prefix, role, created_at, expires_at, revoked_at, "
+            f"last_used_at, note FROM tokens WHERE {where}", params,
+        ).fetchone()
+
+    def revoke_tokens_by_note(
+        self, scope: TenantScope, note: str, *, keep: str | None = None
+    ) -> int:
+        """같은 `note` 의 살아 있는 토큰을 전부 폐기한다. `keep` 은 남긴다.
+
+        계정 세션이 `login:<아이디>` 라는 note 로 묶여 있어서, 비밀번호를 바꾸거나
+        계정을 끄면 이것으로 그 사람의 세션을 한 번에 끊는다.
+        """
+        extra = "note = ? AND revoked_at IS NULL"
+        where, params = self._scoped_where(scope, extra)
+        params.append(note)
+        if keep is not None:
+            where += " AND id != ?"
+            params.append(keep)
+        cur = self._conn.execute(
+            f"UPDATE tokens SET revoked_at = ? WHERE {where}", [self._now(), *params]
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def list_tokens(self, scope: TenantScope) -> list[sqlite3.Row]:
         """토큰 목록. **해시만 저장하므로 원값은 어디에도 없다** — 발급 시 1회 표시가 전부다."""
@@ -2350,6 +2399,71 @@ class SqliteStore:
         )
         return {row["origin_plugin"]: row["n"] for row in rows}
 
+    # -- 계정 -----------------------------------------------------------------
+    #
+    # 테넌트 스코프 인자를 받지 않는 소수 경로다. 로그인은 인증 **이전**이라 스코프가
+    # 아직 없고(`find_token` 과 같은 이유), 계정 관리는 플랫폼 관리자 전용이다.
+    # 비밀번호 해시는 `get_account` 로만 나가고 목록(`list_accounts`)에는 없다.
+
+    def create_account(
+        self, username: str, *, role: str, tenant_id: str, service_id: str,
+        password_hash: str, created_by: str = "",
+    ) -> bool:
+        """계정을 만든다. 이미 있으면 False — 덮어쓰지 않는다."""
+        try:
+            self._conn.execute(
+                "INSERT INTO accounts(username, role, tenant_id, service_id, password_hash, "
+                "created_at, created_by, password_changed_at) VALUES(?,?,?,?,?,?,?,?)",
+                (username, role, tenant_id, service_id, password_hash,
+                 self._now(), created_by, self._now()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        self._conn.commit()
+        return True
+
+    def get_account(self, username: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM accounts WHERE username = ?", (username,)
+        ).fetchone()
+
+    def list_accounts(self, tenant_id: str | None = None) -> list[sqlite3.Row]:
+        """계정 목록. **해시는 나가지 않는다.**"""
+        columns = (
+            "username, role, tenant_id, service_id, created_at, created_by, "
+            "disabled_at, last_login_at, password_changed_at"
+        )
+        if tenant_id is None:
+            rows = self._conn.execute(f"SELECT {columns} FROM accounts ORDER BY username")
+        else:
+            rows = self._conn.execute(
+                f"SELECT {columns} FROM accounts WHERE tenant_id = ? ORDER BY username",
+                (tenant_id,),
+            )
+        return list(rows)
+
+    def set_account_password(self, username: str, password_hash: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE accounts SET password_hash = ?, password_changed_at = ? WHERE username = ?",
+            (password_hash, self._now(), username),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_account_disabled(self, username: str, disabled: bool) -> bool:
+        cur = self._conn.execute(
+            "UPDATE accounts SET disabled_at = ? WHERE username = ?",
+            (self._now() if disabled else None, username),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def record_account_login(self, username: str, at: float) -> None:
+        self._conn.execute(
+            "UPDATE accounts SET last_login_at = ? WHERE username = ?", (at, username)
+        )
+        self._conn.commit()
+
     # -- 플러그인 이벤트 (잡 종결 아웃박스) ------------------------------------
     #
     # 쓰기는 `plugin_events_on_finish` 트리거뿐이다. 여기는 읽기와 커서다.
@@ -3335,15 +3449,18 @@ class SqliteStore:
             raise ScopeViolation("테넌트 파기는 PlatformScope 를 요구한다")
 
         counts: dict[str, int] = {}
-        # **한 트랜잭션이다.** 테이블 열 개를 지우다 중간에 실패하면 절반만
+        # **한 트랜잭션이다.** 테이블 열한 개를 지우다 중간에 실패하면 절반만
         # 파기된 테넌트가 남고, DEK 는 아직 살아 있어 crypto-shredding 도 안 된다.
         #
         # `plugin_events` 는 잡을 지우면 cascade 로도 지워지지만 여기 적어 둔다 —
         # 지운 수가 감사에 남아야 하고, 목록에 없는 표는 다음 사람이 "빠진 것" 으로 읽는다.
+        # `accounts` 도 함께 간다 — 파기된 테넌트의 관리자 계정이 남으면 로그인은 막혀도
+        # (테넌트 상태 검사) 이름과 해시가 남는다.
         with self._tx():
             for table in (
                 "plugin_events", "jobs", "usage", "filter_events", "role_overrides",
-                "tenant_guard_rules", "tenant_settings", "eval_fixtures", "tokens", "services",
+                "tenant_guard_rules", "tenant_settings", "eval_fixtures", "tokens",
+                "accounts", "services",
             ):
                 counts[table] = self._conn.execute(
                     f"DELETE FROM {table} WHERE tenant_id = ?", (tenant_id,)
