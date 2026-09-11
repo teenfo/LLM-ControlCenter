@@ -334,3 +334,17 @@ def test_locale_pack_filtering():
     assert "kr_rrn" not in en_ids, "로케일 팩을 안 켰는데 그 나라 규칙이 적용됐다"
     assert "us_ssn" in en_ids
     assert "credit_card" in ko_ids and "credit_card" in en_ids, "common 팩은 항상 켜진다"
+
+
+def test_shipped_config_has_a_chat_role_the_client_page_can_use():
+    """클라이언트 페이지의 대화 탭은 `chat` 역할이 있어야 열린다 — 지시문이 합성 표식을 설명해야 한다."""
+    from pathlib import Path
+
+    from app.config import load_config
+
+    config = load_config(Path(__file__).resolve().parents[1] / "config")
+    chat = config.roles["chat"]
+    assert chat.kind == "generate"
+    assert chat.max_prompt_chars
+    assert "사용자:" in (chat.system or "") and "도우미:" in (chat.system or "")
+    assert "internal" in chat.placement and "external" not in chat.placement

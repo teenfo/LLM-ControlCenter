@@ -39,8 +39,10 @@ from .auth import (
     ROLE_PLATFORM_ADMIN,
     ROLE_SERVICE,
     ROLE_TENANT_ADMIN,
+    ROLE_USER,
     Principal,
     RateLimiter,
+    account_row,
     account_session,
     active_service,
     authenticate,
@@ -81,7 +83,7 @@ from .crypto import (
 from .evals import Evaluator
 from .guard import Guard
 from .i18n import ApiError, Translator, guard_pack_for, negotiate_locale
-from .identity import new_salt
+from .identity import hash_end_user, new_salt
 from .models import ModelRegistrar
 from .notify import Notifier, channels_from_env
 from .observability import collect, diagnostic_bundle, render_metrics
@@ -94,9 +96,12 @@ from .pipeline import (
     is_public_role,
 )
 from .scheduler import Scheduler
-from .store import AlreadyExists, PlatformScope, ScopeViolation, SqliteStore, StoreError, TenantScope
+from .store import (
+    TERMINAL_STATUSES, AlreadyExists, PlatformScope, ScopeViolation, SqliteStore, StoreError,
+    TenantScope,
+)
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -606,6 +611,52 @@ async def embed(request: Request) -> Response:
     return _ok(request, result)
 
 
+async def jobs_list(request: Request) -> Response:
+    """내 작업 목록. **범위는 사람이다** — (테넌트, 서비스, 엔드유저 해시).
+
+    계정 세션은 아이디가 곧 end_user 라 자기 것만 보인다. 서비스 토큰은 `?end_user=` 를
+    요구한다 — 토큰 하나로 서비스 전체의 이력을 여는 것은 지금까지 없던 노출이고, 공유
+    토큰으로 남의 이력을 보게 된다. 마스킹본과 가드 판정만 나간다 — 원문은 테넌트 관리자의
+    단건 API + 감사다. `route`·`cost_usd`·`has_raw` 는 관리자 표면의 것이라 여기 없다
+    (소비자 계약은 라우팅을 모른다).
+    """
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    ctx.limiter.check_named(
+        f"poll:{principal.tenant_id}:{principal.service_id}",
+        POLL_LIMIT_PER_MIN,
+        scope_label="status_poll",
+    )
+    params = request.query_params
+    account = account_session(ctx.store, principal)
+    person = account or params.get("end_user")
+    if not person:
+        raise ApiError("end_user_required", status=400)
+    tenant = request.state.tenant
+    end_user_hash = hash_end_user(person, tenant["end_user_salt"])
+    rows = ctx.store.list_jobs(
+        principal.scope(), service_id=principal.service_id, end_user_hash=end_user_hash,
+        limit=_int(params.get("limit"), "limit", default=50, minimum=1, maximum=100),
+    )
+    actions = ctx.store.filter_actions_for_jobs(principal.scope(), [j.id for j in rows])
+    return _ok(request, {
+        "scope": "account" if account else "token",
+        "jobs": [
+            {
+                "job_id": j.id,
+                "status": j.status if j.status in TERMINAL_STATUSES else "pending",
+                "role": j.role, "kind": j.kind, "model": j.model, "tier": j.tier,
+                "attempts": j.attempts,
+                "prompt_masked": j.prompt_masked, "response": j.response,
+                "error_code": j.error_code,
+                "guard_actions": actions.get(j.id, {}),
+                "created_at": j.created_at, "finished_at": j.finished_at,
+            }
+            for j in rows
+        ],
+    })
+
+
 async def job_get(request: Request) -> Response:
     """작업 조회. **폴링 방어가 여기 걸린다.**"""
     ctx: AppContext = request.app.state.ctx
@@ -736,6 +787,11 @@ async def session(request: Request) -> Response:
         "raw_prompt_storage": ctx.vault.enabled,
         # 계정 세션이면 그 아이디. 화면이 "누구로 들어왔나" 와 비밀번호 변경을 그린다.
         "account": account_session(ctx.store, principal),
+        # 계정의 역할(user·tenant_admin·platform_admin). 토큰 역할과 다르다 — `user` 는 `service`
+        # 토큰으로 내려오므로 화면이 "누구인가" 를 알려면 이 값이 따로 있어야 한다.
+        "account_role": (
+            row["role"] if (row := account_row(ctx.store, principal)) is not None else None
+        ),
         # **배선만 되고 인증이 안 된 분류기는 안 붙은 것과 결과가 같다.**
         # "붙었는가" 를 답하면 화면이 거짓말을 한다.
         "guard_classifier_ready": classifier_ready,
@@ -1707,7 +1763,7 @@ async def platform_evals(request: Request) -> Response:
 
 
 #: 캐시 키에 들어가는 화면 자산. index.html 은 매번 재검증하므로 여기 없다.
-_ASSETS = ("app.js", "style.css")
+_ASSETS = ("app.js", "style.css", "client/client.js", "client/client.css")
 
 
 def asset_version(static_dir: Path, version: str) -> str:
@@ -1741,27 +1797,36 @@ class VersionedStaticFiles(StaticFiles):
         return response
 
 
-async def ui_index(request: Request) -> Response:
-    """관제 UI 의 첫 화면. **`app.js` 참조에 버전을 박아 내보낸다.**
+def _serve_index(request: Request, directory: Path) -> Response:
+    """정적 화면의 첫 페이지. 관제 UI 와 클라이언트 페이지가 같은 규칙으로 뜬다.
 
-    인증은 없다 — 이 화면 자체는 토큰 입력 폼이고, 데이터는 전부 인증된 API 에서
-    가져온다. 정적 파일로 그냥 내보내던 것과 같은 노출 범위다.
+    인증은 없다 — 페이지 자체가 로그인 폼이다. 슬래시 없이 오면 308 로 붙여 준다: 자산 참조가
+    상대 경로라 `/ui` 로 서빙되면 `/style.css` 를 찾는다(프록시 접두사 아래서도 뜨게 하려고
+    상대 경로를 택했고, 그 대가가 이 리다이렉트다). `__VERSION__` 은 자산 캐시 키로 바뀌고
+    인덱스 자체는 매번 재검증이다 — 업그레이드 뒤 강제 새로고침이 필요 없다.
     """
     ctx: AppContext = request.app.state.ctx
     if not request.url.path.endswith("/"):
-        # `/ui` 는 `/ui/` 로 보낸다. index.html 의 `style.css` · `app.js` 는 **상대 경로**라
-        # 슬래시 없이 서빙하면 브라우저가 `/style.css` 를 찾다 404 를 받고, 스크립트가 안 돌아
-        # 로그인 폼이 숨겨진 채 빈 화면이 뜬다 — 첫 공개 배포에서 그대로 겪었다.
-        # 상대 경로 자체는 유지한다. 프록시가 접두사를 붙여도 자산이 따라가게 하려는 것이다.
         query = f"?{request.url.query}" if request.url.query else ""
         return RedirectResponse(url=f"{request.url.path}/{query}", status_code=308)
-    path = ctx.static_dir / "index.html"
+    path = directory / "index.html"
     if not path.is_file():
         raise ApiError("not_found", status=404)
     key = ctx.asset_version or asset_version(ctx.static_dir, ctx.version)
     html = path.read_text(encoding="utf-8").replace("__VERSION__", key)
-    # 첫 화면은 매번 재검증한다 — 여기 박힌 자산 키가 새 판을 가리키게 하는 유일한 길이다.
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+
+async def ui_index(request: Request) -> Response:
+    """관제 UI 첫 화면."""
+    ctx: AppContext = request.app.state.ctx
+    return _serve_index(request, ctx.static_dir)
+
+
+async def client_page(request: Request) -> Response:
+    """클라이언트 페이지 첫 화면 — 사람이 LLM 을 쓰는 면. 관제 UI 와 같은 서빙 규칙이다."""
+    ctx: AppContext = request.app.state.ctx
+    return _serve_index(request, ctx.static_dir / "client")
 
 
 async def metrics(request: Request) -> Response:
@@ -2074,6 +2139,62 @@ async def platform_account_disable(request: Request) -> Response:
     })
 
 
+def _tenant_user(ctx: AppContext, scope: TenantScope, username: str) -> Any:
+    """자기 테넌트의 `user` 계정 행. 없거나 남의 것이거나 관리자 계정이면 404 — 존재를 흘리지 않는다."""
+    row = ctx.store.get_account(normalize_username(username))
+    if row is None or row["tenant_id"] != scope.tenant_id or row["role"] != ROLE_USER:
+        raise ApiError("not_found", status=404)
+    return row
+
+
+async def tenant_accounts(request: Request) -> Response:
+    """자기 테넌트의 사용자 계정 목록·생성. 역할은 `user` 로 고정이다.
+
+    테넌트 관리자가 관리자 계정을 만들 수 있으면 권한이 옆으로 번진다 — 관리자 계정은
+    플랫폼 소관(`/v1/platform/accounts`)이고 여기 목록에도 나오지 않는다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    if request.method == "GET":
+        rows = ctx.store.list_accounts(tenant_id=scope.tenant_id, role=ROLE_USER)
+        return _ok(request, {"accounts": [dict(row) for row in rows]})
+
+    body = await _body(request)
+    # 서비스는 추측하지 않는다 — 허용 역할·한도·예산이 거기 걸린다. 남의 테넌트 서비스는
+    # `create_account` 가 테넌트 스코프로 찾으므로 404 다.
+    service_id = str(_need(body, "service_id"))
+    name = create_account(
+        ctx.store, _need(body, "username"), _need(body, "password"),
+        role=ROLE_USER, tenant_id=scope.tenant_id, service_id=service_id,
+        actor=principal.token_id,
+    )
+    return _ok(request, {
+        "username": name, "role": ROLE_USER, "tenant_id": scope.tenant_id, "service_id": service_id,
+    }, status=201)
+
+
+async def tenant_account_password(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    row = _tenant_user(ctx, scope, request.path_params["username"])
+    body = await _body(request)
+    revoked = reset_password(
+        ctx.store, row["username"], _need(body, "password"), actor=principal.token_id,
+    )
+    return _ok(request, {"reset": True, "sessions_revoked": revoked})
+
+
+async def tenant_account_disable(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    row = _tenant_user(ctx, scope, request.path_params["username"])
+    body = await _body(request)
+    disabled = bool(body.get("disabled", True))
+    revoked = set_account_enabled(
+        ctx.store, row["username"], not disabled, actor=principal.token_id,
+    )
+    return _ok(request, {
+        "username": row["username"], "disabled": disabled, "sessions_revoked": revoked,
+    })
+
+
 # ── 라우트 ──────────────────────────────────────────────────────────────────
 
 
@@ -2102,6 +2223,7 @@ def _routes(ctx: AppContext) -> list[Any]:
         # 소비자
         Route(f"{v}/generate", generate, methods=["POST"], name="generate"),
         Route(f"{v}/embed", embed, methods=["POST"], name="embed"),
+        Route(f"{v}/jobs", jobs_list, name="jobs_list"),
         Route(f"{v}/jobs/{{job_id}}", job_get, name="job_get"),
         Route(f"{v}/jobs/{{job_id}}", job_cancel, methods=["DELETE"], name="job_cancel"),
         Route(f"{v}/roles", roles, name="roles"),
@@ -2131,6 +2253,11 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["POST"], name="tenant_job_review"),
         Route(f"{v}/admin/usage", tenant_usage, name="tenant_usage"),
         Route(f"{v}/admin/audit", tenant_audit, name="tenant_audit"),
+        Route(f"{v}/admin/accounts", tenant_accounts, methods=["GET", "POST"], name="tenant_accounts"),
+        Route(f"{v}/admin/accounts/{{username}}/password", tenant_account_password,
+              methods=["POST"], name="tenant_account_password"),
+        Route(f"{v}/admin/accounts/{{username}}/disable", tenant_account_disable,
+              methods=["POST"], name="tenant_account_disable"),
         Route(f"{v}/admin/export", tenant_export, name="tenant_export"),
         Route(f"{v}/admin/end-users/{{end_user_hash}}", tenant_purge_end_user,
               methods=["DELETE"], name="tenant_purge_end_user"),
@@ -2190,5 +2317,13 @@ def _routes(ctx: AppContext) -> list[Any]:
         routes.append(Route("/ui/", ui_index, name="ui_index_slash"))
         routes.append(Mount(
             "/ui", VersionedStaticFiles(directory=ctx.static_dir, html=True), name="ui",
+        ))
+    # 클라이언트 페이지 — 사람이 LLM 을 쓰는 면. 관제 UI 와 같은 서빙·캐시 규칙, 다른 디렉터리.
+    client_dir = ctx.static_dir / "client"
+    if client_dir.is_dir():
+        routes.append(Route("/client", client_page, name="client_page"))
+        routes.append(Route("/client/", client_page, name="client_page_slash"))
+        routes.append(Mount(
+            "/client", VersionedStaticFiles(directory=client_dir, html=True), name="client_static",
         ))
     return routes

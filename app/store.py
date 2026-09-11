@@ -1313,6 +1313,7 @@ class SqliteStore:
         *,
         status: str | None = None,
         end_user_hash: str | None = None,
+        service_id: str | None = None,
         limit: int = 50,
     ) -> list[JobRow]:
         conditions = []
@@ -1320,6 +1321,9 @@ class SqliteStore:
         if status:
             conditions.append("status = ?")
             extra_params.append(status)
+        if service_id:
+            conditions.append("service_id = ?")
+            extra_params.append(service_id)
         if end_user_hash:
             conditions.append("end_user_hash = ?")
             extra_params.append(end_user_hash)
@@ -1331,6 +1335,40 @@ class SqliteStore:
             [*params, int(limit)],
         )
         return [_row_to_job(r) for r in rows]
+
+    def filter_actions_for_jobs(
+        self, scope: TenantScope, job_ids: Sequence[str]
+    ) -> dict[str, dict[str, str]]:
+        """잡별 가드 요약 `{rule_id: 등급}` — 소비자에게 돌려주는 모양 그대로.
+
+        판정은 잡 행이 아니라 `filter_events` 에 있다. 제출 응답은 메모리의 판정으로 만들지만
+        나중의 조회(`GET /v1/jobs/{id}`·목록)는 여기서 되읽어야 한다. 한 번에 읽는다 — 행마다
+        쿼리하면 목록 한 장에 잡 수만큼 쿼리가 난다. 등급은 내부 경계 우선(`Pipeline._guard_actions`
+        와 같은 규칙), 출력 축(`stage='output'`)과 계수기 행(`_` 접두)은 뺀다.
+        """
+        ids = [i for i in job_ids if i]
+        if not ids:
+            return {}
+        where, params = self._scoped_where(
+            scope,
+            f"job_id IN ({','.join('?' * len(ids))}) AND stage != 'output' "
+            "AND rule_id NOT LIKE '\\_%' ESCAPE '\\'",
+        )
+        params.extend(ids)
+        result: dict[str, dict[str, str]] = {}
+        settled: set[tuple[str, str]] = set()
+        for row in self._conn.execute(
+            f"SELECT job_id, rule_id, action, boundary FROM filter_events WHERE {where} "
+            "ORDER BY id",
+            params,
+        ):
+            key = (row["job_id"], row["rule_id"])
+            if key in settled:
+                continue
+            result.setdefault(row["job_id"], {})[row["rule_id"]] = row["action"]
+            if row["boundary"] == "internal":
+                settled.add(key)
+        return result
 
     def update_job(
         self,
@@ -2460,20 +2498,26 @@ class SqliteStore:
             "SELECT * FROM accounts WHERE username = ?", (username,)
         ).fetchone()
 
-    def list_accounts(self, tenant_id: str | None = None) -> list[sqlite3.Row]:
+    def list_accounts(
+        self, tenant_id: str | None = None, role: str | None = None
+    ) -> list[sqlite3.Row]:
         """계정 목록. **해시는 나가지 않는다.**"""
         columns = (
             "username, role, tenant_id, service_id, created_at, created_by, "
             "disabled_at, last_login_at, password_changed_at"
         )
-        if tenant_id is None:
-            rows = self._conn.execute(f"SELECT {columns} FROM accounts ORDER BY username")
-        else:
-            rows = self._conn.execute(
-                f"SELECT {columns} FROM accounts WHERE tenant_id = ? ORDER BY username",
-                (tenant_id,),
-            )
-        return list(rows)
+        conditions: list[str] = []
+        params: list[Any] = []
+        if tenant_id is not None:
+            conditions.append("tenant_id = ?")
+            params.append(tenant_id)
+        if role is not None:
+            conditions.append("role = ?")
+            params.append(role)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        return list(self._conn.execute(
+            f"SELECT {columns} FROM accounts{where} ORDER BY username", params
+        ))
 
     def set_account_password(self, username: str, password_hash: str) -> bool:
         cur = self._conn.execute(

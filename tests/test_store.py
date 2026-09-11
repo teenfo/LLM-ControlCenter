@@ -156,7 +156,7 @@ def test_no_unscoped_query_path_is_exposed(store):
 def test_tenant_data_methods_require_scope_first(store):
     """테넌트 데이터를 만지는 메서드는 첫 인자가 scope 다 — 빠뜨릴 수 없게."""
     tenant_scoped = [
-        "create_job", "get_job", "list_jobs", "update_job", "record_usage",
+        "create_job", "get_job", "list_jobs", "filter_actions_for_jobs", "update_job", "record_usage",
         "spend_since", "record_filter_event", "list_filter_events",
         "set_role_override", "get_role_overrides", "clear_role_override",
         "list_audit", "create_service", "get_service", "list_services",
@@ -982,3 +982,25 @@ def test_a_lost_settlement_cas_writes_no_usage(store):
     assert store.get_job(ACME, job_id).status == "queued"
     rows = store._conn.execute("SELECT COUNT(*) AS n FROM usage").fetchone()
     assert rows["n"] == 0, "채택 안 된 실행의 지출이 남았다"
+
+
+def test_filter_actions_for_jobs_prefers_the_internal_grade_and_skips_counters(store):
+    """소비자에게 주는 요약은 규칙 id 와 등급뿐 — 내부 경계 우선, 출력 축과 계수기 행은 뺀다."""
+    store.record_filter_event(
+        ACME, rule_id="email", stage="pattern", action="full", boundary="external", job_id="j1",
+    )
+    store.record_filter_event(
+        ACME, rule_id="email", stage="pattern", action="partial", boundary="internal", job_id="j1",
+    )
+    store.record_filter_event(ACME, rule_id="_classifier_ok", stage="llm", action="audit", job_id="j1")
+    store.record_filter_event(
+        ACME, rule_id="credit_card", stage="output", action="full", boundary="internal", job_id="j1",
+    )
+    store.record_filter_event(
+        ACME, rule_id="kr_rrn", stage="pattern", action="block", boundary="internal", job_id="j2",
+    )
+    assert store.filter_actions_for_jobs(ACME, ["j1", "j2", "j3"]) == {
+        "j1": {"email": "partial"}, "j2": {"kr_rrn": "block"},
+    }
+    assert store.filter_actions_for_jobs(ACME, []) == {}
+    assert store.filter_actions_for_jobs(GLOBEX, ["j1"]) == {}

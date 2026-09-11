@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Collection, Mapping, Sequence
 
 from .auth import (
-    Principal, RateLimiter, active_service, check_role_allowed, limits_for,
+    Principal, RateLimiter, account_session, active_service, check_role_allowed, limits_for,
 )
 from .cluster import PLACED, WAIT, Cluster
 from .completion import CompletionSignal
@@ -416,6 +416,8 @@ class Pipeline:
     ) -> Submission:
         """생성 요청. **이 함수의 본문 순서가 곧 계약이다.**"""
         scope = principal.scope()
+        # ⓪ 계정 세션의 end_user 는 서버가 정한다 — 본문 값은 무시한다.
+        end_user, forced = self._effective_end_user(principal, end_user)
 
         # ① 인증 이후 — 권한·한도
         role_config, tenant, service, end_user_hash = self._authorize(
@@ -496,7 +498,9 @@ class Pipeline:
         self._record_guard_events(
             scope, verdict, job_id=job_id, service_id=principal.service_id
         )
-        self._flag_end_user_shape(principal, end_user, job_id)
+        if not forced:
+            # 강제된 값은 아이디다 — 숫자 아이디가 `phone_or_id` 로 오탐돼 감사를 채우면 안 된다.
+            self._flag_end_user_shape(principal, end_user, job_id)
 
         # ④·⑤ 배치와 실행은 스케줄러가 한다. 여기서는 기다리기만 한다.
         result = await self.wait_for(scope, job_id, seconds=wait)
@@ -509,6 +513,20 @@ class Pipeline:
                 status=413,
                 params={"size": len(text), "limit": role.max_prompt_chars},
             )
+
+    def _effective_end_user(
+        self, principal: Principal, end_user: str | None
+    ) -> tuple[str | None, bool]:
+        """계정 세션이면 `end_user` 는 그 사람의 아이디다. 반환은 (값, 강제됐는가).
+
+        본문의 `end_user` 를 믿으면 로그인한 사람이 남의 이름으로 요청을 남길 수 있다 —
+        개인별 귀속·레이트리밋·파기가 전부 그 값에 걸려 있다. 서비스 토큰(기계)은 지금까지처럼
+        자기가 말하는 값을 쓴다. 이 결정은 `_authorize` **앞**에 있어야 한다(구조 검사가 지킨다).
+        """
+        person = account_session(self._store, principal)
+        if person:
+            return person, True
+        return end_user, False
 
     def _flag_end_user_shape(
         self, principal: Principal, end_user: str | None, job_id: str
@@ -629,6 +647,9 @@ class Pipeline:
             node=job.node,
             tier=job.tier,
             attempts=job.attempts,
+            # 판정은 잡 행이 아니라 filter_events 에 있다. 되읽지 않으면 `wait=0` 으로 낸
+            # 요청의 가드 요약이 조회에서 사라진다(제출 응답과 조회 응답이 달라진다).
+            guard_actions=self._store.filter_actions_for_jobs(scope, [job.id]).get(job.id, {}),
             queue_position=self._queue_position(scope, job) if pending else None,
             retry_after=self._retry_after(job) if pending else None,
             wait_reason=job.wait_reason if pending else None,
@@ -684,6 +705,7 @@ class Pipeline:
         바꿔서 되쪼갤 수 없고, 소비자는 N개를 넣고 1개를 돌려받는다.
         """
         scope = principal.scope()
+        end_user, _forced = self._effective_end_user(principal, end_user)
         role_config, tenant, service, end_user_hash = self._authorize(
             principal, role, end_user
         )

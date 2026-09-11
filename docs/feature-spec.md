@@ -79,9 +79,11 @@
 구현   `app/auth.py:require_platform_admin` `require_tenant_admin` `authenticate`
 계약   테넌트 관리자는 플랫폼 작업을 할 수 없다 · 서비스 토큰은 관리자가 아니다
        정지된 테넌트의 토큰은 인증되지 않는다
+       계정 역할 `user`(AUTH-10)는 토큰 역할 `service` 로 내려온다 — 사람은 네 번째 등급이 아니라 서비스 토큰의 앞문이다
 고정   `test_auth.py::test_tenant_admin_cannot_do_platform_things`
        `test_auth.py::test_service_token_is_not_an_admin`
        `test_auth.py::test_token_of_suspended_tenant_is_rejected`
+       `test_accounts.py::test_a_user_session_cannot_reach_admin_or_platform_routes`
 상태   구현됨
 
 ### AUTH-5  엔드유저 신원 해싱
@@ -133,6 +135,26 @@
        `test_accounts.py::test_changing_the_password_ends_the_other_sessions`
        `test_accounts.py::test_a_session_is_a_token_that_expires`
        `test_architecture.py::test_only_hash_password_writes_password_hashes`
+상태   구현됨
+
+### AUTH-10  사용자 계정
+정의   테넌트 관리자가 자기 테넌트의 사람에게 아이디·비밀번호 계정을 만들어 준다. 계정은 서비스 하나에 귀속되고, 로그인하면 그 서비스의 `service` 역할 세션(12시간)을 받는다 — 새 권한 등급이 아니라 서비스 토큰의 앞문이다.
+표면   `GET/POST /v1/admin/accounts` · `POST /v1/admin/accounts/{username}/password` · `POST /v1/admin/accounts/{username}/disable` · `POST /v1/platform/accounts` 의 `role: user`
+       `python -m app account create --role user` · 관제 UI 설정 → 사용자 계정 탭 · 클라이언트 페이지 로그인(OPS-11)
+구현   `app/auth.py:ROLE_USER` `token_role_for_account` `account_row` · `app/main.py:tenant_accounts` `tenant_account_password` `tenant_account_disable` `_tenant_user` · `app/pipeline.py:_effective_end_user`
+계약   `user` 세션은 관리 면(`/v1/admin/*` · `/v1/platform/*`)에 닿지 않는다 · 계정은 `service_id` 없이 만들 수 없고 그 서비스는 같은 테넌트에 실재해야 한다
+       테넌트 관리자는 자기 테넌트의 `user` 계정만 본다 — 남의 테넌트 것과 관리자 계정은 404(존재를 흘리지 않는다)
+       **모든 계정 세션의 `end_user` 는 파이프라인이 아이디로 강제한다** (본문 값 무시 · generate·embed 공통 · `_authorize` 보다 앞) — 사칭이 불가능하고 레이트리밋·사용량·파기가 사람 단위로 귀속된다
+       생성·재설정·정지는 감사에 남는다(AUTH-9 와 같은 액션 이름)
+고정   `test_accounts.py::test_a_user_account_logs_in_as_a_service_session_bound_to_its_tenant_and_service`
+       `test_accounts.py::test_a_user_session_cannot_reach_admin_or_platform_routes`
+       `test_accounts.py::test_tenant_admin_manages_only_user_accounts_of_its_own_tenant`
+       `test_accounts.py::test_a_user_account_needs_a_service_id_and_a_real_service`
+       `test_accounts.py::test_user_account_management_is_tenant_admin_only`
+       `test_accounts.py::test_user_account_actions_leave_an_audit_trail`
+       `test_api.py::test_an_account_session_cannot_choose_its_end_user`
+       `test_api.py::test_the_forced_end_user_applies_to_embed_too`
+       `test_architecture.py::test_both_submit_paths_force_the_account_end_user`
 상태   구현됨
 
 ## 2. 요청 파이프라인
@@ -206,6 +228,24 @@
 고정   `test_cluster.py::test_korean_is_not_counted_as_if_it_were_english`
        `test_cluster.py::test_the_estimator_errs_high_not_low`
        `test_scheduler.py::test_the_dispatch_path_reserves_input_tokens_for_a_queued_job`
+상태   구현됨
+
+### PIPE-9  내 작업 목록
+정의   호출자가 자기 작업 — 같은 테넌트·같은 서비스·같은 엔드유저 — 만 마스킹본으로 다시 본다. 클라이언트 페이지(OPS-11)의 "기록" 이 이것이다.
+표면   `GET /v1/jobs` (`limit` 기본 50 · 최대 100) · 계정 세션은 엔드유저가 자동, 서비스 토큰은 `?end_user=` 필수(없으면 400 `end_user_required`)
+구현   `app/main.py:jobs_list` · `app/store.py:list_jobs` 의 `service_id`·`end_user_hash` 필터 · `filter_actions_for_jobs` · `app/pipeline.py:_to_submission` 이 같은 경로로 `guard_actions` 를 복원한다
+계약   범위는 (테넌트, 서비스, 엔드유저 해시) 셋 다 — 공유 토큰으로 남의 이력을 보지 못하고 테넌트를 넘지 않는다
+       행에는 마스킹된 프롬프트·응답·가드 판정만 있다. `route`·`cost_usd`·`has_raw`·`prompt_hash` 는 없다(소비자 계약은 라우팅과 원문을 모른다)
+       `status_poll` 한도로 계량된다(`GET /v1/jobs/{id}` 와 같은 키) · 상태는 소비자 어휘로 접힌다(종결 전은 전부 `pending`)
+       `GET /v1/jobs/{id}` 도 저장된 가드 판정을 돌려준다 — `wait=0` 제출 뒤 조회하면 가드 요약이 비던 결함을 같은 경로로 고쳤다
+고정   `test_api.py::test_my_jobs_lists_only_the_callers_jobs`
+       `test_api.py::test_my_jobs_never_crosses_tenants`
+       `test_api.py::test_token_mode_history_requires_an_end_user`
+       `test_api.py::test_my_jobs_returns_masked_prompts_and_guard_actions`
+       `test_api.py::test_my_jobs_omits_admin_only_fields`
+       `test_api.py::test_my_jobs_is_metered_as_a_poll`
+       `test_api.py::test_job_get_carries_the_stored_guard_actions`
+       `test_store.py::test_filter_actions_for_jobs_prefers_the_internal_grade_and_skips_counters`
 상태   구현됨
 
 ---
@@ -939,7 +979,7 @@
 
 ## 10. 운영 · 관측
 
-주 모듈: `observability.py` `notify.py` `cli.py` `loadtest.py` `i18n.py` · 자산: `static/` `locales/`
+주 모듈: `observability.py` `notify.py` `cli.py` `loadtest.py` `i18n.py` · 자산: `static/`(관제 UI) `static/client/`(클라이언트 페이지) `locales/`
 
 ### OPS-1  메트릭
 정의   Prometheus/OpenMetrics 형식으로 운영 신호를 노출한다.
@@ -1077,6 +1117,26 @@
        `test_idempotency.py::test_the_rate_window_excludes_old_usage`
        `test_idempotency.py::test_the_metrics_carry_no_tenant_label`
 상태   부분 — 토큰 축 **한도**는 없음, 요청 수 기준만 (D8)
+
+### OPS-11  클라이언트 페이지
+정의   사람이 브라우저에서 역할을 골라 요청하고, 가드가 무엇을 가렸는지 보고, 자기 이력을 다시 열고, 대화를 이어 가는 화면. 관제 UI 와 같은 앱이 `/client/` 로 서빙한다.
+표면   `GET /client` (308 → `/client/`) · `/client/*` 정적 자산 · `static/client/{index.html, client.js, client.css}`
+       로그인은 사용자 계정(AUTH-10, 기본) 또는 서비스 토큰 붙여넣기(이름 필수) · 탭: 요청 · 대화(`chat` 역할이 보일 때만) · 기록(PIPE-9) · 계정
+구현   `app/main.py:_serve_index` `client_page` · `VersionedStaticFiles` · `static/client/client.js` · `config/roles.yaml` 의 `chat` 역할
+계약   관제 UI 와 같은 규칙 — 빌드 단계·프레임워크·CDN·웹폰트 없음 · `innerHTML` 없음 · 토큰은 `sessionStorage` 만(키는 콘솔과 다르다) · 화면은 마스킹본만 · API 에 없는 기능은 그리지 않는다
+       공용 헬퍼(`t` `applyStaticStrings` `el` `api` `login`)와 테마 토큰은 콘솔에서 글자 그대로 복제하고 테스트가 동일성을 본다 — 공용 모듈은 콘솔의 핀(`import` 금지·함수 순서)이 막는다
+       폴링은 서버의 `retry_after` 를 따르고 `setInterval` 을 쓰지 않는다 · 파일은 브라우저 안에서만 읽는다(텍스트 계열 · 2MB) · 문자열은 `client.*` 만 쓰고 죽은 키는 실패한다
+       대화는 **클라이언트 측 트랜스크립트 합성**이다 — 평문 표식 `사용자:`/`도우미:` 로 `chat` 역할에 보내고 오래된 턴부터 잘라 `max_prompt_chars` 에 맞춘다. 표식은 베이스라인 인젝션 규칙에 걸리지 않는다. 트랜스크립트는 메모리에만 있다
+고정   `test_client_page.py::test_the_client_page_is_served_without_a_build_step`
+       `test_client_page.py::test_client_has_no_external_assets`
+       `test_client_page.py::test_client_keeps_the_token_in_session_storage_only`
+       `test_client_page.py::test_shared_helpers_are_identical_to_the_console`
+       `test_client_page.py::test_client_polls_with_the_servers_retry_after`
+       `test_client_page.py::test_chat_markers_do_not_trip_the_shipped_control_token_rule`
+       `test_client_page.py::test_client_calls_only_routes_that_exist`
+       `test_client_page.py::test_history_shows_masked_prompts_only`
+       `test_config.py::test_shipped_config_has_a_chat_role_the_client_page_can_use`
+상태   부분 — 대화는 트랜스크립트 합성이다(서버 대화 API·스트리밍 없음, G7) · 파일 입력은 텍스트 계열만(PDF 없음)
 
 ---
 
@@ -1375,7 +1435,8 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | PIPE-3 멱등성 키 | 키가 작업을 식별함. 페이로드를 비교하지 않고 `/v1/embed` 는 미적용 | 부분 | D7 / G3 |
 | ROUTE-4 라우팅 정확도 | 계측 도구는 있으나 픽스처가 번들에 없음. 안 재면 맞는지 아무도 모름 | 부분 | L1 |
 | OPS-10 토큰 처리율 | 보여주기만 하고 한도로 걸지 않음. 설치처 분포를 모르는 채 건 한도는 꺼짐 | 부분 | D8 |
-| AUTH-8 관리 신원 연동 | 로컬 계정(AUTH-9)만 있음. IdP·MFA 없음 | 미구현 | D12 |
+| OPS-11 클라이언트 페이지 | 요청·기록·계정은 API 그대로. 대화는 클라이언트가 트랜스크립트를 합성해 `chat` 역할에 보내는 형태라 서버 대화 API·스트리밍이 없고, 파일 입력은 텍스트 계열만 | 부분 | G7 |
+| AUTH-8 관리 신원 연동 | 로컬 계정(AUTH-9 · AUTH-10)만 있음. IdP·MFA 없음 | 미구현 | D12 |
 | PIPE-7 선언적 체인 실행 | 없음 | 미구현 | L2 |
 | PIPE-8 스트리밍 응답 | 없음 | 미구현 | G7 |
 | CLUSTER-14 테넌트별 클라우드 키 | 없음 | 미구현 | D5 |
@@ -1463,6 +1524,13 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_account_disable` | `POST /v1/platform/accounts/{username}/disable` | AUTH-9 |
 | `platform_nodes` | `GET/POST /v1/platform/nodes` | CLUSTER-1 |
 | `platform_node_drain` | `POST /v1/platform/nodes/{node}/drain` | CLUSTER-8 |
+| `jobs_list` | `GET /v1/jobs` | PIPE-9 |
+| `tenant_accounts` | `GET/POST /v1/admin/accounts` | AUTH-10 |
+| `tenant_account_password` | `POST /v1/admin/accounts/{username}/password` | AUTH-10 |
+| `tenant_account_disable` | `POST /v1/admin/accounts/{username}/disable` | AUTH-10 |
+| `client_page` | `GET /client` | OPS-11 |
+| `client_page_slash` | `GET /client/` | OPS-11 |
+| `client_static` | `/client/*` (정적 자산) | OPS-11 |
 | `platform_node_delete` | `DELETE /v1/platform/nodes/{node}` | CLUSTER-1 |
 | `platform_models` | `GET /v1/platform/models` | CLUSTER-11 |
 | `platform_model_approve` | `POST /v1/platform/models/{id}/approve` | CLUSTER-11 |
@@ -1503,7 +1571,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `doctor` | OPS-5 CRYPTO-2 CRYPTO-4 |
 | `rotate-kek` | CRYPTO-2 |
 | `audit-export` | CRYPTO-5 |
-| `account` | AUTH-9 (`create` · `list` · `reset-password` · `disable` · `enable`) |
+| `account` | AUTH-9 AUTH-10 (`create` · `list` · `reset-password` · `disable` · `enable` — `--role user` 가 AUTH-10) |
 
 ---
 
@@ -1511,7 +1579,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 
 | 파일 | 무엇을 정하나 | 기능 |
 |---|---|---|
-| `config/roles.yaml` | 역할 = 모델·배치·레인 정책, 라우팅 옵트인 | AUTH-6 AUTH-7 CLUSTER-3 ROUTE-1 |
+| `config/roles.yaml` | 역할 = 모델·배치·레인 정책, 라우팅 옵트인 · 클라이언트 페이지의 `chat` 역할 | AUTH-6 AUTH-7 CLUSTER-3 ROUTE-1 OPS-11 |
 | `config/lanes.yaml` | 레인별 동시 실행 상한과 기아 임계 | SCHED-2 SCHED-3 |
 | `config/nodes.yaml` | 노드 시드 (DB 가 이긴다) | CLUSTER-1 CLUSTER-5 CLUSTER-10 |
 | `config/guard.yaml` | 로케일 팩·맥락 규칙·시크릿·인젝션 | GUARD-1 GUARD-2 GUARD-3 GUARD-8 GUARD-9 |

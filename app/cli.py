@@ -24,6 +24,7 @@ from typing import Any
 from .auth import (
     ROLE_PLATFORM_ADMIN,
     ROLE_TENANT_ADMIN,
+    ROLE_USER,
     create_account,
     reset_password,
     set_account_enabled,
@@ -645,7 +646,7 @@ def cmd_account(args: argparse.Namespace) -> int:
             role = args.role
             tenant_id = args.tenant or (PLATFORM_TENANT if role == ROLE_PLATFORM_ADMIN else "")
             if not tenant_id:
-                print("tenant_admin 계정에는 --tenant 가 필요합니다.", file=sys.stderr)
+                print("tenant_admin·user 계정에는 --tenant 가 필요합니다.", file=sys.stderr)
                 return 2
             # 세션 토큰이 걸릴 서비스. 플랫폼은 bootstrap 이 만든 console, 테넌트는 관행상 <테넌트>-app.
             service_id = args.service or (
@@ -823,11 +824,14 @@ def build_parser() -> argparse.ArgumentParser:
     create = actions.add_parser("create", help="계정을 만든다")
     create.add_argument("username", help="소문자·숫자·._- 3~32자")
     create.add_argument(
-        "--role", choices=(ROLE_PLATFORM_ADMIN, ROLE_TENANT_ADMIN), default=ROLE_TENANT_ADMIN,
+        "--role", choices=(ROLE_PLATFORM_ADMIN, ROLE_TENANT_ADMIN, ROLE_USER),
+        default=ROLE_TENANT_ADMIN,
+        help="user 는 클라이언트 페이지(/client/)로 로그인하는 사람 — 관제 UI 권한이 없다",
     )
-    create.add_argument("--tenant", help="tenant_admin 이 속할 테넌트. platform_admin 은 생략")
+    create.add_argument("--tenant", help="tenant_admin·user 가 속할 테넌트. platform_admin 은 생략")
     create.add_argument(
-        "--service", help="세션 토큰이 걸릴 서비스. 기본은 console(플랫폼) 또는 <테넌트>-app",
+        "--service",
+        help="세션 토큰이 걸릴 서비스(허용 역할·한도·예산이 여기 걸린다). 기본은 console(플랫폼) 또는 <테넌트>-app",
     )
     password_options(create)
 

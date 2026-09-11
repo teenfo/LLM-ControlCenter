@@ -1265,6 +1265,23 @@ def test_the_wheel_carries_the_bundled_assets():
     assert "*.json" in data["app.bundled_locales"]
 
 
+def test_the_wheel_carries_the_client_page():
+    """`package-data` 글롭은 **비재귀**다 — `*.js` 는 `static/client/client.js` 를 담지 않는다.
+
+    관제 UI 는 `static/` 바로 아래라 첫 선언으로 충분했지만, 클라이언트 페이지는 한 단계
+    아래에 있다. 글롭 세 개를 지우면 `-e` 설치와 도커에서는 멀쩡히 돌고 휠 설치본만
+    `/client/` 가 404 다 — P-1 과 같은 종류의 틈이라 선언에 못박는다.
+    """
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        config = tomllib.load(handle)
+
+    data = config["tool"]["setuptools"]["package-data"]["app.bundled_static"]
+    for pattern in ("client/*.html", "client/*.js", "client/*.css"):
+        assert pattern in data, f"app.bundled_static 에 {pattern} 이 없다"
+
+
 def test_asset_lookup_handles_both_layouts():
     """저장소에서는 루트에, 설치본에서는 패키지 아래에 있다 — 한쪽만 보면 깨진다."""
     from app.cli_paths import PACKAGE, ROOT as APP_ROOT, bundled
@@ -1362,11 +1379,24 @@ def test_the_wheel_content_matches_the_source(tmp_path):
 
     [wheel] = wheel_dir.glob("*.whl")
     with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
         shipped = {
             name: archive.read(name)
-            for name in archive.namelist()
+            for name in names
             if name.startswith("app/") and name.endswith(".py")
         }
+
+    # 정적 자산도 같은 휠에서 본다 — 페이지 한 장이 빠져도 설치본은 조용히 뜬다.
+    tracked_static = {
+        name for name in listing.stdout.decode().split("\0")
+        if name.startswith("static/") and name.endswith((".html", ".js", ".css"))
+    }
+    assert tracked_static, "추적 중인 static/ 파일을 하나도 못 읽었다"
+    absent = sorted(
+        name for name in tracked_static
+        if "app/bundled_static/" + name[len("static/"):] not in names
+    )
+    assert not absent, f"소스에 있는 정적 자산이 휠에 없다: {absent}"
 
     source_modules = {
         f"app/{path.relative_to(ROOT / 'app')}"

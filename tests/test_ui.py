@@ -645,3 +645,21 @@ def test_a_header_with_an_empty_label_does_not_render_as_an_object():
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     assert "label || h" not in js, "머리글이 falsy 폴백으로 객체를 문자열화한다"
     assert re.search(r"typeof h === 'object'", js), "머리글을 모양으로 가르지 않는다"
+
+
+def test_the_settings_offer_user_accounts_to_tenant_admins():
+    """사용자(user) 계정은 테넌트 관리자의 것이다 — 설정에 그 탭이 있고 자기 테넌트 라우트를 부른다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    settings = source[source.index("async function renderSettings"):source.index("async function renderConnections")]
+    assert "'users'" in settings and "is_tenant_admin" in settings
+    users = source[source.index("async function renderUserAccounts"):source.index("function createUserForm")]
+    assert "'/v1/admin/accounts'" in users
+    form = source[source.index("function createUserForm"):source.index("function initialOf")]
+    assert "service_id" in form and "'/v1/admin/accounts'" in form
+
+
+def test_the_platform_account_form_offers_the_user_role_with_a_service():
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    form = source[source.index("function createAccountForm"):source.index("function initialOf")]
+    assert "value: 'user'" in form
+    assert "service_id" in form

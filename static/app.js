@@ -376,6 +376,7 @@ async function api(path, options) {
     const error = new Error((body && body.message) || response.statusText);
     error.code = body && body.code;
     error.status = response.status;
+    error.body = body;   // params(규칙·범위·retry_after)가 여기 실린다 — 화면은 코드로 분기하고 이것으로 설명한다
     throw error;
   }
   return body;
@@ -1472,6 +1473,8 @@ async function renderSettings() {
   if (s.is_tenant_admin) subs.push({ id: 'connections', label: t('ui.connections'), render: renderConnections });
   if (s.is_platform_admin) subs.push({ id: 'plugins', label: t('ui.plugins'), render: renderPlugins, platform: true });
   if (s.is_tenant_admin) subs.push({ id: 'data', label: t('ui.data'), render: renderData });
+  // 사용자(user) 계정은 테넌트 관리자의 것이다 — 클라이언트 페이지로 로그인하는 사람들.
+  if (s.is_tenant_admin) subs.push({ id: 'users', label: t('ui.user_accounts'), render: renderUserAccounts });
   if (s.is_platform_admin) subs.push({ id: 'accounts', label: t('ui.accounts'), render: renderAccounts, platform: true });
   // 계정으로 들어왔을 때만 — 서비스 토큰에는 바꿀 비밀번호가 없다.
   if (s.account) subs.push({ id: 'account', label: t('ui.account'), render: renderAccount });
@@ -1729,20 +1732,18 @@ async function renderAccount() {
 }
 
 /** 관리자 계정 — 목록·만들기·정지·비밀번호 재설정. 해시는 서버가 애초에 안 내준다. */
-async function renderAccounts() {
-  const data = await api('/v1/platform/accounts');
-  renderBanners();
-  const accounts = data.accounts || [];
-
+/** 계정 표·정지 스위치·재설정 폼. 플랫폼(관리자 계정)과 테넌트(사용자 계정)가 base path 만 바꿔 같이 쓴다.
+ *  목록에 해시는 없다 — 서버가 애초에 내주지 않는다. */
+function accountsPanel(basePath, accounts, options) {
   const rows = accounts.map((a) => [
     el('span', { class: 'mono', text: a.username, style: 'font-weight:500' }),
-    pill(a.role, a.role === 'platform_admin' ? 'accent' : ''),
-    el('span', { class: 'mono', text: a.tenant_id }),
+    pill(a.role, a.role === 'platform_admin' ? 'accent' : (a.role === 'user' ? 'info' : '')),
+    el('span', { class: 'mono', text: options.showTenant ? a.tenant_id : a.service_id }),
     el('span', { class: 'muted', text: a.last_login_at ? when(a.last_login_at) : '—' }),
     a.disabled_at ? pill(t('ui.disabled'), 'danger') : pill(t('ui.plugin_active'), 'ok'),
     switchControl(!a.disabled_at, async () => {
       try {
-        await api('/v1/platform/accounts/' + encodeURIComponent(a.username) + '/disable',
+        await api(basePath + '/' + encodeURIComponent(a.username) + '/disable',
           { method: 'POST', body: { disabled: !a.disabled_at } });
         refresh();
       } catch (err) { showError(err); }
@@ -1756,7 +1757,7 @@ async function renderAccounts() {
     onsubmit: async (event) => {
       event.preventDefault();
       try {
-        await api('/v1/platform/accounts/' + encodeURIComponent(target.value) + '/password',
+        await api(basePath + '/' + encodeURIComponent(target.value) + '/password',
           { method: 'POST', body: { password: fresh.value } });
         fresh.value = '';
         toast(t('ui.account_reset_done'));
@@ -1769,15 +1770,65 @@ async function renderAccounts() {
   ]);
 
   return [
-    card(t('ui.accounts'), [rows.length
-      ? table([t('ui.username'), t('ui.role'), t('ui.tenants'), t('ui.last_login'), t('ui.status'), ''], rows)
+    card(options.title, [rows.length
+      ? table([
+        t('ui.username'), t('ui.role'), options.showTenant ? t('ui.tenants') : t('ui.service'),
+        t('ui.last_login'), t('ui.status'), '',
+      ], rows)
       : emptyState(t('ui.account_none'))],
       null, el('button', {
         type: 'button', class: 'primary sm', text: t('ui.account_create'),
-        onclick: () => openDrawer(t('ui.account_create'), [createAccountForm()]),
+        onclick: () => openDrawer(t('ui.account_create'), [options.createForm()]),
       })),
-    card(t('ui.account_reset_password'), [resetForm]),
+    accounts.length ? card(t('ui.account_reset_password'), [resetForm]) : null,
   ];
+}
+
+async function renderAccounts() {
+  const data = await api('/v1/platform/accounts');
+  renderBanners();
+  return accountsPanel('/v1/platform/accounts', data.accounts || [], {
+    title: t('ui.accounts'), showTenant: true, createForm: createAccountForm,
+  });
+}
+
+/** 테넌트 관리자의 사용자 계정 — 클라이언트 페이지(/client/)로 들어오는 사람들. 역할은 user 로 고정이다. */
+async function renderUserAccounts() {
+  const data = await fetchAll({ accounts: '/v1/admin/accounts', services: '/v1/admin/services' });
+  renderBanners();
+  const services = (data.services && data.services.services) || [];
+  return [el('p', { class: 'hint', text: t('ui.user_hint') })].concat(
+    accountsPanel('/v1/admin/accounts', (data.accounts && data.accounts.accounts) || [], {
+      title: t('ui.user_accounts'), showTenant: false, createForm: () => createUserForm(services),
+    }));
+}
+
+function createUserForm(services) {
+  const username = el('input', { id: 'user-username', type: 'text', autocomplete: 'off', spellcheck: 'false' });
+  const password = el('input', { id: 'user-password', type: 'password', autocomplete: 'new-password' });
+  // 서비스는 고른다 — 허용 역할·한도·예산이 거기 걸린다. 서버도 추측하지 않는다.
+  const service = el('select', { id: 'user-service' }, services.map((svc) => el('option', { value: svc.id, text: svc.id })));
+  return el('form', {
+    class: 'stack',
+    onsubmit: async (event) => {
+      event.preventDefault();
+      try {
+        await api('/v1/admin/accounts', {
+          method: 'POST',
+          body: { username: username.value.trim(), password: password.value, service_id: service.value },
+        });
+        toast(t('ui.account_created'));
+        closeDrawer();
+        refresh();
+      } catch (err) { showError(err); }
+    },
+  }, [
+    el('div', {}, [el('label', { for: 'user-username', text: t('ui.username') }), username]),
+    el('div', {}, [el('label', { for: 'user-password', text: t('ui.password') }), password]),
+    el('div', {}, [el('label', { for: 'user-service', text: t('ui.service') }), service]),
+    el('p', { class: 'hint', text: t('ui.user_hint') }),
+    el('button', { type: 'submit', class: 'primary', text: t('ui.account_create') }),
+  ]);
 }
 
 function createAccountForm() {
@@ -1786,8 +1837,11 @@ function createAccountForm() {
   const role = el('select', { id: 'acct-role' }, [
     el('option', { value: 'platform_admin', text: 'platform_admin' }),
     el('option', { value: 'tenant_admin', text: 'tenant_admin' }),
+    el('option', { value: 'user', text: 'user' }),
   ]);
   const tenant = el('input', { id: 'acct-tenant', type: 'text', autocomplete: 'off', spellcheck: 'false' });
+  // 세션이 걸릴 서비스. 비우면 서버 관행(<테넌트>-app)을 따른다 — user 는 여기 걸린 한도·역할을 받는다.
+  const service = el('input', { id: 'acct-service', type: 'text', autocomplete: 'off', spellcheck: 'false' });
   return el('form', {
     class: 'stack',
     onsubmit: async (event) => {
@@ -1798,6 +1852,7 @@ function createAccountForm() {
           body: {
             username: username.value.trim(), password: password.value, role: role.value,
             tenant_id: tenant.value.trim() || undefined,
+            service_id: service.value.trim() || undefined,
           },
         });
         toast(t('ui.account_created'));
@@ -1810,6 +1865,7 @@ function createAccountForm() {
     el('div', {}, [el('label', { for: 'acct-password', text: t('ui.password') }), password]),
     el('div', {}, [el('label', { for: 'acct-role', text: t('ui.role') }), role]),
     el('div', {}, [el('label', { for: 'acct-tenant', text: t('ui.tenants') }), tenant]),
+    el('div', {}, [el('label', { for: 'acct-service', text: t('ui.service') }), service]),
     el('button', { type: 'submit', class: 'primary', text: t('ui.account_create') }),
   ]);
 }

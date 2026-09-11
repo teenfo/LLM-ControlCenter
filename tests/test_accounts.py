@@ -15,6 +15,7 @@ from app.auth import (
     LOGIN_LOCK_SECONDS,
     MIN_PASSWORD_LENGTH,
     ROLE_TENANT_ADMIN,
+    ROLE_USER,
     SESSION_TTL_SECONDS,
     account_session,
     authenticate,
@@ -486,3 +487,158 @@ def test_account_actions_leave_an_audit_trail(client, acme, harness):
     actions = [row["action"] for row in harness.store.list_audit(ACME, limit=50)]
     for expected in ("create_account", "login", "logout"):
         assert expected in actions, actions
+
+
+# ── 사용자 계정(user) — 클라이언트 페이지의 앞문 (feature-spec AUTH-10) ──────────
+
+
+def login_user(client, harness, tokens, username: str, tenant: str = "acme") -> str:
+    create_account(
+        harness.store, username, PASSWORD, role=ROLE_USER, tenant_id=tenant,
+        service_id=tokens["service_id"], actor="test",
+    )
+    body = client.post("/v1/login", json={"username": username, "password": PASSWORD}).json()
+    return body["token"]
+
+
+def test_a_user_account_logs_in_as_a_service_session_bound_to_its_tenant_and_service(
+    client, acme, harness,
+):
+    """`user` 는 토큰 역할이 아니다 — 세션은 자기 서비스의 `service` 토큰이고, 사람임은 계정 정보로 안다."""
+    token = login_user(client, harness, acme, "alice")
+    session = client.get("/v1/session", headers=auth(token)).json()
+    assert session["role"] == "service"
+    assert session["account"] == "alice"
+    assert session["account_role"] == "user"
+    assert session["tenant"]["id"] == "acme"
+    assert session["service"]["id"] == acme["service_id"]
+    assert not session["is_tenant_admin"] and not session["is_platform_admin"]
+
+
+def test_a_user_session_cannot_reach_admin_or_platform_routes(client, acme, harness):
+    token = login_user(client, harness, acme, "alice")
+    assert client.get("/v1/admin/services", headers=auth(token)).status_code == 403
+    assert client.get("/v1/admin/accounts", headers=auth(token)).status_code == 403
+    assert client.get("/v1/platform/tenants", headers=auth(token)).status_code == 403
+
+
+def test_tenant_admin_manages_only_user_accounts_of_its_own_tenant(client, acme, globex, harness):
+    """자기 테넌트의 `user` 만 — 관리자 계정도, 남의 테넌트 사용자도 이 라우트에는 없다(404)."""
+    headers = auth(acme["tenant_admin"])
+    # 같은 테넌트의 관리자 계정은 목록에 나오지 않는다 — 플랫폼 소관이다.
+    make_account(harness.store, "ops", tenant="acme", service=acme["service_id"])
+
+    created = client.post(
+        "/v1/admin/accounts",
+        json={"username": "alice", "password": PASSWORD, "service_id": acme["service_id"]},
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json() == {
+        "username": "alice", "role": "user", "tenant_id": "acme", "service_id": acme["service_id"],
+    }
+
+    # 남의 테넌트 서비스에 묶을 수 없다 — 존재를 말하지 않고 404.
+    foreign = client.post(
+        "/v1/admin/accounts",
+        json={"username": "bob", "password": PASSWORD, "service_id": globex["service_id"]},
+        headers=headers,
+    )
+    assert foreign.status_code == 404
+
+    listed = client.get("/v1/admin/accounts", headers=headers).json()["accounts"]
+    assert [row["username"] for row in listed] == ["alice"]
+    assert all("password_hash" not in row for row in listed)
+
+    # 남의 테넌트 사용자·자기 테넌트 관리자에게는 손댈 수 없다.
+    create_account(
+        harness.store, "gus", PASSWORD, role=ROLE_USER, tenant_id="globex",
+        service_id=globex["service_id"], actor="test",
+    )
+    for username in ("gus", "ops", "nobody"):
+        assert client.post(
+            f"/v1/admin/accounts/{username}/password", json={"password": OTHER}, headers=headers,
+        ).status_code == 404
+        assert client.post(
+            f"/v1/admin/accounts/{username}/disable", json={}, headers=headers,
+        ).status_code == 404
+
+    reset = client.post("/v1/admin/accounts/alice/password", json={"password": OTHER}, headers=headers)
+    assert reset.status_code == 200
+    disabled = client.post("/v1/admin/accounts/alice/disable", json={}, headers=headers)
+    assert disabled.status_code == 200 and disabled.json()["disabled"] is True
+    assert client.post("/v1/login", json={"username": "alice", "password": OTHER}).status_code == 401
+    enabled = client.post(
+        "/v1/admin/accounts/alice/disable", json={"disabled": False}, headers=headers,
+    )
+    assert enabled.status_code == 200
+    assert client.post("/v1/login", json={"username": "alice", "password": OTHER}).status_code == 200
+
+
+def test_a_user_account_needs_a_service_id_and_a_real_service(client, acme):
+    headers = auth(acme["tenant_admin"])
+    missing = client.post(
+        "/v1/admin/accounts", json={"username": "alice", "password": PASSWORD}, headers=headers,
+    )
+    assert missing.status_code == 400
+    assert missing.json()["code"] == "missing_field"
+    unknown = client.post(
+        "/v1/admin/accounts",
+        json={"username": "alice", "password": PASSWORD, "service_id": "nope"},
+        headers=headers,
+    )
+    assert unknown.status_code == 404
+
+
+def test_user_account_management_is_tenant_admin_only(client, acme, harness):
+    token = login_user(client, harness, acme, "alice")
+    for who in (acme["service"], token):
+        assert client.get("/v1/admin/accounts", headers=auth(who)).status_code == 403
+        assert client.post(
+            "/v1/admin/accounts",
+            json={"username": "x1", "password": PASSWORD, "service_id": acme["service_id"]},
+            headers=auth(who),
+        ).status_code == 403
+
+
+def test_platform_can_create_a_user_account_with_tenant_and_service(client, acme):
+    created = client.post(
+        "/v1/platform/accounts",
+        json={
+            "username": "pam", "password": PASSWORD, "role": "user",
+            "tenant_id": "acme", "service_id": acme["service_id"],
+        },
+        headers=auth(acme["platform_admin"]),
+    )
+    assert created.status_code == 201
+    assert created.json()["role"] == "user"
+    logged = client.post("/v1/login", json={"username": "pam", "password": PASSWORD})
+    assert logged.status_code == 200
+    assert logged.json()["role"] == "user"
+
+
+def test_the_cli_offers_the_user_role():
+    from app.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["account", "create", "alice", "--role", "user", "--tenant", "acme", "--service", "acme-web"],
+    )
+    assert args.role == "user" and args.tenant == "acme" and args.service == "acme-web"
+
+
+def test_user_account_actions_leave_an_audit_trail(client, acme, harness):
+    headers = auth(acme["tenant_admin"])
+    client.post(
+        "/v1/admin/accounts",
+        json={"username": "alice", "password": PASSWORD, "service_id": acme["service_id"]},
+        headers=headers,
+    )
+    client.post("/v1/admin/accounts/alice/password", json={"password": OTHER}, headers=headers)
+    client.post("/v1/admin/accounts/alice/disable", json={}, headers=headers)
+    actions = {
+        row["action"]
+        for row in harness.store._conn.execute(
+            "SELECT action FROM admin_audit WHERE target = 'alice' AND tenant_id = 'acme'"
+        )
+    }
+    assert {"create_account", "reset_password", "disable_account"} <= actions

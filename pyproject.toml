@@ -1,6 +1,6 @@
 [project]
 name = "llm-controlcenter"
-version = "0.3.1"
+version = "0.4.0"
 description = "설치형 LLM 클러스터 관제 솔루션 — 다중 백엔드 라우팅·테넌시·프롬프트 거버넌스"
 requires-python = ">=3.11"
 
@@ -53,7 +53,7 @@ packages = [
 [tool.setuptools.package-data]
 "app.bundled_config" = ["*.yaml", "*.yml"]
 "app.bundled_locales" = ["*.json"]
-"app.bundled_static" = ["*.html", "*.js", "*.css"]
+"app.bundled_static" = ["*.html", "*.js", "*.css", "client/*.html", "client/*.js", "client/*.css"]
 "app.bundled_clients" = ["*.py", "*.md"]
 
 [tool.pytest.ini_options]

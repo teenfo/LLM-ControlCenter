@@ -441,3 +441,27 @@ def test_only_hash_password_writes_password_hashes():
                 offenders.append(f"{path.relative_to(APP)}:{node.lineno}")
     assert checked >= 3, "계정 해시를 쓰는 호출을 하나도 못 읽었다 — 형식이 바뀌었다"
     assert not offenders, f"hash_password 를 거치지 않고 해시 칸을 쓰는 호출: {offenders}"
+
+
+def test_both_submit_paths_force_the_account_end_user():
+    """계정 세션의 end_user 는 `_authorize` **앞**에서 정해진다 — 뒤면 한도·해시가 남의 이름으로 걸린다.
+
+    generate 와 embed 두 경로가 따로 있으므로 둘 다 본다. 한쪽만 고치면 임베딩이 사칭 경로가 된다.
+    """
+    tree = ast.parse((APP / "pipeline.py").read_text(encoding="utf-8"))
+    checked = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef) or node.name not in ("submit", "embed"):
+            continue
+        calls = [
+            (sub.lineno, sub.func.attr)
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr in ("_effective_end_user", "_authorize")
+        ]
+        forced = [line for line, name in calls if name == "_effective_end_user"]
+        authorized = [line for line, name in calls if name == "_authorize"]
+        assert forced and authorized, f"{node.name} 에 두 호출이 다 있어야 한다"
+        assert min(forced) < min(authorized), f"{node.name}: end_user 강제가 _authorize 뒤에 있다"
+        checked.add(node.name)
+    assert checked == {"submit", "embed"}

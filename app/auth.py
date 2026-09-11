@@ -405,7 +405,10 @@ LOGIN_LOCK_AFTER = 5
 LOGIN_LOCK_SECONDS = 15 * 60
 MIN_PASSWORD_LENGTH = 10
 MAX_PASSWORD_LENGTH = 256
-ACCOUNT_ROLES = (ROLE_PLATFORM_ADMIN, ROLE_TENANT_ADMIN)
+#: 사람이 LLM 을 쓰는 계정(클라이언트 페이지). **토큰 역할이 아니다** — 로그인하면 자기 서비스의
+#: `service` 토큰을 받는다(`token_role_for_account`). 사람은 새 권한 모델이 아니라 토큰을 받는 앞문이다.
+ROLE_USER = "user"
+ACCOUNT_ROLES = (ROLE_PLATFORM_ADMIN, ROLE_TENANT_ADMIN, ROLE_USER)
 
 _USERNAME = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
 #: log2(N), r, p — 16MB·수십 ms. 로그인 한 번에 맞는 비용이고 노트북급 호스트에서도 돈다.
@@ -526,7 +529,8 @@ def login(
     expires_at = moment + SESSION_TTL_SECONDS
     token_id, raw = issue_token(
         store, TenantScope(account["tenant_id"]), account["service_id"],
-        role=account["role"], expires_at=expires_at, note=session_note(name),
+        role=token_role_for_account(account["role"]), expires_at=expires_at,
+        note=session_note(name),
         actor=f"account:{name}",
     )
     store.record_account_login(name, moment)
@@ -539,6 +543,22 @@ def account_session(store: SqliteStore, principal: Principal) -> str | None:
     row = store.get_token(principal.scope(), principal.token_id)
     note = (row["note"] or "") if row is not None else ""
     return note[len(_SESSION_NOTE):] if note.startswith(_SESSION_NOTE) else None
+
+
+def account_row(store: SqliteStore, principal: Principal) -> Any:
+    """계정 세션이면 그 계정 행(해시 포함 — 밖으로 내보내지 않는다), 아니면 None."""
+    name = account_session(store, principal)
+    return store.get_account(name) if name else None
+
+
+def token_role_for_account(account_role: str) -> str:
+    """계정 역할 → 세션 토큰의 역할.
+
+    `user` 는 토큰 역할이 아니다. 토큰 역할을 하나 늘리면 `authenticate`·`require_can_issue`·
+    관리 라우트 검사가 전부 그 값을 알아야 하고, 하나라도 빠뜨리면 그 자리가 구멍이다.
+    사람은 자기 서비스의 `service` 토큰으로 내려온다 — 서비스가 허용 역할·한도·예산을 정한다.
+    """
+    return ROLE_SERVICE if account_role == ROLE_USER else account_role
 
 
 def logout(store: SqliteStore, principal: Principal) -> bool:

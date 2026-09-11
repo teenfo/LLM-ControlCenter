@@ -10,6 +10,8 @@ import json
 
 import pytest
 
+from app.auth import ROLE_USER, create_account
+from app.identity import hash_end_user
 from app.pipeline import MAX_WAIT_SECONDS
 from app.store import TenantScope
 from tests.conftest import auth, seed_tenant
@@ -1478,3 +1480,126 @@ def test_tenant_admin_cannot_delete_nodes(harness, client, acme):
     response = client.delete("/v1/platform/nodes/in-1", headers=auth(acme["tenant_admin"]))
     assert response.status_code == 403
     assert harness.cluster.state("in-1") is not None
+
+
+# ── 사람의 요청 — end_user 강제 · 내 작업 목록 (feature-spec AUTH-10 · PIPE-9) ─────
+
+PASSWORD = "correct horse battery"
+
+
+def _login_user(client, harness, tokens, username: str, tenant: str = "acme") -> str:
+    create_account(
+        harness.store, username, PASSWORD, role=ROLE_USER, tenant_id=tenant,
+        service_id=tokens["service_id"], actor="test",
+    )
+    return client.post("/v1/login", json={"username": username, "password": PASSWORD}).json()["token"]
+
+
+def _submit(client, token, prompt="안녕", **extra):
+    body = {"role": "summarize", "prompt": prompt, "wait": 0, **extra}
+    response = client.post("/v1/generate", json=body, headers=auth(token))
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_an_account_session_cannot_choose_its_end_user(harness, client, acme):
+    """로그인한 사람의 end_user 는 서버가 아이디로 정한다 — 본문의 값은 무시된다."""
+    token = _login_user(client, harness, acme, "alice")
+    job_id = _submit(client, token, end_user="someone-else")["job_id"]
+    salt = harness.store.get_tenant("acme")["end_user_salt"]
+    job = harness.store.get_job(TenantScope("acme"), job_id)
+    assert job.end_user_hash == hash_end_user("alice", salt)
+    assert job.end_user_hash != hash_end_user("someone-else", salt)
+    # 아이디는 개인정보 모양 경고의 대상이 아니다.
+    flagged = harness.store._conn.execute(
+        "SELECT COUNT(*) AS n FROM admin_audit WHERE action = 'end_user_looks_like_pii' AND target = ?",
+        (job_id,),
+    ).fetchone()["n"]
+    assert flagged == 0
+
+
+def test_the_forced_end_user_applies_to_embed_too(harness, client, acme):
+    token = _login_user(client, harness, acme, "alice")
+    response = client.post(
+        "/v1/embed", json={"role": "vec", "input": "안녕", "end_user": "someone-else"},
+        headers=auth(token),
+    )
+    assert response.status_code == 200, response.text
+    salt = harness.store.get_tenant("acme")["end_user_salt"]
+    job = harness.store.get_job(TenantScope("acme"), response.json()["job_id"])
+    assert job.end_user_hash == hash_end_user("alice", salt)
+
+
+def test_my_jobs_lists_only_the_callers_jobs(harness, client, acme):
+    alice = _login_user(client, harness, acme, "alice")
+    bob = _login_user(client, harness, acme, "bob")
+    mine = {_submit(client, alice, "첫째")["job_id"], _submit(client, alice, "둘째")["job_id"]}
+    _submit(client, bob, "밥의 것")
+
+    body = client.get("/v1/jobs", headers=auth(alice)).json()
+    assert body["scope"] == "account"
+    assert {j["job_id"] for j in body["jobs"]} == mine
+    assert [j["job_id"] for j in client.get("/v1/jobs", headers=auth(bob)).json()["jobs"]] != []
+    assert len(client.get("/v1/jobs", headers=auth(bob)).json()["jobs"]) == 1
+
+
+def test_my_jobs_never_crosses_tenants(harness, client, acme, globex):
+    alice = _login_user(client, harness, acme, "alice")
+    gus = _login_user(client, harness, globex, "gus", tenant="globex")
+    _submit(client, alice, "acme 의 것")
+    assert client.get("/v1/jobs", headers=auth(gus)).json()["jobs"] == []
+    # 테넌트 관리자는 자기 테넌트 전체를 본다 — 그 표면은 그대로다.
+    admin_view = client.get("/v1/admin/jobs", headers=auth(acme["tenant_admin"])).json()["jobs"]
+    assert len(admin_view) == 1
+
+
+def test_token_mode_history_requires_an_end_user(harness, client, acme):
+    """서비스 토큰 하나로 서비스 전체의 이력을 열지 않는다 — 사람 이름이 있어야 그 사람 것만."""
+    alice = _login_user(client, harness, acme, "alice")
+    _submit(client, alice, "앨리스의 것")
+    _submit(client, acme["service"], "기계의 것", end_user="alice")
+    _submit(client, acme["service"], "다른 사람 것", end_user="carol")
+
+    refused = client.get("/v1/jobs", headers=auth(acme["service"]))
+    assert refused.status_code == 400
+    assert refused.json()["code"] == "end_user_required"
+
+    body = client.get("/v1/jobs?end_user=alice", headers=auth(acme["service"])).json()
+    assert body["scope"] == "token"
+    assert len(body["jobs"]) == 2       # 계정 세션의 것 + 같은 이름으로 낸 기계의 것
+
+
+def test_my_jobs_returns_masked_prompts_and_guard_actions(harness, client, acme):
+    alice = _login_user(client, harness, acme, "alice")
+    _submit(client, alice, "연락처는 hong.gildong@example.com 으로 회신")
+    row = client.get("/v1/jobs", headers=auth(alice)).json()["jobs"][0]
+    assert "hong.gildong@example.com" not in (row["prompt_masked"] or "")
+    assert row["guard_actions"].get("email")
+
+
+def test_my_jobs_omits_admin_only_fields(harness, client, acme):
+    """소비자 계약은 라우팅·비용·원문 유무를 모른다 — 관리자 표면의 필드가 새지 않는다."""
+    alice = _login_user(client, harness, acme, "alice")
+    _submit(client, alice)
+    row = client.get("/v1/jobs?limit=999", headers=auth(alice)).json()["jobs"][0]
+    assert not {"route", "cost_usd", "has_raw", "prompt_hash", "end_user_hash"} & set(row)
+    assert {"job_id", "status", "role", "prompt_masked", "guard_actions", "created_at"} <= set(row)
+
+
+def test_my_jobs_is_metered_as_a_poll():
+    """목록 조회도 폴링이다 — 단건 조회와 같은 창을 쓴다."""
+    import inspect
+
+    from app import main
+
+    source = inspect.getsource(main.jobs_list)
+    assert "POLL_LIMIT_PER_MIN" in source and "status_poll" in source
+
+
+def test_job_get_carries_the_stored_guard_actions(harness, client, acme):
+    """`wait=0` 으로 내고 나중에 조회해도 가드 요약이 같아야 한다 — 판정은 filter_events 에 있다."""
+    alice = _login_user(client, harness, acme, "alice")
+    submitted = _submit(client, alice, "연락처는 hong.gildong@example.com 으로 회신")
+    assert submitted["guard_actions"].get("email")
+    fetched = client.get(f"/v1/jobs/{submitted['job_id']}", headers=auth(alice)).json()
+    assert fetched["guard_actions"] == submitted["guard_actions"]

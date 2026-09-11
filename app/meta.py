@@ -117,6 +117,11 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "embed": ("임베딩. 동기지만 가드·배치·경계·비용은 생성과 같은 관문을 지난다.", "consumer", True),
     "job_get": ("작업 조회. 대기 중이면 적응형 `retry_after` 가 함께 온다.", "consumer", True),
     "job_cancel": ("대기 중인 작업 취소. 실행 중인 작업은 취소할 수 없다.", "consumer", True),
+    "jobs_list": (
+        "내 작업 목록. 계정 세션은 자기 아이디, 서비스 토큰은 `?end_user=` 로 범위가 사람 단위다. "
+        "마스킹본과 가드 판정이 실린다.",
+        "consumer", True,
+    ),
     "roles": ("이 토큰이 쓸 수 있는 역할과 각 역할의 한도.", "consumer", True),
     "status": ("클러스터 상태 요약 — 레인·큐·노드 헬스.", "consumer", True),
     # 테넌트 관리
@@ -132,6 +137,12 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "tenant_settings": ("테넌트 설정 — 기본 로케일·원문 보관 기간·예산.", "tenant_admin", False),
     "tenant_overrides": ("역할 오버라이드 조회·설정·해제.", "tenant_admin", False),
     "tenant_jobs": ("자기 테넌트의 작업 목록. 마스킹본만 보인다.", "tenant_admin", False),
+    "tenant_accounts": (
+        "자기 테넌트의 사용자(`user`) 계정 목록·생성. 관리자 계정은 플랫폼 소관이라 안 보인다.",
+        "tenant_admin", False,
+    ),
+    "tenant_account_password": ("자기 테넌트 사용자 계정의 비밀번호 재설정. 세션이 전부 끊긴다.", "tenant_admin", False),
+    "tenant_account_disable": ("자기 테넌트 사용자 계정의 정지·해제.", "tenant_admin", False),
     "ui_index": (
         "관제 UI 첫 화면. `app.js` 참조에 버전을 박아 내보낸다 — "
         "정적으로 내보내면 업그레이드 후 브라우저가 캐시한 옛 JS 를 새 API 에 대고 돈다.",
@@ -203,6 +214,12 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "platform_notifications": ("알림 채널 현황과 테스트 발송.", "platform_admin", False),
     "metrics": ("Prometheus/OpenMetrics 노출. 테넌트 이름은 라벨에 없다.", "platform_admin", False),
     "ui": ("관제 UI 정적 자산.", "public", False),
+    "client_page": (
+        "클라이언트 페이지 첫 화면 — 사람이 역할별 요청·대화·기록을 쓰는 면. 서빙 규칙은 `ui_index` 와 같다.",
+        "public", False,
+    ),
+    "client_page_slash": ("클라이언트 페이지 첫 화면(슬래시 포함). `client_page` 와 같다.", "public", False),
+    "client_static": ("클라이언트 페이지 정적 자산.", "public", False),
 }
 
 
@@ -499,6 +516,20 @@ def openapi_document(
                     "responses": {"200": {"description": "벡터"}, **errors},
                 }
             },
+            f"/{API_VERSION}/jobs": {
+                "get": {
+                    "operationId": "listMyJobs",
+                    "summary": ROUTE_SUMMARIES["jobs_list"][0],
+                    "parameters": [
+                        {"name": "end_user", "in": "query", "required": False,
+                         "schema": {"type": "string"},
+                         "description": "서비스 토큰은 필수. 계정 세션은 무시된다(아이디가 곧 end_user)."},
+                        {"name": "limit", "in": "query", "required": False,
+                         "schema": {"type": "integer", "minimum": 1, "maximum": 100}},
+                    ],
+                    "responses": {"200": {"description": "내 작업 목록(마스킹본)"}, **errors},
+                }
+            },
             f"/{API_VERSION}/jobs/{{job_id}}": {
                 "get": {
                     "operationId": "getJob",
@@ -625,6 +656,9 @@ def integration_guide(
         "대기 응답에는 `retry_after` 가 실린다. 큐 위치에 따라 서버가 계산한 값이므로",
         "**그 값을 지켜야 한다** — 고정 간격 폴링은 큐가 길어질수록 컨트롤 플레인을 때린다.",
         "완료 콜백(웹훅)은 제공하지 않는다.",
+        "",
+        f"내 이력은 `GET {base_url}/{API_VERSION}/jobs` 다 — 이 서비스에서 같은 `end_user` 로 낸 작업을",
+        "최근순으로 준다(`?end_user=` 필수, 계정 세션은 자동). 마스킹본과 가드 판정이 실리고 원문은 없다.",
         "",
         "### 재시도할 때는 `Idempotency-Key` 를 보낸다",
         "",
