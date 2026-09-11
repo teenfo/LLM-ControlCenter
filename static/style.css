@@ -318,6 +318,9 @@ form.inline { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, 
 form.inline button { justify-self: start; }
 form.stack { display: flex; flex-direction: column; gap: 12px; }
 form.stack button { align-self: flex-start; }
+/* 체크박스 줄(허용 역할 폼) — 전역 input 은 폭 100% 라 체크박스만 예외 */
+label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+label.check input[type=checkbox] { width: auto; margin: 0; flex: none; }
 pre.reveal, pre.code {
   margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--code); border: 1px solid var(--border);
   font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-all;
