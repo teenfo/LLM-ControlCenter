@@ -49,6 +49,10 @@ ln -sfn audit-export-$(date +%Y%m%d).jsonl /backup/llmcc-audit/latest.jsonl
 재계산을 의심하세요 — 스크립트가 그 비교를 하고 실패 코드로 알리게 두는 것이 `doctor` 의
 팁 대조를 밖에서 한 번 더 하는 셈입니다.
 
+유닛 파일에서는 **값 뒤에 주석을 두지 마세요.** systemd 는 줄 끝 주석을 모르므로
+`Persistent=true   # …` 는 "값을 못 읽어 무시" 가 되어 `Persistent` 가 조용히 꺼집니다 —
+`systemd-analyze verify <unit>` 가 그것을 알려 주고, `systemctl show <timer> -p Persistent` 로 확인합니다.
+
 `doctor` 는 두 가지를 봅니다:
 
 - 체인이 이어지는가 (내부 검증)
