@@ -119,11 +119,39 @@ class AnthropicProvider:
         timeout: float = 120.0,
         max_tokens: int | None = None,
     ) -> GenerationResult:
+        # 이 API 는 원래 턴 배열을 받는다 — 단발 생성은 사용자 턴 하나짜리 대화다.
+        return await self._create(
+            model, [{"role": "user", "content": prompt}], system, options, timeout, max_tokens
+        )
+
+    async def chat(
+        self,
+        *,
+        model: str,
+        messages: Sequence[Mapping[str, str]],
+        system: str | None = None,
+        options: Mapping[str, Any] | None = None,
+        timeout: float = 120.0,
+        max_tokens: int | None = None,
+    ) -> GenerationResult:
+        """채팅 형식. 턴 배열을 그대로 넘기고 `system` 은 별도 필드다(이 API 의 원형)."""
+        turns = [{"role": str(m["role"]), "content": str(m["content"])} for m in messages]
+        return await self._create(model, turns, system, options, timeout, max_tokens)
+
+    async def _create(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        system: str | None,
+        options: Mapping[str, Any] | None,
+        timeout: float,
+        max_tokens: int | None,
+    ) -> GenerationResult:
         opts = dict(options or {})
         payload: dict[str, Any] = {
             "model": model,
             "max_tokens": int(max_tokens or opts.pop("max_tokens", DEFAULT_MAX_TOKENS)),
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
         }
         if system:
             payload["system"] = system

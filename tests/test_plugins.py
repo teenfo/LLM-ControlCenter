@@ -1333,3 +1333,19 @@ def test_the_admin_list_shows_the_subscription_and_the_backlog(
     client.post("/v1/plugin/events", json={"ack": cursor}, headers=auth(result.token))
     [row] = client.get("/v1/platform/plugins", headers=auth(acme["platform_admin"])).json()["plugins"]
     assert row["events_pending"] == 0 and row["last_event_at"] is not None
+
+
+def test_a_plugin_owned_service_is_not_editable_by_hand(harness, client, signing_key, platform_tenant):
+    """플러그인 서비스의 정본은 매니페스트다 — 콘솔·API 로 고치면 다음 설치·갱신과 어긋난다(409)."""
+    from app.auth import ROLE_TENANT_ADMIN, issue_token
+
+    result = do_install(harness, bundle(key=signing_key))
+    _, admin = issue_token(harness.store, platform_tenant, result.service_id, role=ROLE_TENANT_ADMIN)
+
+    response = client.put(
+        f"/v1/admin/services/{result.service_id}", json={"allow_roles": ["*"]},
+        headers={"Authorization": f"Bearer {admin}"},
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "plugin_managed"
+    assert json.loads(harness.store.get_service(platform_tenant, result.service_id)["allow_roles_json"]) == ["summarize"]

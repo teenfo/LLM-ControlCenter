@@ -535,11 +535,45 @@ class Guard:
         candidate_boundaries: Iterable[str] = (INTERNAL, EXTERNAL),
         allow_classifier: bool = True,
     ) -> GuardResult:
-        """프롬프트를 검사하고 경계별 마스킹본과 허용 경계를 돌려준다."""
+        """프롬프트를 검사하고 경계별 마스킹본과 허용 경계를 돌려준다.
+
+        `inspect_many` 의 텍스트 하나짜리 특수형이다 — 경로가 둘이면 규칙이 한쪽에만 붙는다.
+        """
+        results = await self.inspect_many(
+            [prompt], system=system, locales=locales, tenant_rules=tenant_rules,
+            candidate_boundaries=candidate_boundaries, allow_classifier=allow_classifier,
+        )
+        return results[0]
+
+    async def inspect_many(
+        self,
+        texts: Sequence[str],
+        *,
+        system: str | None = None,
+        locales: Iterable[str] = (),
+        tenant_rules: Sequence[GuardRule] = (),
+        candidate_boundaries: Iterable[str] = (INTERNAL, EXTERNAL),
+        allow_classifier: bool = True,
+    ) -> list[GuardResult]:
+        """텍스트 여러 개를 **각각** 검사하되 2단 분류는 **한 번만** 돈다.
+
+        1단(패턴)은 텍스트마다 따로 돈다 — 스팬이 그 텍스트 안의 위치라, 이어 붙였다가는
+        마스킹 뒤에 되쪼갤 수 없다(임베딩 경로가 먼저 겪은 일). 2단(LLM)은 맥락 판정이라
+        1단 마스킹본을 이어 붙여 한 번 묻는다 — 턴이 20개인 대화에 추론을 20번 돌리면
+        가드가 요청보다 비싸진다. LLM 탐지는 스팬이 없어 어느 텍스트에 붙여도 마스킹은
+        같고, 사건은 한 번만 남아야 하므로 첫 결과에만 붙인다. `system` 은 하나뿐이라
+        첫 텍스트와 함께 본다.
+        """
+        texts = list(texts)
+        if not texts:
+            return []
         rules = self.rules_for(locales, tenant_rules)
         boundaries = frozenset(candidate_boundaries)
 
-        pattern_hits = await self._run_stage1(prompt, system, rules)
+        pattern_hits = [
+            await self._run_stage1(text, system if index == 0 else None, rules)
+            for index, text in enumerate(texts)
+        ]
 
         context_rules = [r for r in rules if r.is_llm]
         classifier_failed = False
@@ -551,53 +585,61 @@ class Guard:
                 if self._classifier is None:
                     raise RuntimeError("분류기가 없다")
                 # 1단 마스킹본을 넘긴다 — 분류기에도 원문을 주지 않는다.
-                pre_masked = _apply(prompt, pattern_hits, INTERNAL)
+                pre_masked = "\n\n".join(
+                    _apply(text, hits, INTERNAL) for text, hits in zip(texts, pattern_hits)
+                )
                 llm_hits = await self._classifier(pre_masked, context_rules)
             except Exception:
                 classifier_failed = True
 
-        detections = list(pattern_hits)
-        for rule in context_rules:
-            if rule.id in llm_hits:
-                detections.append(
-                    Detection(
-                        rule_id=rule.id, stage=STAGE_LLM,
-                        actions={b: rule.action_for_boundary(b) for b in boundaries},
-                        label=rule.label,
-                    )
-                )
+        llm_detections = [
+            Detection(
+                rule_id=rule.id, stage=STAGE_LLM,
+                actions={b: rule.action_for_boundary(b) for b in boundaries},
+                label=rule.label,
+            )
+            for rule in context_rules
+            if rule.id in llm_hits
+        ]
 
         # 분류 실패는 판정이 아니다 — 정책을 타되 그 사건을 별도로 집계한다.
         if classifier_failed:
             boundaries = self._apply_classifier_failure(boundaries)
 
-        allowed = {
-            boundary
-            for boundary in boundaries
-            if not any(d.actions.get(boundary) == "block" for d in detections)
-        }
-        blocked_rules = tuple(
-            sorted(
-                {
-                    d.rule_id
-                    for d in detections
-                    if any(a == "block" for a in d.actions.values())
-                }
+        results: list[GuardResult] = []
+        for index, (text, hits) in enumerate(zip(texts, pattern_hits)):
+            detections = list(hits) + (llm_detections if index == 0 else [])
+            allowed = {
+                boundary
+                for boundary in boundaries
+                if not any(d.actions.get(boundary) == "block" for d in detections)
+            }
+            blocked_rules = tuple(
+                sorted(
+                    {
+                        d.rule_id
+                        for d in detections
+                        if any(a == "block" for a in d.actions.values())
+                    }
+                )
             )
-        )
-
-        return GuardResult(
-            allowed_boundaries=frozenset(allowed),
-            prompts={b: _apply(prompt, detections, b) for b in (INTERNAL, EXTERNAL)},
-            systems={
-                b: (_apply(system, detections, b, field="system_spans") if system else None)
-                for b in (INTERNAL, EXTERNAL)
-            },
-            detections=tuple(detections),
-            blocked_rules=blocked_rules,
-            classifier_attempted=classifier_attempted,
-            classifier_failed=classifier_failed,
-        )
+            own_system = system if index == 0 else None
+            results.append(GuardResult(
+                allowed_boundaries=frozenset(allowed),
+                prompts={b: _apply(text, detections, b) for b in (INTERNAL, EXTERNAL)},
+                systems={
+                    b: (
+                        _apply(own_system, detections, b, field="system_spans")
+                        if own_system else None
+                    )
+                    for b in (INTERNAL, EXTERNAL)
+                },
+                detections=tuple(detections),
+                blocked_rules=blocked_rules,
+                classifier_attempted=classifier_attempted,
+                classifier_failed=classifier_failed,
+            ))
+        return results
 
     async def inspect_output(
         self,

@@ -586,6 +586,29 @@ async def generate(request: Request) -> Response:
     return _submission_response(request, submission)
 
 
+async def chat(request: Request) -> Response:
+    """대화 요청. 본문이 `prompt` 가 아니라 `messages` 인 것 말고는 `generate` 와 같은 계약이다."""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    body = await _body(request)
+
+    submission = await ctx.pipeline.chat(
+        principal,
+        role=str(_need(body, "role")),
+        messages=_need(body, "messages"),
+        system=body.get("system"),
+        end_user=body.get("end_user"),
+        priority=_int(body.get("priority"), "priority", minimum=-100, maximum=100),
+        metadata=body.get("metadata") or {},
+        wait=(
+            None if body.get("wait") is None
+            else _float(body.get("wait"), "wait", minimum=0.0, maximum=MAX_WAIT_SECONDS)
+        ),
+        idempotency_key=_idempotency_key(request),
+    )
+    return _submission_response(request, submission)
+
+
 async def embed(request: Request) -> Response:
     ctx: AppContext = request.app.state.ctx
     principal = _principal(request)
@@ -917,31 +940,51 @@ def _tenant_admin(request: Request) -> tuple[AppContext, Principal, TenantScope]
     return ctx, principal, principal.scope()
 
 
-async def tenant_services(request: Request) -> Response:
-    ctx, principal, scope = _tenant_admin(request)
-    if request.method == "GET":
-        return _ok(request, {"services": [
-            {
-                "id": row["id"], "name": row["name"], "status": row["status"],
-                "allow_roles": json.loads(row["allow_roles_json"]),
-                "rate_limit_per_min": row["rate_limit_per_min"],
-                "budget_usd_per_month": row["budget_usd_per_month"],
-                "require_end_user": bool(row["require_end_user"]),
-                "end_user_rate_limit": row["end_user_rate_limit"],
-                "created_at": row["created_at"],
-            }
-            for row in ctx.store.list_services(scope)
-        ]})
+def _service_view(row: Any) -> dict[str, Any]:
+    """서비스 행의 응답 모양 — 목록·생성 직후·갱신 직후가 같은 모양이어야 콘솔이 한 렌더러를 쓴다."""
+    return {
+        "id": row["id"], "name": row["name"], "status": row["status"],
+        "allow_roles": json.loads(row["allow_roles_json"]),
+        "rate_limit_per_min": row["rate_limit_per_min"],
+        "budget_usd_per_month": row["budget_usd_per_month"],
+        "require_end_user": bool(row["require_end_user"]),
+        "end_user_rate_limit": row["end_user_rate_limit"],
+        "created_at": row["created_at"],
+    }
 
-    body = await _body(request)
-    allow = list(body.get("allow_roles") or ["*"])
+
+def _validate_allow_roles(ctx: AppContext, allow: Any) -> list[str]:
+    """`allow_roles` 는 문자열 목록이고 `*` 또는 실재하는 **공개** 역할 이름만 담는다.
+
+    모르는 역할과 내부 역할이 같은 404 인 것은 의도다 — 내부 역할의 존재를 흘리지 않는다.
+    내부 역할을 소비자 토큰에 붙일 수 있으면 분류 경로가 열린다.
+    """
+    if not isinstance(allow, list) or not all(isinstance(r, str) for r in allow):
+        raise ApiError("invalid_field", status=400, params={"field": "allow_roles"})
     unknown = [r for r in allow if r != "*" and r not in ctx.config.roles]
     if unknown:
         raise ApiError("unknown_role", status=404, params={"role": ", ".join(unknown)})
     hidden = [r for r in allow if r != "*" and not is_public_role(r)]
     if hidden:
-        # 내부 역할은 소비자 토큰에 붙일 수 없다. 붙일 수 있으면 분류 경로가 열린다.
         raise ApiError("unknown_role", status=404, params={"role": ", ".join(hidden)})
+    return allow
+
+
+async def tenant_services(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    if request.method == "GET":
+        # 역할 카탈로그를 같이 준다 — 콘솔의 allow_roles 폼이 고를 이름이다. `/v1/roles` 는 호출
+        # 토큰 자기 서비스 기준이라 플랫폼 `console` 서비스(allow_roles=[])로는 비어 있다.
+        return _ok(request, {
+            "services": [_service_view(row) for row in ctx.store.list_services(scope)],
+            "roles": [
+                {"name": name, "kind": ctx.config.roles[name].kind}
+                for name in meta_mod.visible_roles(ctx.config, ["*"])
+            ],
+        })
+
+    body = await _body(request)
+    allow = _validate_allow_roles(ctx, list(body.get("allow_roles") or ["*"]))
 
     service_id = str(_need(body, "id"))
     if ctx.store.get_service(scope, service_id) is not None:
@@ -965,6 +1008,73 @@ async def tenant_services(request: Request) -> Response:
         target=service_id, detail={"allow_roles": allow},
     )
     return _ok(request, {"id": service_id}, status=201)
+
+
+#: PUT /v1/admin/services/{id} 가 받는 필드. `status` 는 없다 — 그 스위치는 플러그인 토글의 것이다.
+_SERVICE_EDITABLE = (
+    "name", "allow_roles", "rate_limit_per_min", "end_user_rate_limit",
+    "budget_usd_per_month", "require_end_user",
+)
+
+
+async def tenant_service_update(request: Request) -> Response:
+    """서비스 정책 갱신. **적용은 다음 요청부터다** — 캐시가 없어서 무효화할 것도 없다.
+
+    없는 키는 그대로 두고 `null` 은 한도를 해제한다. 숫자는 잘라내지 않고 거절한다(`_int` 는
+    최소값으로 잘라 주므로 그 뒤에 한 번 더 본다). 플러그인이 만든 서비스는 매니페스트가
+    정본이라 여기서 고칠 수 없다 — 고치면 다음 설치·갱신에서 어긋난다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    service_id = request.path_params["service_id"]
+    row = ctx.store.get_service(scope, service_id)
+    if row is None:
+        raise ApiError("not_found", status=404)
+    owner = ctx.store.plugin_id_for_service(scope, service_id)
+    if owner is not None:
+        raise ApiError("plugin_managed", status=409, params={"id": service_id, "plugin": owner})
+
+    body = await _body(request)
+    changes: dict[str, Any] = {}
+    if "name" in body:
+        name = body["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ApiError("invalid_field", status=400, params={"field": "name"})
+        changes["name"] = name.strip()
+    if "allow_roles" in body:
+        changes["allow_roles"] = _validate_allow_roles(ctx, body["allow_roles"])
+    for field_name in ("rate_limit_per_min", "end_user_rate_limit"):
+        if field_name in body:
+            if body[field_name] is None:
+                changes[field_name] = None
+            else:
+                raw_limit = body[field_name]
+                if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit < 1:
+                    # `_int` 는 최소값으로 잘라 준다 — 0 이나 음수를 1 로 바꿔 저장하면 "한도 없음" 을
+                    # 뜻한 요청이 "분당 1회" 가 된다. 자르지 않고 거절한다.
+                    raise ApiError("invalid_field", status=400, params={"field": field_name})
+                changes[field_name] = _int(raw_limit, field_name, minimum=1)
+    if "budget_usd_per_month" in body:
+        raw_budget = body["budget_usd_per_month"]
+        if raw_budget is None:
+            changes["budget_usd_per_month"] = None
+        else:
+            if isinstance(raw_budget, bool) or not isinstance(raw_budget, (int, float)) or raw_budget < 0:
+                # 문자열·불·음수는 거절한다 — `_float` 는 음수를 0 으로 잘라 "예산 없음" 을 "예산 0" 으로 바꾼다.
+                raise ApiError("invalid_field", status=400, params={"field": "budget_usd_per_month"})
+            changes["budget_usd_per_month"] = _float(raw_budget, "budget_usd_per_month", minimum=0.0)
+    if "require_end_user" in body:
+        if not isinstance(body["require_end_user"], bool):
+            raise ApiError("invalid_field", status=400, params={"field": "require_end_user"})
+        changes["require_end_user"] = body["require_end_user"]
+    if not changes:
+        raise ApiError("missing_field", status=400, params={"field": "fields"})
+
+    ctx.store.update_service(scope, service_id, **changes)
+    ctx.store.audit(
+        principal.token_id, "update_service", tenant_id=scope.tenant_id, target=service_id,
+        detail={"fields": sorted(changes), **({"allow_roles": changes["allow_roles"]} if "allow_roles" in changes else {})},
+    )
+    return _ok(request, _service_view(ctx.store.get_service(scope, service_id)))
 
 
 async def tenant_tokens(request: Request) -> Response:
@@ -1266,7 +1376,7 @@ async def tenant_jobs(request: Request) -> Response:
     return _ok(request, {"jobs": [
         {
             "id": j.id, "service_id": j.service_id, "end_user_hash": j.end_user_hash,
-            "role": j.role, "lane": j.lane, "status": j.status, "node": j.node,
+            "role": j.role, "kind": j.kind, "lane": j.lane, "status": j.status, "node": j.node,
             "model": j.model, "tier": j.tier, "attempts": j.attempts,
             # **"왜 이 모델로 갔는가" 에 답한다.** 관리자 표면에만 나간다 —
             # 소비자 계약(`/v1/generate`·`/v1/meta`)은 라우팅을 모른다(I5).
@@ -2222,6 +2332,7 @@ def _routes(ctx: AppContext) -> list[Any]:
         Route(f"{v}/client/{{name}}", client_file, name="client_file"),
         # 소비자
         Route(f"{v}/generate", generate, methods=["POST"], name="generate"),
+        Route(f"{v}/chat", chat, methods=["POST"], name="chat"),
         Route(f"{v}/embed", embed, methods=["POST"], name="embed"),
         Route(f"{v}/jobs", jobs_list, name="jobs_list"),
         Route(f"{v}/jobs/{{job_id}}", job_get, name="job_get"),
@@ -2230,6 +2341,8 @@ def _routes(ctx: AppContext) -> list[Any]:
         Route(f"{v}/status", status, name="status"),
         # 테넌트 관리
         Route(f"{v}/admin/services", tenant_services, methods=["GET", "POST"], name="tenant_services"),
+        Route(f"{v}/admin/services/{{service_id}}", tenant_service_update, methods=["PUT"],
+              name="tenant_service_update"),
         Route(f"{v}/admin/tokens", tenant_tokens, methods=["GET", "POST"], name="tenant_tokens"),
         Route(f"{v}/admin/tokens/{{token_id}}/rotate", tenant_token_rotate,
               methods=["POST"], name="tenant_token_rotate"),

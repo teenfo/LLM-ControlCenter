@@ -82,6 +82,11 @@ def make_config(**overrides) -> Config:
                 name="vec", model="embed-m", kind="embed", lane="batch",
                 placement=("internal",),
             ),
+            "talk": Role(
+                name="talk", model="m", kind="chat", lane="interactive",
+                placement=("internal", "external"), tier_models={"external": "cm"},
+                system="간결하게 답한다", max_prompt_chars=overrides.pop("chat_chars", 2_000),
+            ),
             "_guard_classify": Role(
                 name="_guard_classify", model="guard-m", lane="guard",
                 placement=("internal",), internal_only=True,

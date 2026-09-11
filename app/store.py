@@ -1117,6 +1117,44 @@ class SqliteStore:
             )
         return cursor.rowcount > 0
 
+    #: `update_service` 가 받는 필드 → 열. `status` 는 여기 없다 — 그 스위치는 `set_service_status` 하나다.
+    _SERVICE_FIELDS = {
+        "name": "name",
+        "allow_roles": "allow_roles_json",
+        "rate_limit_per_min": "rate_limit_per_min",
+        "end_user_rate_limit": "end_user_rate_limit",
+        "budget_usd_per_month": "budget_usd_per_month",
+        "require_end_user": "require_end_user",
+    }
+
+    def update_service(self, scope: TenantScope, service_id: str, **fields: Any) -> bool:
+        """서비스 정책을 바꾼다 — 허용 역할·한도·예산·이름·엔드유저 필수.
+
+        캐시가 없으므로 **다음 요청부터** 적용된다: `_authorize` 가 요청마다 이 행을 읽고,
+        배치·디스패치도 예산을 이 행에서 다시 읽는다. `None` 은 그 한도를 해제한다.
+        모르는 필드는 조용히 버리지 않고 `StoreError` 다.
+        """
+        unknown = sorted(set(fields) - set(self._SERVICE_FIELDS))
+        if unknown:
+            raise StoreError(f"알 수 없는 서비스 필드: {unknown}")
+        if not fields:
+            return False
+        assignments, values = [], []
+        for key, value in fields.items():
+            if key == "allow_roles":
+                value = _json(list(value))
+            elif key == "require_end_user":
+                value = int(bool(value))
+            assignments.append(f"{self._SERVICE_FIELDS[key]} = ?")
+            values.append(value)
+        where, params = self._scoped_where(scope, "id = ?")
+        params.append(service_id)
+        with self._tx():
+            cursor = self._conn.execute(
+                f"UPDATE services SET {', '.join(assignments)} WHERE {where}", [*values, *params]
+            )
+        return cursor.rowcount > 0
+
     def list_services(self, scope: TenantScope) -> list[sqlite3.Row]:
         where, params = self._scoped_where(scope)
         return list(

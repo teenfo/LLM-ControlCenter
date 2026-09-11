@@ -999,3 +999,52 @@ def test_a_pattern_matching_the_empty_string_is_refused_at_save(harness):
         harness.guard.validate_rule({
             "id": "oops", "kind": "pattern", "action": "full", "pattern": r"\d*",
         })
+
+
+# ── 여러 텍스트 · 2단은 한 번 ────────────────────────────────────────────────
+
+
+async def test_inspect_many_runs_the_classifier_once():
+    """턴 다섯 개에 추론을 다섯 번 돌리면 가드가 요청보다 비싸진다 — 1단은 각각, 2단은 한 번."""
+    calls: list[str] = []
+
+    async def classifier(text, rules):
+        calls.append(text)
+        return {"finance"}
+
+    guard = Guard(make_config((TIERED_RULE,)), classifier=classifier)
+    results = await guard.inspect_many(["a", "b", "c", "d", "e"])
+
+    assert len(calls) == 1
+    assert calls[0] == "a\n\nb\n\nc\n\nd\n\ne", "1단 마스킹본을 이어 붙여 한 번 묻는다"
+    assert len(results) == 5
+    llm_hits = [d for r in results for d in r.detections if d.rule_id == "finance"]
+    assert len(llm_hits) == 1, "LLM 탐지 사건은 한 번만 남는다"
+    assert results[0].allowed_boundaries == {INTERNAL}, "외부 차단 등급은 첫 결과에 실린다"
+    assert all(r.classifier_attempted for r in results)
+
+
+async def test_inspect_many_masks_each_text_by_its_own_spans():
+    """스팬은 그 텍스트 안의 위치다 — 다른 텍스트의 탐지가 새어 들어오면 안 된다."""
+    guard = Guard(make_config((RRN_RULE, PHONE_RULE)))
+    results = await guard.inspect_many(
+        ["번호 990101-1234563", "전화 010-1234-5678", "깨끗한 문장"], locales=["ko_KR"]
+    )
+
+    assert "[주민등록번호]" in results[0].prompt_for(INTERNAL)
+    assert "[휴대폰]" not in results[0].prompt_for(INTERNAL)
+    assert "[휴대폰]" in results[1].prompt_for(INTERNAL)
+    assert results[2].prompt_for(INTERNAL) == "깨끗한 문장"
+    assert results[2].detections == ()
+
+
+async def test_inspect_single_still_matches_the_previous_result():
+    """`inspect` 는 `inspect_many` 의 특수형이다 — 결과가 같아야 한다(system 스팬 포함)."""
+    guard = Guard(make_config((RRN_RULE,)))
+    text, system = "값 990101-1234563 임", "지시 990101-1234563"
+
+    single = await guard.inspect(text, system=system, locales=["ko_KR"])
+    many = (await guard.inspect_many([text], system=system, locales=["ko_KR"]))[0]
+
+    assert single == many
+    assert "[주민등록번호]" in single.system_for(INTERNAL)

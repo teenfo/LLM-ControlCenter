@@ -10,6 +10,8 @@ from __future__ import annotations
 import dataclasses
 
 import httpx
+import json
+
 import pytest
 
 from app.config import Node
@@ -395,3 +397,69 @@ async def test_anthropic_unknown_exception_defaults_to_retryable():
     with pytest.raises(BackendError) as exc:
         await provider.generate(model="m", prompt="p")
     assert exc.value.retryable is True
+
+
+# ── 대화(chat) ───────────────────────────────────────────────────────────────
+
+
+async def test_ollama_chat_posts_messages_with_a_leading_system():
+    """`/api/chat` 로 가고, system 은 선두 턴이며, 본문은 `message.content` 에서 읽는다."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "message": {"role": "assistant", "content": "답"}, "model": "m",
+            "prompt_eval_count": 7, "eval_count": 3, "eval_duration": 10,
+        })
+
+    result = await ollama_with(handler).chat(
+        model="m", messages=[{"role": "user", "content": "안녕"}], system="간결하게",
+        options={"temperature": 0.2},
+    )
+
+    assert seen["path"] == "/api/chat"
+    assert seen["body"]["messages"] == [
+        {"role": "system", "content": "간결하게"}, {"role": "user", "content": "안녕"},
+    ]
+    assert seen["body"]["stream"] is False and seen["body"]["options"]["temperature"] == 0.2
+    assert result.text == "답" and result.input_tokens == 7 and result.output_tokens == 3
+
+
+async def test_ollama_chat_missing_model_becomes_model_not_found():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="model 'x' not found")
+
+    with pytest.raises(ModelNotFound):
+        await ollama_with(handler).chat(model="x", messages=[{"role": "user", "content": "p"}])
+
+
+async def test_mock_chat_is_deterministic_and_logged(mock):
+    turns = [
+        {"role": "user", "content": "안녕"}, {"role": "assistant", "content": "네"},
+        {"role": "user", "content": "질문"},
+    ]
+    first = await mock.chat(model="demo-small", messages=turns, system="s")
+    second = await mock.chat(model="demo-small", messages=turns, system="s")
+
+    assert first.text == second.text and first.text.startswith("[mock:")
+    assert mock.call_log[-1]["op"] == "chat" and mock.call_log[-1]["messages"] == 3
+    other = await mock.chat(model="demo-small", messages=turns[:1], system="s")
+    assert other.text != first.text, "마지막 사용자 턴이 다르면 답도 다르다"
+
+
+async def test_anthropic_chat_forwards_the_transcript_and_system():
+    provider = anthropic_with(FakeResponse("답"))
+    turns = [
+        {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+    ]
+    result = await provider.chat(
+        model="claude-opus-5", messages=turns, system="s", options={"temperature": 0.1}
+    )
+
+    payload = provider._client.messages.last_payload
+    assert payload["messages"] == turns and payload["system"] == "s"
+    assert payload["temperature"] == 0.1
+    assert result.text == "답" and result.input_tokens == 100

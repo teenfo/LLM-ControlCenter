@@ -33,6 +33,8 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
                   "max_prompt_chars": 200000, "has_default_system": True},
     "embed": {"kind": "embed", "lane": "batch", "timeout_seconds": 60,
               "max_prompt_chars": 8000, "has_default_system": False},
+    "chat": {"kind": "chat", "lane": "interactive", "timeout_seconds": 180,
+             "max_prompt_chars": 24000, "has_default_system": True},
 }
 
 #: 목에서 재현하는 가드 규칙. 진짜 규칙의 부분집합이며 **체크섬은 없다** —
@@ -177,6 +179,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/v1/generate":
             self._generate(body)
+        elif path == "/v1/chat":
+            self._chat(body)
         elif path == "/v1/embed":
             self._embed(body)
         else:
@@ -225,8 +229,56 @@ class Handler(BaseHTTPRequestHandler):
                         rules=", ".join(hits))
             return
 
+        self._enqueue(role, prompt, body)
+
+    def _chat(self, body: dict[str, Any]) -> None:
+        """대화 — 턴 배열을 받는다. 진짜 서버와 같은 모양으로 거절하고, 답은 마지막 사용자 턴의 해시다."""
+        role = str(body.get("role") or "")
+        messages = body.get("messages")
+        if not role:
+            self._error(400, "missing_field", "필수 항목이 없습니다: role", field="role")
+            return
+        if messages is None:
+            self._error(400, "missing_field", "필수 항목이 없습니다: messages", field="messages")
+            return
+
+        spec = self.roles.get(role)
+        if spec is None:
+            self._error(404, "unknown_role", f"알 수 없는 역할입니다: {role}", role=role)
+            return
+        if spec["kind"] != "chat":
+            self._error(400, "wrong_kind", f"역할 '{role}'은(는) 이 엔드포인트로 호출할 수 없습니다.",
+                        role=role, kind=spec["kind"])
+            return
+        turns = messages if isinstance(messages, list) else None
+        if not turns:
+            self._error(400, "empty_input", "입력이 비어 있습니다.")
+            return
+        well_formed = all(
+            isinstance(t, dict) and t.get("role") in ("user", "assistant")
+            and isinstance(t.get("content"), str) and t["content"].strip()
+            for t in turns
+        )
+        if not well_formed or turns[0]["role"] != "user" or turns[-1]["role"] != "user":
+            self._error(400, "invalid_field", "항목 'messages'의 값이 올바르지 않습니다.", field="messages")
+            return
+        joined = "\n".join(t["content"] for t in turns)
+        if len(joined) > spec["max_prompt_chars"]:
+            self._error(413, "payload_too_large", "입력이 한도를 초과했습니다.",
+                        size=len(joined), limit=spec["max_prompt_chars"])
+            return
+        hits = [rule for rule, pattern in MOCK_GUARD if pattern.search(joined)]
+        if hits:
+            self._error(422, "guard_blocked",
+                        f"민감 정보가 감지되어 요청이 차단되었습니다 (규칙: {', '.join(hits)}).",
+                        rules=", ".join(hits))
+            return
+        self._enqueue(role, turns[-1]["content"], body)
+
+    def _enqueue(self, role: str, seed: str, body: dict[str, Any]) -> None:
+        """가짜 잡을 만들고 `wait` 만큼 기다렸다가 돌려준다 — generate 와 chat 이 같은 꼬리를 쓴다."""
         job_id = uuid.uuid4().hex[:16]
-        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
         _jobs[job_id] = {
             "job_id": job_id, "role": role, "attempts": 0, "guard_actions": {},
             "status": "pending", "ready_at": time.time() + self.latency,

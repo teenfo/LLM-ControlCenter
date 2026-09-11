@@ -337,14 +337,20 @@ def test_locale_pack_filtering():
 
 
 def test_shipped_config_has_a_chat_role_the_client_page_can_use():
-    """클라이언트 페이지의 대화 탭은 `chat` 역할이 있어야 열린다 — 지시문이 합성 표식을 설명해야 한다."""
+    """클라이언트 페이지의 대화 탭은 `kind: chat` 역할이 있어야 열린다.
+
+    0.4.0 까지는 kind generate 에 평문 표식("사용자:"/"도우미:")을 설명하는 지시문으로
+    대화를 흉내 냈다. 0.5.0 부터 턴 배열이 그대로 가므로 표식 문장이 남아 있으면 모델이
+    없는 표식을 찾는다 — 없어야 한다.
+    """
     from pathlib import Path
 
     from app.config import load_config
 
     config = load_config(Path(__file__).resolve().parents[1] / "config")
     chat = config.roles["chat"]
-    assert chat.kind == "generate"
+    assert chat.kind == "chat" and chat.is_chat
     assert chat.max_prompt_chars
-    assert "사용자:" in (chat.system or "") and "도우미:" in (chat.system or "")
+    assert "사용자:" not in (chat.system or "") and "도우미:" not in (chat.system or "")
+    assert "한국어" in (chat.system or "")
     assert "internal" in chat.placement and "external" not in chat.placement

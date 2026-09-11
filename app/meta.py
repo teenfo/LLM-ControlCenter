@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .config import Config
 from .i18n import Translator
-from .pipeline import DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS, is_public_role
+from .pipeline import DEFAULT_WAIT_SECONDS, MAX_CHAT_MESSAGES, MAX_WAIT_SECONDS, is_public_role
 
 API_VERSION = "v1"
 
@@ -41,6 +41,7 @@ ERROR_CODES: tuple[tuple[str, int, bool], ...] = (
     # 같은 id 로 다시 만들려 했다. PK 충돌이 500 으로 나가면 소비자는
     # "서버가 고장났다" 로 읽고 재시도한다.
     ("already_exists", 409, False),
+    ("plugin_managed", 409, False),
     ("payload_too_large", 413, False),
     ("guard_blocked", 422, False),
     # 측정 없이 규칙을 `block` 으로 켜려 했다. 재시도해도 같으므로 재시도 불가 —
@@ -115,6 +116,7 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "client_file": ("단일 파일 클라이언트 또는 목 서버 원본을 그대로 내려준다.", "consumer", False),
     "generate": ("생성 요청. `wait` 로 동기·비동기를 한 엔드포인트로 흡수한다.", "consumer", True),
     "embed": ("임베딩. 동기지만 가드·배치·경계·비용은 생성과 같은 관문을 지난다.", "consumer", True),
+    "chat": ("대화 요청. 턴 배열(messages)을 역할의 모델에 채팅 형식으로 보낸다 — 가드·배치·비용·멱등성·`wait` 는 생성과 같다.", "consumer", True),
     "job_get": ("작업 조회. 대기 중이면 적응형 `retry_after` 가 함께 온다.", "consumer", True),
     "job_cancel": ("대기 중인 작업 취소. 실행 중인 작업은 취소할 수 없다.", "consumer", True),
     "jobs_list": (
@@ -125,7 +127,8 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "roles": ("이 토큰이 쓸 수 있는 역할과 각 역할의 한도.", "consumer", True),
     "status": ("클러스터 상태 요약 — 레인·큐·노드 헬스.", "consumer", True),
     # 테넌트 관리
-    "tenant_services": ("자기 테넌트의 서비스 목록·생성.", "tenant_admin", False),
+    "tenant_services": ("자기 테넌트의 서비스 목록(역할 카탈로그 포함)·생성.", "tenant_admin", False),
+    "tenant_service_update": ("서비스 정책 갱신 — 허용 역할·한도·예산. 다음 요청부터 적용된다.", "tenant_admin", False),
     "tenant_tokens": ("서비스 토큰 발급·목록. 발급 값은 이때 한 번만 보인다.", "tenant_admin", False),
     "tenant_token_rotate": ("토큰 회전. 유예 기간 동안 구 토큰도 함께 동작한다.", "tenant_admin", False),
     "tenant_token_revoke": ("토큰 폐기.", "tenant_admin", False),
@@ -383,6 +386,7 @@ def openapi_document(
     names = visible_roles(config, allow_roles)
     generate = [n for n in names if config.roles[n].kind == "generate"]
     embed = [n for n in names if config.roles[n].kind == "embed"]
+    chat = [n for n in names if config.roles[n].kind == "chat"]
 
     def role_enum(subset: Sequence[str]) -> dict[str, Any]:
         schema: dict[str, Any] = {"type": "string"}
@@ -458,6 +462,66 @@ def openapi_document(
                                         "system": {
                                             "type": "string",
                                             "description": "프롬프트는 호출자 소유다. 주면 역할 기본값을 대체한다.",
+                                        },
+                                        "end_user": {
+                                            "type": "string",
+                                            "description": "불투명 식별자. 서버가 테넌트 솔트로 해싱한다 — 이메일을 넣지 말 것.",
+                                        },
+                                        "priority": {"type": "integer", "default": 0},
+                                        "wait": {
+                                            "type": "number",
+                                            "default": DEFAULT_WAIT_SECONDS,
+                                            "maximum": MAX_WAIT_SECONDS,
+                                        },
+                                        "metadata": {"type": "object", "additionalProperties": True},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "완료 또는 대기 중",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Submission"}
+                                }
+                            },
+                        },
+                        **errors,
+                    },
+                }
+            },
+            f"/{API_VERSION}/chat": {
+                "post": {
+                    "operationId": "chat",
+                    "summary": ROUTE_SUMMARIES["chat"][0],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["role", "messages"],
+                                    "properties": {
+                                        "role": role_enum(chat),
+                                        "messages": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "maxItems": MAX_CHAT_MESSAGES,
+                                            "description": "대화 기록 전체. 서버는 세션을 기억하지 않는다 — 첫 턴과 마지막 턴은 user.",
+                                            "items": {
+                                                "type": "object",
+                                                "required": ["role", "content"],
+                                                "properties": {
+                                                    "role": {"type": "string", "enum": ["user", "assistant"]},
+                                                    "content": {"type": "string"},
+                                                },
+                                            },
+                                        },
+                                        "system": {
+                                            "type": "string",
+                                            "description": "지시문은 하나다 — 주면 역할 기본값을 대체한다. 메시지 안의 system 턴은 받지 않는다.",
                                         },
                                         "end_user": {
                                             "type": "string",
@@ -646,6 +710,25 @@ def integration_guide(
         '  -H "Content-Type: application/json" \\',
         f"""  -d '{{"role": "{generate}", "prompt": "요약할 내용", "end_user": "u_8f3a91", "wait": 30}}'""",
         "```",
+    ]
+    chat_role = next((n for n in names if config.roles[n].kind == "chat"), None)
+    if chat_role:
+        lines += [
+            "",
+            "### 3-b. 대화 — 턴 배열을 보낸다",
+            "",
+            f"`kind` 가 `chat` 인 역할(`{chat_role}`)은 `POST /{API_VERSION}/chat` 로 부른다. 서버는 대화를",
+            "기억하지 않는다 — **매번 기록 전체**를 `messages` 로 보내고, 첫 턴과 마지막 턴은 `user` 다.",
+            "`system` 은 본문 필드 하나뿐이다(메시지 안의 system 턴은 400). 응답 모양·`wait`·`Idempotency-Key` 는 생성과 같다.",
+            "",
+            "```bash",
+            f"curl -X POST {base_url}/{API_VERSION}/chat \\",
+            '  -H "Authorization: Bearer $TOKEN" \\',
+            '  -H "Content-Type: application/json" \\',
+            f"""  -d '{{"role": "{chat_role}", "messages": [{{"role": "user", "content": "안녕, 오늘 할 일을 정리해 줘"}}], "end_user": "u_8f3a91", "wait": 30}}'""",
+            "```",
+        ]
+    lines += [
         "",
         "## 4. `wait` — 동기와 비동기를 한 엔드포인트로",
         "",
@@ -672,7 +755,8 @@ def integration_guide(
         "",
         "(테넌트, 서비스) 안에서 같은 값이면 **같은 작업**이다 — 서버는 새 잡을 만들지 않고",
         "원래 잡을 그대로 돌려준다. 끝났으면 그 결과가, 아직이면 대기 응답이 온다.",
-        "키는 24시간 뒤 풀린다.",
+        "키는 24시간 뒤 풀린다. 키의 이름공간은 (테넌트, 서비스)이고 엔드포인트와 무관하다 —",
+        "`/v1/generate` 와 `/v1/chat` 에 같은 키를 쓰면 먼저 만든 잡이 돌아온다.",
         "",
         "**주의**: 키가 작업을 식별한다. 같은 키로 *다른* 프롬프트를 보내면 서버는 첫",
         "요청의 잡을 돌려주고 두 번째 프롬프트는 실행되지 않는다 — 요청마다 새 키를 쓰고,",

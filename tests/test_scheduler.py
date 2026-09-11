@@ -17,6 +17,7 @@ from app.config import (
     Role,
     Thresholds,
 )
+from app.pipeline import encode_transcript
 from app.scheduler import Scheduler, _round_robin_by_tenant
 from app.store import SqliteStore, TenantScope
 
@@ -61,6 +62,8 @@ def make_config(**overrides) -> Config:
                            placement=("internal",)),
             "vec": Role(name="vec", model="m", kind="embed", lane="batch",
                         placement=("internal",)),
+            "talk": Role(name="talk", model="m", kind="chat", lane="interactive",
+                         placement=("internal", "external"), tier_models={"external": "cm"}),
         },
         lanes={
             "interactive": Lane("interactive", overrides.pop("lane_concurrency", 2),
@@ -888,3 +891,61 @@ async def test_failure_recording_does_not_overwrite_a_finalized_job(parts, store
     )
 
     assert store.get_job(ACME, job_id).status == "ok", "종결된 잡이 실패로 되돌아갔다"
+
+
+# ── 대화 경로 ────────────────────────────────────────────────────────────────
+
+
+async def test_chat_jobs_call_the_chat_operation(parts, store):
+    """kind 가 chat 인 행은 저장된 턴 배열 JSON 을 풀어 `provider.chat` 으로 간다 — system 포함."""
+    cluster, scheduler = parts
+    transcript = encode_transcript([
+        {"role": "user", "content": "안녕"}, {"role": "assistant", "content": "네"},
+        {"role": "user", "content": "질문"},
+    ])
+    job_id = enqueue(
+        store, ACME, role="talk", kind="chat", prompt=transcript,
+        placement=["internal"], system_masked="간결하게",
+    )
+
+    await drain(scheduler)
+
+    job = store.get_job(ACME, job_id)
+    assert job.status == "ok"
+    assert job.response.startswith("[mock:")
+    call = cluster.provider_for(job.node).call_log[-1]
+    assert call["op"] == "chat" and call["messages"] == 3 and call["system"] is True
+
+
+async def test_chat_sends_the_external_transcript_off_boundary(parts, store):
+    """경계 밖 노드에는 더 세게 가린 JSON 이 나간다 — 저장본이 아니라."""
+    cluster, scheduler = parts
+    internal = encode_transcript([{"role": "user", "content": "내부용 긴 내용 1234567890"}])
+    external = encode_transcript([{"role": "user", "content": "[가림]"}])
+    job_id = enqueue(
+        store, ACME, role="talk", kind="chat", prompt=internal, prompt_external=external,
+        placement=["external"], allowed_boundaries=["internal", "external"],
+    )
+
+    await drain(scheduler)
+
+    job = store.get_job(ACME, job_id)
+    assert job.status == "ok" and job.node == "out"
+    call = cluster.provider_for("out").call_log[-1]
+    assert call["op"] == "chat" and call["chars"] == len("[가림]")
+
+
+async def test_a_corrupt_transcript_fails_without_penalising_the_node(parts, store):
+    """본문이 턴 배열이 아니면 잡만 실패한다 — 노드는 제 잘못이 아니고 예약도 풀린다."""
+    cluster, scheduler = parts
+    job_id = enqueue(
+        store, ACME, role="talk", kind="chat", prompt="이건 JSON 이 아니다", placement=["internal"]
+    )
+
+    await drain(scheduler)
+
+    job = store.get_job(ACME, job_id)
+    assert job.status == "failed" and job.error_code == "invalid_transcript"
+    assert all(state.status == HEALTHY for state in cluster.nodes.values())
+    assert store.reserved_cost(ACME) == 0.0
+    assert cluster.provider_for("in-1").call_log == [] and cluster.provider_for("in-2").call_log == []

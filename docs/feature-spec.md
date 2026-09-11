@@ -1132,7 +1132,7 @@
        `test_client_page.py::test_client_keeps_the_token_in_session_storage_only`
        `test_client_page.py::test_shared_helpers_are_identical_to_the_console`
        `test_client_page.py::test_client_polls_with_the_servers_retry_after`
-       `test_client_page.py::test_chat_markers_do_not_trip_the_shipped_control_token_rule`
+       `test_client_page.py::test_chat_sends_a_message_array_to_the_chat_route`
        `test_client_page.py::test_client_calls_only_routes_that_exist`
        `test_client_page.py::test_history_shows_masked_prompts_only`
        `test_config.py::test_shipped_config_has_a_chat_role_the_client_page_can_use`
@@ -1476,6 +1476,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 |---|---|---|
 | `generate` | `POST /v1/generate` | PIPE-1 PIPE-2 |
 | `embed` | `POST /v1/embed` | PIPE-5 |
+| `chat` | `POST /v1/chat` | PIPE-10 |
 | `logout` | `POST /v1/logout` | AUTH-9 |
 | `session_password` | `POST /v1/session/password` | AUTH-9 |
 | `job_get` | `GET /v1/jobs/{job_id}` | PIPE-4 |
@@ -1494,7 +1495,8 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 
 | 라우트 이름 | 경로 | 기능 |
 |---|---|---|
-| `tenant_services` | `GET/POST /v1/admin/services` | AUTH-1 |
+| `tenant_services` | `GET/POST /v1/admin/services` | AUTH-1 AUTH-11 |
+| `tenant_service_update` | `PUT /v1/admin/services/{service_id}` | AUTH-11 |
 | `tenant_tokens` | `GET/POST /v1/admin/tokens` | AUTH-1 |
 | `tenant_token_rotate` | `POST /v1/admin/tokens/{id}/rotate` | AUTH-2 |
 | `tenant_token_revoke` | `DELETE /v1/admin/tokens/{id}` | AUTH-2 |

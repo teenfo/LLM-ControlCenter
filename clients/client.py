@@ -178,6 +178,35 @@ class ControlCenter:
             body["metadata"] = dict(metadata)
         return Result.from_body(self._request("POST", "/v1/generate", body))
 
+    def chat(
+        self,
+        role: str,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        system: str | None = None,
+        end_user: str | None = None,
+        priority: int = 0,
+        wait: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Result:
+        """대화 요청. 서버는 대화를 기억하지 않는다 — **매번 기록 전체**를 보낸다.
+
+        `messages` 는 `{"role": "user"|"assistant", "content": ...}` 의 목록이고 첫 턴과
+        마지막 턴은 user 다. 응답 모양은 `generate` 와 같아서 `job()`·`run()` 이 그대로 쓰인다.
+        """
+        body: dict[str, Any] = {"role": role, "messages": [dict(m) for m in messages]}
+        if system is not None:
+            body["system"] = system
+        if end_user is not None:
+            body["end_user"] = end_user
+        if priority:
+            body["priority"] = priority
+        if wait is not None:
+            body["wait"] = wait
+        if metadata:
+            body["metadata"] = dict(metadata)
+        return Result.from_body(self._request("POST", "/v1/chat", body))
+
     def embed(
         self, role: str, inputs: str | Sequence[str], *, end_user: str | None = None
     ) -> dict[str, Any]:
@@ -211,8 +240,9 @@ class ControlCenter:
     def run(
         self,
         role: str,
-        prompt: str,
+        prompt: str | None = None,
         *,
+        messages: Sequence[Mapping[str, str]] | None = None,
         deadline: float = 600.0,
         wait: float = 30.0,
         **kwargs: Any,
@@ -221,9 +251,15 @@ class ControlCenter:
 
         `wait` 로 최대한 서버에서 기다리고, 그래도 안 끝나면 **서버가 준
         `retry_after` 를 지켜** 다시 묻는다. 고정 간격으로 폴링하지 않는다.
+        `messages` 를 주면 대화 경로(`chat`)로 간다.
         """
         started = time.monotonic()
-        result = self.generate(role, prompt, wait=wait, **kwargs)
+        if messages is not None:
+            result = self.chat(role, messages, wait=wait, **kwargs)
+        elif prompt is not None:
+            result = self.generate(role, prompt, wait=wait, **kwargs)
+        else:
+            raise ValueError("prompt 나 messages 중 하나는 있어야 한다")
 
         while not result.done:
             if time.monotonic() - started > deadline:

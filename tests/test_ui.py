@@ -663,3 +663,24 @@ def test_the_platform_account_form_offers_the_user_role_with_a_service():
     form = source[source.index("function createAccountForm"):source.index("function initialOf")]
     assert "value: 'user'" in form
     assert "service_id" in form
+
+
+def test_the_job_views_render_chat_transcripts():
+    """kind 가 chat 인 잡의 마스킹본은 턴 배열 JSON 이다 — 표와 드로어가 그것을 턴으로 그린다(원문은 여전히 단건 API)."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    jobs = source[source.index("function transcriptOf"):source.index("async function viewRaw")]
+    assert "JSON.parse(j.prompt_masked)" in jobs and "j.kind !== 'chat'" in jobs
+    assert "transcriptView(" in jobs and "ui.turn_user" in jobs
+    assert "lastUserText(j)" in jobs
+
+
+def test_the_connections_view_can_edit_and_add_a_service():
+    """서비스 정책은 콘솔에서 고친다 — 편집 버튼과 추가 버튼이 같은 드로어 폼을 열고, 편집은 PUT 이다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    connections = source[source.index("async function renderConnections"):source.index("function issueTokenForm")]
+    assert "openServiceForm(s, roleCatalog)" in connections and "openServiceForm(null, roleCatalog)" in connections
+    assert "data.services.roles" in connections, "역할 카탈로그는 서비스 목록 응답에서 온다"
+    form = source[source.index("function serviceForm"):source.index("function revealOnce")]
+    assert "'/v1/admin/services/'" in form and "method: 'PUT'" in form
+    assert "'/v1/admin/services'" in form and "method: 'POST'" in form
+    assert "allow_roles" in form and "require_end_user" in form and "openDrawer(" in form

@@ -17,6 +17,8 @@ from app.pipeline import (
     Pipeline,
     _classification_prompt,
     _parse_classification,
+    decode_transcript,
+    encode_transcript,
     is_public_role,
 )
 from app.store import TenantScope
@@ -573,3 +575,137 @@ async def test_the_poll_interval_backs_off(harness, client, acme):
     assert len(intervals) > 3
     assert intervals[-1] > intervals[0], "간격이 안 늘어난다"
     assert max(intervals) <= MAX_POLL_INTERVAL
+
+
+# ── 대화 경로 ────────────────────────────────────────────────────────────────
+
+
+def _turns(*texts):
+    """user/assistant 가 번갈아 나오는 턴 배열 — 홀수 개면 마지막이 user 다."""
+    roles = ("user", "assistant")
+    return [{"role": roles[i % 2], "content": text} for i, text in enumerate(texts)]
+
+
+async def test_chat_masks_each_message_independently(harness, acme_principal):
+    """턴마다 1단이 따로 돈다 — 두 번째 턴의 이메일만 가려지고 나머지 턴은 글자 그대로다."""
+    result = await harness.pipeline.chat(
+        acme_principal, role="talk",
+        messages=_turns("첫 질문", "hong@example.com 으로 답장했습니다", "고마워요"), wait=0,
+    )
+    job = harness.store.get_job(TenantScope("acme"), result.job_id)
+    turns = decode_transcript(job.prompt_masked)
+    assert [t["role"] for t in turns] == ["user", "assistant", "user"]
+    assert turns[0]["content"] == "첫 질문" and turns[2]["content"] == "고마워요"
+    assert "hong@example.com" not in turns[1]["content"]
+    assert result.guard_actions == {"email": "partial"}
+
+
+async def test_chat_stores_a_json_transcript_and_seals_the_raw_one(harness, acme_principal):
+    """저장본은 마스킹된 턴을 다시 조립한 JSON 이고, 원문 JSON 은 암호문으로만 남는다."""
+    messages = _turns("메일 hong@example.com 확인")
+    result = await harness.pipeline.chat(acme_principal, role="talk", messages=messages, wait=0)
+
+    job = harness.store.get_job(TenantScope("acme"), result.job_id)
+    assert job.kind == "chat"
+    assert decode_transcript(job.prompt_masked) is not None
+    assert "hong@example.com" not in job.prompt_masked
+    assert job.prompt_cipher is not None
+    assert encode_transcript(messages) != job.prompt_masked
+
+
+async def test_chat_blocks_when_any_turn_is_blocked(harness, acme_principal):
+    """오래된 assistant 턴에 든 주민번호도 차단이다 — 잡 행이 생기지 않는다."""
+    with pytest.raises(ApiError) as exc:
+        await harness.pipeline.chat(
+            acme_principal, role="talk",
+            messages=_turns("내 번호 알려줘", f"기록상 {VALID_RRN} 입니다", "고마워"), wait=0,
+        )
+    assert exc.value.code == "guard_blocked"
+    assert harness.store._conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 0
+
+
+async def test_chat_rejects_a_generate_role_and_generate_rejects_a_chat_role(
+    harness, acme_principal
+):
+    with pytest.raises(ApiError) as exc:
+        await harness.pipeline.chat(
+            acme_principal, role="summarize", messages=_turns("안녕"), wait=0
+        )
+    assert exc.value.code == "wrong_kind" and exc.value.params["kind"] == "generate"
+
+    with pytest.raises(ApiError) as exc:
+        await harness.pipeline.submit(acme_principal, role="talk", prompt="안녕", wait=0)
+    assert exc.value.code == "wrong_kind" and exc.value.params["kind"] == "chat"
+
+
+@pytest.mark.parametrize("messages, code", [
+    ([], "empty_input"),
+    ("문자열", "invalid_field"),
+    ([{"role": "system", "content": "지시"}, {"role": "user", "content": "안녕"}], "invalid_field"),
+    ([{"role": "user", "content": "안녕"}, {"role": "assistant", "content": "네"}], "invalid_field"),
+    ([{"role": "assistant", "content": "먼저"}, {"role": "user", "content": "안녕"}], "invalid_field"),
+    ([{"role": "user", "content": "   "}], "invalid_field"),
+    ([{"role": "user", "content": "x"}] * 201, "invalid_field"),
+])
+async def test_chat_enforces_shape_and_count(harness, acme_principal, messages, code):
+    """메시지 안의 system · 마지막이 assistant · 첫 턴이 assistant · 빈 내용 · 201턴 — 전부 400."""
+    with pytest.raises(ApiError) as exc:
+        await harness.pipeline.chat(acme_principal, role="talk", messages=messages, wait=0)
+    assert exc.value.code == code
+
+
+async def test_chat_size_is_the_sum_of_contents(harness, acme_principal):
+    """길이는 턴 내용의 합이다 — 한 턴씩은 한도 아래여도 합이 넘으면 413."""
+    limit = harness.config.roles["talk"].max_prompt_chars
+    big = "가" * (limit // 2 + 10)
+    with pytest.raises(ApiError) as exc:
+        await harness.pipeline.chat(
+            acme_principal, role="talk", messages=_turns(big, big, "끝"), wait=0
+        )
+    assert exc.value.code == "payload_too_large"
+    assert exc.value.params["limit"] == limit
+
+
+async def test_chat_routes_on_the_last_user_turn(harness, acme_principal):
+    """라우터가 보는 것은 마지막 사용자 턴의 마스킹본이다 — 전체 기록이 아니다."""
+    from app.config import Role
+    from tests.test_routing import routing
+
+    harness.config.roles["talk"] = Role(
+        **{**harness.config.roles["talk"].__dict__, "routing": routing(simple="m", complex="m")}
+    )
+    seen: list[str] = []
+
+    async def spy(role, masked_text):
+        seen.append(masked_text)
+        return None
+
+    harness.pipeline._router = spy
+    await harness.pipeline.chat(
+        acme_principal, role="talk",
+        messages=_turns("처음 hong@example.com", "네", "마지막 질문"), wait=0,
+    )
+    assert seen == ["마지막 질문"]
+
+
+async def test_chat_applies_the_role_default_system_when_none_is_given(harness, acme_principal):
+    """지시문은 하나다 — 본문에 없으면 역할 기본값이, 있으면 그것이 노드까지 간다."""
+    default = await harness.pipeline.chat(
+        acme_principal, role="talk", messages=_turns("안녕"), wait=0
+    )
+    assert harness.store.get_job(TenantScope("acme"), default.job_id).system_masked == "간결하게 답한다"
+
+    override = await harness.pipeline.chat(
+        acme_principal, role="talk", messages=_turns("안녕"), system="영어로 답한다", wait=0
+    )
+    assert harness.store.get_job(TenantScope("acme"), override.job_id).system_masked == "영어로 답한다"
+
+
+async def test_a_chat_idempotency_key_returns_the_same_job(harness, acme_principal):
+    first = await harness.pipeline.chat(
+        acme_principal, role="talk", messages=_turns("안녕"), wait=0, idempotency_key="k-1"
+    )
+    again = await harness.pipeline.chat(
+        acme_principal, role="talk", messages=_turns("다른 내용"), wait=0, idempotency_key="k-1"
+    )
+    assert again.job_id == first.job_id

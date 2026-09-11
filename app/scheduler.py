@@ -32,7 +32,7 @@ from typing import Any, Callable, Mapping, Sequence
 import logging
 
 from .cluster import FAIL, PLACED, WAIT, Cluster, Placement
-from .pipeline import GUARD_ROLE
+from .pipeline import GUARD_ROLE, decode_transcript
 from .completion import CompletionSignal
 from .config import EXTERNAL, INTERNAL, Config, Role
 from .cost import CostAccountant
@@ -459,10 +459,30 @@ class Scheduler:
                 )
                 return
 
-            result = await provider.generate(
-                model=placement.model, prompt=prompt, system=system,
-                options=job.options, timeout=job.timeout_s,
-            )
+            if job.kind == "chat":
+                # **행의 형식이 판단 기준이다** — 실시간 역할이 아니라. 저장된 본문이 턴 배열
+                # JSON 이면 채팅 호출이고, 아니면 잡 자체가 깨진 것이다.
+                turns = decode_transcript(prompt)
+                if turns is None:
+                    # 노드 잘못이 아니다 — `_handle_failure` 로 보내면 `record_failure` 가
+                    # 건강한 노드를 벌준다(QA R-LOW3). finalize 실패와 같은 방식으로 종결한다.
+                    self._store.update_job(
+                        scope, job_id, expect_status="running",
+                        status="failed", error="저장된 대화 본문을 읽을 수 없다",
+                        error_code="invalid_transcript", finished_at=self._now(),
+                    )
+                    self._accountant.release_reservation(scope, job_id)
+                    self._completion.done(job_id)
+                    return
+                result = await provider.chat(
+                    model=placement.model, messages=turns, system=system,
+                    options=job.options, timeout=job.timeout_s,
+                )
+            else:
+                result = await provider.generate(
+                    model=placement.model, prompt=prompt, system=system,
+                    options=job.options, timeout=job.timeout_s,
+                )
             # **추론이 성공한 뒤부터는 컨트롤 플레인이다.** 출력 가드·정산의
             # 예외를 아래 except 로 흘리면 `record_failure` 가 건강한 노드를
             # 벌점 주고 헬스가 뒤집힌다(QA R-LOW3) — 노드는 제 일을 다 했다.

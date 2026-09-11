@@ -239,7 +239,7 @@ def _placement_probe(parts) -> Callable[[], Any]:
 
     counter = itertools.count()
     role = next(
-        (r for r in parts.config.roles.values() if r.kind != "embed"),
+        (r for r in parts.config.roles.values() if r.kind == "generate"),
         next(iter(parts.config.roles.values())),
     )
 

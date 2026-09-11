@@ -26,7 +26,7 @@ INTERNAL = "internal"
 EXTERNAL = "external"
 BOUNDARIES = (INTERNAL, EXTERNAL)
 
-KINDS = ("generate", "embed")
+KINDS = ("generate", "embed", "chat")
 
 MAX_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_PROMPT_CHARS = 200_000
@@ -46,7 +46,8 @@ OVERRIDABLE_ROLE_FIELDS = frozenset(
 )
 
 #: 덮어쓸 수 **없는** 역할 필드.
-#:   kind   — embed 로 바꾸면 그 역할이 큐를 우회하는 동기 경로로 넘어간다.
+#:   kind   — embed 로 바꾸면 그 역할이 큐를 우회하는 동기 경로로 넘어가고,
+#:            chat 으로 바꾸면 본문 형식(턴 배열)과 프로바이더 호출이 달라진다.
 #:   system — "프롬프트는 호출자 소유" 계약과 충돌한다.
 #:   internal_only — 안전장치를 설정으로 풀 수 있으면 안전장치가 아니다.
 FROZEN_ROLE_FIELDS = frozenset({"kind", "system", "internal_only", "name"})
@@ -161,6 +162,11 @@ class Role:
     @property
     def is_embed(self) -> bool:
         return self.kind == "embed"
+
+    @property
+    def is_chat(self) -> bool:
+        """턴 배열을 받아 채팅 형식으로 부르는 역할. 본문이 `prompt` 가 아니라 `messages` 다."""
+        return self.kind == "chat"
 
 
 @dataclass(frozen=True)

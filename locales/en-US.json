@@ -340,7 +340,7 @@
   "client.err_too_long": "The text exceeds the role's character limit. Shorten it.",
   "client.err_retry_later": "No node can take this right now. Try again in a moment.",
   "client.too_long": "This is longer than can be sent at once.",
-  "client.chat_empty": "Start a conversation. Earlier turns are sent along with each request.",
+  "client.chat_empty": "Start a conversation. Earlier turns are sent with every request — the server keeps no session.",
   "client.chat_placeholder": "Type a message and press Enter (Shift+Enter for a new line)",
   "client.chat_new": "New chat",
   "client.chat_trimmed": "The oldest {n} turn(s) were left out to fit the length limit.",
@@ -374,5 +374,17 @@
   "client.password_changed": "Password changed. Sessions on other devices were signed out.",
   "ui.user_accounts": "User accounts",
   "ui.user_hint": "Users sign in at the client page (/client/). They get the allowed roles, limits and budget of the chosen service.",
-  "ui.service": "Service"
+  "ui.service": "Service",
+  "ui.turn_user": "User",
+  "ui.turn_assistant": "Assistant",
+  "client.turn_user": "User",
+  "client.turn_assistant": "Assistant",
+  "error.plugin_managed": "Service '{id}' is managed by plugin '{plugin}'. Its manifest is the source of truth, so it cannot be edited here.",
+  "ui.edit": "Edit",
+  "ui.add_service": "Add service",
+  "ui.allow_roles": "Allowed roles",
+  "ui.all_roles": "All roles (*)",
+  "ui.require_end_user": "Require end user",
+  "ui.end_user_rate_limit": "End-user limit / min",
+  "ui.limit_blank_hint": "Leave a limit or budget blank for no limit. Allowed roles apply from the next request."
 }

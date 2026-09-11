@@ -113,9 +113,45 @@ class OllamaProvider:
             payload["options"]["num_predict"] = int(max_tokens)
 
         data = await self._post("/api/generate", payload, timeout)
+        return self._generation(data, model, data.get("response", ""))
 
+    async def chat(
+        self,
+        *,
+        model: str,
+        messages: Sequence[Mapping[str, str]],
+        system: str | None = None,
+        options: Mapping[str, Any] | None = None,
+        timeout: float = 120.0,
+        max_tokens: int | None = None,
+    ) -> GenerationResult:
+        """`/api/chat` — 모델의 채팅 템플릿을 Ollama 가 적용한다.
+
+        `system` 은 선두 system 턴으로 넣는다(`/api/generate` 의 `system` 필드와 같은 자리).
+        응답 본문은 `message.content` 에 오고, 토큰·소요 시간 필드 이름은 `/api/generate` 와 같다.
+        """
+        turns: list[dict[str, str]] = []
+        if system:
+            turns.append({"role": "system", "content": system})
+        turns.extend({"role": str(m["role"]), "content": str(m["content"])} for m in messages)
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": turns,
+            "stream": False,
+            "keep_alive": DEFAULT_KEEP_ALIVE,
+            "options": dict(options or {}),
+        }
+        if max_tokens:
+            payload["options"]["num_predict"] = int(max_tokens)
+
+        data = await self._post("/api/chat", payload, timeout)
+        message = data.get("message") or {}
+        return self._generation(data, model, str(message.get("content", "")))
+
+    @staticmethod
+    def _generation(data: Mapping[str, Any], model: str, text: str) -> GenerationResult:
         return GenerationResult(
-            text=data.get("response", ""),
+            text=text,
             model=data.get("model", model),
             input_tokens=int(data.get("prompt_eval_count", 0)),
             output_tokens=int(data.get("eval_count", 0)),

@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pytest
 
-from app.config import load_config
 from app.main import VERSION, asset_version
 from tests.test_ui import strip_comments
 
@@ -221,23 +220,39 @@ def test_client_polls_with_the_servers_retry_after():
     assert "Idempotency-Key" in code
 
 
-def test_chat_markers_do_not_trip_the_shipped_control_token_rule():
-    """대화 합성 표식이 베이스라인 가드에 걸리면 매 턴이 마스킹돼 대화가 망가진다."""
-    code = (CLIENT / "client.js").read_text(encoding="utf-8")
+def test_chat_sends_a_message_array_to_the_chat_route():
+    """대화는 서버의 대화 API 로 간다 — 이력을 표식으로 이어 붙이는 합성은 0.4.0 에서 끝났다."""
+    code = strip_comments((CLIENT / "client.js").read_text(encoding="utf-8"))
+    send = block(code, "async function sendChat(input, role, limit) {")
+    assert "'/v1/chat'" in send and "messages:" in send
+    assert "prompt:" not in send, "대화 요청에 prompt 를 섞어 보내면 서버가 wrong_kind 로 거절한다"
+    assert "USER_MARK" not in code and "ASSISTANT_MARK" not in code and "composePrompt" not in code
     assert "<|im_start|>" not in code and "[INST]" not in code
-    user = re.search(r"const USER_MARK = '([^']+)'", code).group(1)
-    assistant = re.search(r"const ASSISTANT_MARK = '([^']+)'", code).group(1)
-    transcript = f"{user}안녕\n{assistant}안녕하세요\n{user}오늘 일정 요약해 줘\n{assistant.strip()}"
-    config = load_config(ROOT / "config")
-    rule = next(r for r in config.guard_rules if r.id == "injection_control_token")
-    assert not re.search(rule.pattern, transcript), "표식이 제어 토큰 규칙에 걸린다"
 
 
 def test_chat_trims_to_the_role_limit():
+    """오래된 턴부터 버려 max_prompt_chars 에 맞춘다 — 남는 기록의 첫 턴은 user 다(서버 계약)."""
     code = (CLIENT / "client.js").read_text(encoding="utf-8")
-    compose = block(code, "function composePrompt(turns, limit) {")
-    assert "dropped" in compose and "limit" in compose
+    trim = block(code, "function trimMessages(turns, limit) {")
+    assert "dropped" in trim and "limit" in trim
+    assert "kept[0].role !== 'user'" in trim
     assert "max_prompt_chars" in code
+
+
+def test_the_chat_tab_is_keyed_on_role_kind():
+    """설치처가 역할 이름을 바꿔도 탭은 남는다 — 이름이 아니라 kind 로 고른다."""
+    code = (CLIENT / "client.js").read_text(encoding="utf-8")
+    assert "r.kind === 'chat'" in block(code, "function chatRole() {")
+    assert "r.kind !== 'chat'" in block(code, "function askRoles() {")
+    assert "CHAT_ROLE" not in code
+
+
+def test_history_renders_chat_transcripts_only_from_the_masked_copy():
+    """대화 잡의 턴은 서버가 저장한 마스킹본 JSON 을 푼 것이다 — 파싱 대상은 prompt_masked 뿐이다."""
+    code = strip_comments((CLIENT / "client.js").read_text(encoding="utf-8"))
+    helper = block(code, "function transcriptOf(j) {")
+    assert "JSON.parse(j.prompt_masked)" in helper and "j.kind !== 'chat'" in helper
+    assert "client.turn_user" in code and "client.turn_assistant" in code
 
 
 def test_client_reads_files_in_the_browser_only():

@@ -241,3 +241,7 @@ form.stack button { align-self: flex-start; }
   .bubble { max-width: 94%; }
   #toast, #error { bottom: 76px; }
 }
+
+/* 기록 상세의 대화 — 마스킹본 JSON 을 턴으로 보여 준다 */
+.chat-log.static { max-height: 46vh; overflow: auto; padding: 12px; }
+.bubble .who { font-size: 11px; line-height: 1.3; opacity: .72; margin-bottom: 3px; }

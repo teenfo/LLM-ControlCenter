@@ -1181,6 +1181,29 @@ const JOB_FILTERS = [
   { id: 'guard', label: 'ui.filter_guard', match: (j) => j.status === 'blocked' || String(j.error_code || '').startsWith('guard') },
 ];
 
+/** chat 잡의 마스킹본은 턴 배열 JSON 이다 — 파싱되면 턴 목록, 아니면 null(원문을 그대로 보여 준다). */
+function transcriptOf(j) {
+  if (j.kind !== 'chat' || !j.prompt_masked) return null;
+  try {
+    const turns = JSON.parse(j.prompt_masked).messages;
+    return Array.isArray(turns) ? turns.filter((m) => m && typeof m.content === 'string') : null;
+  } catch (_) { return null; }
+}
+
+function lastUserText(j) {
+  const turns = transcriptOf(j);
+  if (!turns) return j.prompt_masked || '';
+  const last = turns.slice().reverse().find((m) => m.role === 'user');
+  return last ? last.content : '';
+}
+
+function transcriptView(turns) {
+  return el('div', { class: 'transcript' }, turns.map((m) => el('div', { class: 'turn ' + (m.role === 'user' ? 'user' : 'assistant') }, [
+    el('div', { class: 'who', text: t(m.role === 'user' ? 'ui.turn_user' : 'ui.turn_assistant') }),
+    el('pre', { class: 'code', text: m.content }),
+  ])));
+}
+
 async function renderJobs() {
   const data = await api('/v1/admin/jobs?limit=100');
   renderBanners();
@@ -1215,7 +1238,9 @@ async function renderJobs() {
             // 어느 쪽이든 기본 모델로 갔고, 실패율은 메트릭이 답한다.
             j.route && !j.route.startsWith('_') ? el('div', { class: 'sub', text: '← ' + j.route }) : null,
           ]),
-          el('span', { class: 'mono muted', text: (j.prompt_masked || '').slice(0, 60) }),
+          transcriptOf(j)
+            ? el('div', { class: 'row' }, [pill('chat', 'info'), el('span', { class: 'mono muted', text: lastUserText(j).slice(0, 60) })])
+            : el('span', { class: 'mono muted', text: (j.prompt_masked || '').slice(0, 60) }),
           money(j.cost_usd),
           el('span', { class: 'muted nowrap', text: when(j.created_at) }),
           el('div', { class: 'row end' }, [
@@ -1243,7 +1268,8 @@ function openJob(j) {
       j.error_code ? [t('ui.error_code'), el('div', { class: 'mono', text: j.error_code }), true] : null,
       j.route && !j.route.startsWith('_') ? ['route', el('div', { class: 'mono', text: j.route }), true] : null,
     ]),
-    el('div', {}, [el('label', { text: t('ui.prompt') + ' · ' + t('ui.masked_only') }), el('pre', { class: 'code', text: j.prompt_masked || '' })]),
+    el('div', {}, [el('label', { text: t('ui.prompt') + ' · ' + t('ui.masked_only') }),
+      transcriptOf(j) ? transcriptView(transcriptOf(j)) : el('pre', { class: 'code', text: j.prompt_masked || '' })]),
     j.response ? el('div', {}, [el('label', { text: t('ui.response') }), el('pre', { class: 'code', text: j.response })]) : null,
   ];
   const foot = [
@@ -1499,18 +1525,26 @@ async function renderConnections() {
   renderBanners();
 
   const services = (data.services && data.services.services) || [];
+  // 역할 카탈로그 — 허용 역할 폼의 선택지. 같은 응답에 실려 온다(/v1/roles 는 자기 서비스 기준이라 못 쓴다).
+  const roleCatalog = (data.services && data.services.roles) || [];
   const tokens = (data.tokens && data.tokens.tokens) || [];
 
   return [
     card(t('ui.services'), [table(
-      [t('ui.services'), t('ui.role'), t('ui.rate_limit'), t('ui.budget'), t('ui.end_users'), t('ui.status')],
+      [t('ui.services'), t('ui.role'), t('ui.rate_limit'), t('ui.budget'), t('ui.end_users'), t('ui.status'), ''],
       services.map((s) => [
         el('span', { class: 'mono', text: s.id, style: 'font-weight:500' }), s.allow_roles.join(', '),
         s.rate_limit_per_min ? s.rate_limit_per_min + '/min' : '—',
         s.budget_usd_per_month ? money(s.budget_usd_per_month) : '—',
         s.require_end_user ? badge('required', 'internal') : '—',
         badge(s.status, s.status === 'active' ? 'healthy' : 'unhealthy'),
-      ]))], null, el('span', { text: t('ui.count', { n: services.length }) })),
+        el('div', { class: 'row end' }, [
+          el('button', { type: 'button', class: 'sm', text: t('ui.edit'), onclick: () => openServiceForm(s, roleCatalog) }),
+        ]),
+      ]))], null, [
+      el('span', { text: t('ui.count', { n: services.length }) }),
+      el('button', { type: 'button', class: 'primary sm', text: t('ui.add_service'), onclick: () => openServiceForm(null, roleCatalog) }),
+    ]),
 
     card(t('ui.tokens'), [
       // **원값도 해시도 나가지 않는다.** 접두사만으로 어느 토큰인지 식별한다.
@@ -1553,6 +1587,83 @@ function issueTokenForm(services) {
     el('div', {}, [el('label', { for: 'token-role', text: t('ui.role') }), role]),
     el('button', { class: 'primary', type: 'submit', text: t('ui.issue_token') }),
   ]);
+}
+
+/** 서비스 정책 폼 — 편집(PUT)과 생성(POST)이 한 폼이다. 드로어 안이라 자동 갱신이 지우지 못한다.
+ *  허용 역할은 카탈로그에서 고른다(`*` 는 전부). 한도·예산 빈칸은 "없음"(null) 이다 — 서버는 다음 요청부터 적용한다. */
+function serviceForm(existing, roleCatalog) {
+  const editing = !!existing;
+  const id = el('input', { id: 'service-id', type: 'text', autocomplete: 'off', spellcheck: 'false', value: editing ? existing.id : '' });
+  if (editing) id.disabled = true;
+  const name = el('input', { id: 'service-name', type: 'text', autocomplete: 'off', value: editing ? (existing.name || '') : '' });
+  let allowAll = !editing || existing.allow_roles.includes('*');
+  const picked = new Set(editing ? existing.allow_roles.filter((r) => r !== '*') : []);
+  const boxes = el('div', { class: 'stack', id: 'service-roles' }, roleCatalog.map((r) => {
+    const box = el('input', { type: 'checkbox', id: 'service-role-' + r.name, value: r.name });
+    box.checked = picked.has(r.name);
+    box.disabled = allowAll;
+    box.addEventListener('change', () => { if (box.checked) picked.add(r.name); else picked.delete(r.name); });
+    return el('label', { for: box.id, class: 'check' }, [box, ' ', el('span', { class: 'mono', text: r.name }), ' ', pill(r.kind, '')]);
+  }));
+  const modeHost = el('div', {});
+  const drawMode = () => {
+    modeHost.replaceChildren(segment([
+      { id: 'all', label: t('ui.all_roles') }, { id: 'some', label: t('ui.allow_roles') },
+    ], allowAll ? 'all' : 'some', (mode) => {
+      allowAll = mode === 'all';
+      for (const box of boxes.querySelectorAll('input')) box.disabled = allowAll;
+      drawMode();
+    }));
+  };
+  drawMode();
+  const rate = el('input', { id: 'service-rate', type: 'number', min: '1', step: '1', value: editing && existing.rate_limit_per_min ? String(existing.rate_limit_per_min) : '' });
+  const endUserRate = el('input', { id: 'service-end-user-rate', type: 'number', min: '1', step: '1', value: editing && existing.end_user_rate_limit ? String(existing.end_user_rate_limit) : '' });
+  const budget = el('input', { id: 'service-budget', type: 'number', min: '0', step: '0.01', value: editing && existing.budget_usd_per_month ? String(existing.budget_usd_per_month) : '' });
+  let requireEndUser = editing ? !!existing.require_end_user : false;
+  const switchHost = el('div', {});
+  const drawSwitch = () => {
+    switchHost.replaceChildren(switchControl(requireEndUser, () => { requireEndUser = !requireEndUser; drawSwitch(); }, t('ui.require_end_user')));
+  };
+  drawSwitch();
+  const numberOrNull = (input) => (input.value.trim() === '' ? null : Number(input.value));
+  return el('form', {
+    class: 'stack',
+    onsubmit: async (event) => {
+      event.preventDefault();
+      const policy = {
+        name: name.value.trim() || id.value.trim(),
+        allow_roles: allowAll ? ['*'] : Array.from(picked),
+        rate_limit_per_min: numberOrNull(rate),
+        end_user_rate_limit: numberOrNull(endUserRate),
+        budget_usd_per_month: numberOrNull(budget),
+        require_end_user: requireEndUser,
+      };
+      try {
+        if (editing) {
+          await api('/v1/admin/services/' + encodeURIComponent(existing.id), { method: 'PUT', body: policy });
+        } else {
+          await api('/v1/admin/services', { method: 'POST', body: Object.assign({ id: id.value.trim() }, policy) });
+        }
+        toast(t('ui.saved'));
+        closeDrawer();
+        refresh();
+      } catch (err) { showError(err); }
+    },
+  }, [
+    el('div', {}, [el('label', { for: 'service-id', text: t('ui.service') }), id]),
+    el('div', {}, [el('label', { for: 'service-name', text: t('ui.name') }), name]),
+    el('div', {}, [el('label', { text: t('ui.allow_roles') }), modeHost, boxes]),
+    el('div', {}, [el('label', { for: 'service-rate', text: t('ui.rate_limit') }), rate]),
+    el('div', {}, [el('label', { for: 'service-end-user-rate', text: t('ui.end_user_rate_limit') }), endUserRate]),
+    el('div', {}, [el('label', { for: 'service-budget', text: t('ui.budget') }), budget]),
+    el('div', {}, [el('label', { text: t('ui.require_end_user') }), switchHost]),
+    el('p', { class: 'hint', text: t('ui.limit_blank_hint') }),
+    el('button', { type: 'submit', class: 'primary', text: editing ? t('ui.save') : t('ui.create') }),
+  ]);
+}
+
+function openServiceForm(existing, roleCatalog) {
+  openDrawer(existing ? t('ui.edit') + ' · ' + existing.id : t('ui.add_service'), [serviceForm(existing, roleCatalog)], [drawerClose()]);
 }
 
 /** 발급된 토큰을 한 번만 보여준다. 드로어는 갱신이 안 건드리므로 닫기 전까지 남는다. */

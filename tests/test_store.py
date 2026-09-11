@@ -159,7 +159,7 @@ def test_tenant_data_methods_require_scope_first(store):
         "create_job", "get_job", "list_jobs", "filter_actions_for_jobs", "update_job", "record_usage",
         "spend_since", "record_filter_event", "list_filter_events",
         "set_role_override", "get_role_overrides", "clear_role_override",
-        "list_audit", "create_service", "get_service", "list_services",
+        "list_audit", "create_service", "get_service", "list_services", "update_service",
         "create_token", "list_tokens", "revoke_token", "purge_end_user",
     ]
     for name in tenant_scoped:
@@ -1004,3 +1004,28 @@ def test_filter_actions_for_jobs_prefers_the_internal_grade_and_skips_counters(s
     }
     assert store.filter_actions_for_jobs(ACME, []) == {}
     assert store.filter_actions_for_jobs(GLOBEX, ["j1"]) == {}
+
+
+# ── 서비스 정책 갱신 ────────────────────────────────────────────────────────
+
+
+def test_update_service_rejects_unknown_fields(store):
+    """모르는 필드를 조용히 버리면 "저장됨" 이 거짓이 된다 — `status` 도 이 문으로는 안 바뀐다."""
+    from app.store import StoreError
+
+    with pytest.raises(StoreError):
+        store.update_service(ACME, "acme-web", status="inactive")
+    with pytest.raises(StoreError):
+        store.update_service(ACME, "acme-web", tenant_id="globex")
+    assert store.update_service(ACME, "acme-web") is False, "바꿀 것이 없으면 False"
+
+
+def test_update_service_is_scoped(store):
+    """다른 테넌트 스코프로는 행이 안 보인다 — 갱신도 0건이다."""
+    assert store.update_service(GLOBEX, "acme-web", name="훔침") is False
+    assert store.update_service(ACME, "acme-web", allow_roles=["summarize"], rate_limit_per_min=None) is True
+
+    row = store.get_service(ACME, "acme-web")
+    assert row["name"] == "web" and row["allow_roles_json"] == '["summarize"]'
+    assert row["rate_limit_per_min"] is None
+    assert store.get_service(GLOBEX, "globex-web")["allow_roles_json"] != '["summarize"]', "다른 테넌트 행은 그대로"

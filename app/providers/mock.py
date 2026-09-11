@@ -178,6 +178,40 @@ class MockProvider:
             metrics={"mock": True, "node": self.node_name},
         )
 
+    async def chat(
+        self,
+        *,
+        model: str,
+        messages: Sequence[Mapping[str, str]],
+        system: str | None = None,
+        options: Mapping[str, Any] | None = None,
+        timeout: float = 120.0,
+        max_tokens: int | None = None,
+    ) -> GenerationResult:
+        """채팅 형식. 마지막 사용자 턴에 대해 `generate` 와 같은 결정적 답을 만든다."""
+        self._guard()
+        if self.capabilities.requires_model_install and model not in self.installed:
+            raise ModelNotFound(model, self.node_name)
+
+        turns = [dict(m) for m in messages]
+        chars = sum(len(str(m.get("content", ""))) for m in turns)
+        self._log({"op": "chat", "model": model, "messages": len(turns), "chars": chars,
+                   "system": bool(system)})
+        self._loaded = model
+
+        last_user = next(
+            (str(m.get("content", "")) for m in reversed(turns) if m.get("role") == "user"), ""
+        )
+        digest = hashlib.sha256(f"{model}|{system}|{last_user}".encode()).hexdigest()[:12]
+        return GenerationResult(
+            text=self.reply if self.reply is not None
+            else f"[mock:{self.node_name}/{model}] {digest}",
+            model=model,
+            input_tokens=max(1, chars // 4),
+            output_tokens=max(1, len(digest) // 2),
+            metrics={"mock": True, "node": self.node_name, "turns": len(turns)},
+        )
+
     async def embed(
         self, *, model: str, inputs: Sequence[str], timeout: float = 60.0
     ) -> EmbeddingResult:

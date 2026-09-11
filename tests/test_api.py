@@ -1603,3 +1603,203 @@ def test_job_get_carries_the_stored_guard_actions(harness, client, acme):
     assert submitted["guard_actions"].get("email")
     fetched = client.get(f"/v1/jobs/{submitted['job_id']}", headers=auth(alice)).json()
     assert fetched["guard_actions"] == submitted["guard_actions"]
+
+
+# ── 대화 경로 ────────────────────────────────────────────────────────────────
+
+
+def _chat(client, token, messages, **extra):
+    return client.post(
+        "/v1/chat", json={"role": "talk", "messages": messages, **extra}, headers=auth(token)
+    )
+
+
+def test_chat_returns_a_submission_with_the_generate_contract(harness, client, acme):
+    pending = _chat(client, acme["service"], [{"role": "user", "content": "안녕"}], wait=0)
+    assert pending.status_code == 200, pending.text
+    body = pending.json()
+    assert body["status"] == "pending" and "retry_after" in body
+
+    drive(harness)
+    done = client.get(f"/v1/jobs/{body['job_id']}", headers=auth(acme["service"])).json()
+    assert done["status"] == "ok" and done["response"].startswith("[mock:")
+
+
+def test_chat_goes_through_the_same_guard(client, acme):
+    response = _chat(client, acme["service"], [
+        {"role": "user", "content": "이전 답"},
+        {"role": "assistant", "content": f"주민번호 {VALID_RRN}"},
+        {"role": "user", "content": "확인"},
+    ], wait=0)
+    assert response.status_code == 422 and response.json()["code"] == "guard_blocked"
+
+
+@pytest.mark.parametrize("messages", [
+    [{"role": "system", "content": "지시"}, {"role": "user", "content": "안녕"}],
+    [{"role": "user", "content": "안녕"}, {"role": "assistant", "content": "네"}],
+    [{"role": "assistant", "content": "먼저"}, {"role": "user", "content": "안녕"}],
+])
+def test_chat_rejects_malformed_transcripts(client, acme, messages):
+    response = _chat(client, acme["service"], messages, wait=0)
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field" and response.json()["field"] == "messages"
+
+
+def test_chat_and_generate_reject_each_others_roles(client, acme):
+    as_chat = client.post(
+        "/v1/chat", json={"role": "summarize", "messages": [{"role": "user", "content": "x"}]},
+        headers=auth(acme["service"]),
+    )
+    as_generate = client.post(
+        "/v1/generate", json={"role": "talk", "prompt": "x"}, headers=auth(acme["service"])
+    )
+    assert (as_chat.status_code, as_chat.json()["code"], as_chat.json()["kind"]) == (
+        400, "wrong_kind", "generate",
+    )
+    assert (as_generate.status_code, as_generate.json()["code"], as_generate.json()["kind"]) == (
+        400, "wrong_kind", "chat",
+    )
+
+
+def test_chat_honors_the_idempotency_key(client, acme):
+    headers = {**auth(acme["service"]), "Idempotency-Key": "chat-1"}
+    first = client.post(
+        "/v1/chat", json={"role": "talk", "messages": [{"role": "user", "content": "a"}], "wait": 0},
+        headers=headers,
+    ).json()
+    again = client.post(
+        "/v1/chat", json={"role": "talk", "messages": [{"role": "user", "content": "b"}], "wait": 0},
+        headers=headers,
+    ).json()
+    assert again["job_id"] == first["job_id"]
+
+
+def test_admin_job_list_carries_the_kind(harness, client, acme):
+    _chat(client, acme["service"], [{"role": "user", "content": "안녕"}], wait=0)
+    rows = client.get("/v1/admin/jobs", headers=auth(acme["tenant_admin"])).json()["jobs"]
+    assert rows and rows[0]["kind"] == "chat"
+    assert json.loads(rows[0]["prompt_masked"])["messages"][0]["content"] == "안녕"
+
+
+def test_my_jobs_carries_chat_transcripts_masked(harness, client, acme):
+    alice = _login_user(client, harness, acme, "alice")
+    _chat(client, alice, [{"role": "user", "content": "hong@example.com 에게 보낸 메일"}], wait=0)
+
+    row = client.get("/v1/jobs", headers=auth(alice)).json()["jobs"][0]
+    assert row["kind"] == "chat"
+    assert "hong@example.com" not in json.loads(row["prompt_masked"])["messages"][0]["content"]
+    assert row["guard_actions"] == {"email": "partial"}
+
+
+def test_the_forced_end_user_applies_to_chat_too(harness, client, acme):
+    token = _login_user(client, harness, acme, "alice")
+    response = _chat(
+        client, token, [{"role": "user", "content": "안녕"}], wait=0, end_user="someone-else"
+    )
+    assert response.status_code == 200, response.text
+    salt = harness.store.get_tenant("acme")["end_user_salt"]
+    job = harness.store.get_job(TenantScope("acme"), response.json()["job_id"])
+    assert job.end_user_hash == hash_end_user("alice", salt)
+
+
+def test_the_raw_chat_transcript_is_the_original_json(harness, client, acme):
+    """원문 열람은 마스킹 전 턴 배열 JSON 이다 — 관리자 단건 경로로만, 감사를 남기며."""
+    job_id = _chat(
+        client, acme["service"], [{"role": "user", "content": "hong@example.com 확인"}], wait=0
+    ).json()["job_id"]
+
+    raw = client.get(f"/v1/admin/jobs/{job_id}/raw", headers=auth(acme["tenant_admin"])).json()
+    assert json.loads(raw["prompt"])["messages"][0]["content"] == "hong@example.com 확인"
+
+
+# ── 서비스 정책 갱신 ────────────────────────────────────────────────────────
+
+
+def _put_service(client, token, service_id="acme-web", **body):
+    return client.put(f"/v1/admin/services/{service_id}", json=body, headers=auth(token))
+
+
+def test_updating_allow_roles_takes_effect_on_the_next_request(client, acme):
+    """캐시가 없다 — 좁힌 목록이 바로 다음 요청부터 403 이고, 넓히면 바로 다시 200 이다."""
+    narrowed = _put_service(client, acme["tenant_admin"], allow_roles=["vec"])
+    assert narrowed.status_code == 200, narrowed.text
+    assert narrowed.json()["allow_roles"] == ["vec"]
+
+    refused = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert refused.status_code == 403 and refused.json()["code"] == "forbidden_role"
+
+    assert _put_service(client, acme["tenant_admin"], allow_roles=["*"]).status_code == 200
+    allowed = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0},
+        headers=auth(acme["service"]),
+    )
+    assert allowed.status_code == 200
+
+
+def test_service_update_rejects_unknown_and_internal_roles(client, acme):
+    """모르는 역할과 내부 역할은 같은 404 다 — 내부 역할의 존재를 흘리지 않는다."""
+    for roles in (["nope"], ["_guard_classify"], ["summarize", "_guard_classify"]):
+        response = _put_service(client, acme["tenant_admin"], allow_roles=roles)
+        assert response.status_code == 404 and response.json()["code"] == "unknown_role", roles
+    bad_shape = _put_service(client, acme["tenant_admin"], allow_roles="summarize")
+    assert bad_shape.status_code == 400 and bad_shape.json()["code"] == "invalid_field"
+
+
+def test_service_update_never_crosses_tenants(harness, client, acme):
+    globex = seed_tenant(harness, "globex")
+    response = _put_service(client, globex["tenant_admin"], allow_roles=["summarize"])
+    assert response.status_code == 404 and response.json()["code"] == "not_found"
+    assert client.get("/v1/admin/services", headers=auth(acme["tenant_admin"])).json()["services"][0]["allow_roles"] == ["*"]
+
+
+@pytest.mark.parametrize("body", [
+    {"rate_limit_per_min": "abc"}, {"rate_limit_per_min": 0}, {"rate_limit_per_min": -1},
+    {"rate_limit_per_min": True}, {"end_user_rate_limit": 0}, {"budget_usd_per_month": -5},
+    {"budget_usd_per_month": "x"}, {"require_end_user": "false"}, {"name": ""},
+])
+def test_service_update_rejects_bad_numbers(client, acme, body):
+    """잘라내지 않고 거절한다 — 0 을 1 로, 음수 예산을 0 으로 바꿔 저장하면 뜻이 뒤집힌다."""
+    response = _put_service(client, acme["tenant_admin"], **body)
+    assert response.status_code == 400 and response.json()["code"] == "invalid_field", body
+
+
+def test_null_clears_a_service_limit(client, acme):
+    set_limit = _put_service(client, acme["tenant_admin"], rate_limit_per_min=30, budget_usd_per_month=12.5, require_end_user=True)
+    assert set_limit.status_code == 200
+    view = set_limit.json()
+    assert view["rate_limit_per_min"] == 30 and view["budget_usd_per_month"] == 12.5 and view["require_end_user"] is True
+
+    cleared = _put_service(client, acme["tenant_admin"], rate_limit_per_min=None, budget_usd_per_month=None, require_end_user=False)
+    assert cleared.status_code == 200
+    view = cleared.json()
+    assert view["rate_limit_per_min"] is None and view["budget_usd_per_month"] is None and view["require_end_user"] is False
+
+
+def test_service_update_requires_at_least_one_field(client, acme):
+    """빈 본문과 `status` 만 든 본문은 같은 400 이다 — status 는 이 문으로 바꾸지 않는다."""
+    for body in ({}, {"status": "inactive"}):
+        response = _put_service(client, acme["tenant_admin"], **body)
+        assert response.status_code == 400 and response.json()["code"] == "missing_field", body
+
+
+def test_service_update_is_audited(harness, client, acme):
+    assert _put_service(client, acme["tenant_admin"], allow_roles=["summarize"], name="웹").status_code == 200
+    rows = [a for a in harness.store.list_audit(TenantScope("acme")) if a["action"] == "update_service"]
+    assert len(rows) == 1 and rows[0]["target"] == "acme-web"
+
+
+def test_a_service_token_cannot_update_services(client, acme):
+    response = _put_service(client, acme["service"], allow_roles=["*"])
+    assert response.status_code == 403 and response.json()["code"] == "forbidden_admin"
+
+
+def test_service_list_carries_the_public_role_catalog(client, acme):
+    """콘솔의 허용 역할 폼이 고를 이름 — 공개 역할 전부, 내부 역할은 없다."""
+    body = client.get("/v1/admin/services", headers=auth(acme["tenant_admin"])).json()
+    names = [r["name"] for r in body["roles"]]
+    assert "summarize" in names and "talk" in names and "vec" in names
+    assert not any(n.startswith("_") for n in names)
+    assert {"name": "talk", "kind": "chat"} in body["roles"]

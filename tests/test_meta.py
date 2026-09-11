@@ -185,3 +185,29 @@ def test_client_file_refuses_path_traversal(harness, client, acme, tmp_path):
     assert client.get("/v1/client/client.py", headers=auth(acme["service"])).text == "ok\n"
     escaped = client.get("/v1/client/..%2F..%2Fetc%2Fpasswd", headers=auth(acme["service"]))
     assert escaped.status_code == 404
+
+
+# ── 대화 경로의 계약 ────────────────────────────────────────────────────────
+
+
+def test_openapi_chat_role_enum_lists_only_chat_roles(harness, client, acme):
+    doc = client.get("/v1/openapi.json", headers=auth(acme["service"])).json()
+    props = doc["paths"]["/v1/chat"]["post"]["requestBody"]["content"]["application/json"][
+        "schema"
+    ]["properties"]
+    assert props["role"]["enum"] == ["talk"]
+    assert props["messages"]["items"]["properties"]["role"]["enum"] == ["user", "assistant"]
+
+    generate = doc["paths"]["/v1/generate"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]["properties"]["role"]["enum"]
+    assert "talk" not in generate
+
+
+def test_integration_guide_shows_chat_only_when_a_chat_role_is_visible(harness, client, acme):
+    everything = client.get("/v1/integration", headers=auth(acme["service"])).text
+    assert "3-b. 대화" in everything and "`talk`" in everything
+
+    limited = seed_tenant(harness, "globex", allow_roles=["summarize"])
+    narrow = client.get("/v1/integration", headers=auth(limited["service"])).text
+    assert "3-b. 대화" not in narrow

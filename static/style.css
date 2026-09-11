@@ -372,3 +372,7 @@ pre.reveal { border-color: var(--accent); }
   .grid.wide, .grid.cards { grid-template-columns: minmax(0, 1fr); }
   .usage-row { grid-template-columns: 90px 1fr 60px; }
 }
+
+/* 작업 드로어의 대화 잡 — 턴 단위 */
+.transcript { display: grid; gap: 8px; }
+.transcript .who { font-size: 11px; line-height: 1.3; opacity: .72; margin-bottom: 2px; }

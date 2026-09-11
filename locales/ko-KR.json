@@ -340,7 +340,7 @@
   "client.err_too_long": "내용이 역할의 최대 글자 수를 넘습니다. 줄여서 보내세요.",
   "client.err_retry_later": "지금 처리할 노드가 없습니다. 잠시 뒤 다시 시도하세요.",
   "client.too_long": "한 번에 보낼 수 있는 길이를 넘습니다.",
-  "client.chat_empty": "대화를 시작하세요. 이전 턴은 다음 요청에 함께 보내집니다.",
+  "client.chat_empty": "대화를 시작하세요. 이전 턴은 매 요청에 함께 보내집니다 — 서버는 대화를 기억하지 않습니다.",
   "client.chat_placeholder": "메시지를 입력하고 Enter (줄바꿈은 Shift+Enter)",
   "client.chat_new": "새 대화",
   "client.chat_trimmed": "길이 한도 때문에 오래된 {n}턴은 보내지 않았습니다.",
@@ -374,5 +374,17 @@
   "client.password_changed": "비밀번호를 바꿨습니다. 다른 기기의 세션은 끊겼습니다.",
   "ui.user_accounts": "사용자 계정",
   "ui.user_hint": "사용자는 클라이언트 페이지(/client/)로 로그인합니다. 고른 서비스의 허용 역할·한도·예산을 받습니다.",
-  "ui.service": "서비스"
+  "ui.service": "서비스",
+  "ui.turn_user": "사용자",
+  "ui.turn_assistant": "도우미",
+  "client.turn_user": "사용자",
+  "client.turn_assistant": "도우미",
+  "error.plugin_managed": "서비스 '{id}' 은(는) 플러그인 '{plugin}' 이 관리합니다. 매니페스트가 정본이라 여기서 바꿀 수 없습니다.",
+  "ui.edit": "편집",
+  "ui.add_service": "서비스 추가",
+  "ui.allow_roles": "허용 역할",
+  "ui.all_roles": "모든 역할 (*)",
+  "ui.require_end_user": "엔드유저 필수",
+  "ui.end_user_rate_limit": "엔드유저 한도/분",
+  "ui.limit_blank_hint": "한도·예산을 비우면 제한 없음입니다. 허용 역할은 다음 요청부터 바로 적용됩니다."
 }

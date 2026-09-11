@@ -100,6 +100,19 @@ class Provider(Protocol):
         max_tokens: int | None = None,
     ) -> GenerationResult: ...
 
+    async def chat(
+        self,
+        *,
+        model: str,
+        messages: Sequence[Mapping[str, str]],
+        system: str | None = None,
+        options: Mapping[str, Any] | None = None,
+        timeout: float = 120.0,
+        max_tokens: int | None = None,
+    ) -> GenerationResult:
+        """턴 배열(`{role, content}`)을 채팅 형식으로 보낸다. 결과 모양은 `generate` 와 같다."""
+        ...
+
     async def embed(
         self, *, model: str, inputs: Sequence[str], timeout: float = 60.0
     ) -> EmbeddingResult: ...

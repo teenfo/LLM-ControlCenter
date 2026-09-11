@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import secrets
 import sqlite3
@@ -47,6 +48,12 @@ POLL_INTERVAL = 0.05
 POLL_BACKOFF = 1.6
 #: 그래도 이 이상 벌어지지는 않는다 — 완료 후 응답까지의 지연 상한이다.
 MAX_POLL_INTERVAL = 0.5
+
+#: 대화 한 번에 받는 턴 수 상한. 길이 상한(`max_prompt_chars`)과 별개로 개수도 막는다 —
+#: 한 글자짜리 턴 만 개는 길이 검사를 지나지만 가드 1단을 만 번 돌린다.
+MAX_CHAT_MESSAGES = 200
+#: 대화 턴의 역할. `system` 은 여기 없다 — 지시문은 본문 `system` 또는 역할 기본값 하나다.
+CHAT_TURN_ROLES = ("user", "assistant")
 
 #: 2단 분류를 수행하는 역할. `internal_only` 이므로 경계 밖으로 나갈 수 없다.
 GUARD_ROLE = "_guard_classify"
@@ -105,6 +112,66 @@ class Submission:
     @property
     def pending(self) -> bool:
         return self.status == "pending"
+
+
+def encode_transcript(messages: Sequence[Mapping[str, str]]) -> str:
+    """턴 배열을 저장·전송용 문자열 하나로. **마스킹 뒤에** 부른다 — 조립된 JSON 안의
+    내용은 이미 마스킹본이라 JSON 구조가 마스킹으로 깨질 일이 없다.
+
+    최상위가 객체인 이유는 나중에 필드를 더할 자리다. `ensure_ascii=False` 는 이 저장소의
+    규칙이고, 구분자를 고정하는 이유는 같은 턴이 같은 바이트여야 `prompt_hash` 가 안정되기
+    때문이다.
+    """
+    return json.dumps(
+        {"messages": [{"role": m["role"], "content": m["content"]} for m in messages]},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+
+
+def decode_transcript(text: str | None) -> list[dict[str, str]] | None:
+    """`encode_transcript` 의 역. 모양이 아니면 `None` — 호출자가 실패로 종결한다."""
+    try:
+        data = json.loads(text or "")
+    except (TypeError, ValueError):
+        return None
+    turns = data.get("messages") if isinstance(data, dict) else None
+    if not isinstance(turns, list) or not turns:
+        return None
+    out: list[dict[str, str]] = []
+    for turn in turns:
+        if (
+            not isinstance(turn, dict)
+            or turn.get("role") not in CHAT_TURN_ROLES
+            or not isinstance(turn.get("content"), str)
+        ):
+            return None
+        out.append({"role": turn["role"], "content": turn["content"]})
+    return out
+
+
+def _validate_messages(messages: Any) -> list[dict[str, str]]:
+    """턴 배열의 모양. 틀리면 400 — 조용히 고쳐서 보내지 않는다."""
+    if not isinstance(messages, list):
+        raise ApiError("invalid_field", status=400, params={"field": "messages"})
+    if not messages:
+        raise ApiError("empty_input", status=400)
+    if len(messages) > MAX_CHAT_MESSAGES:
+        raise ApiError("invalid_field", status=400, params={"field": "messages"})
+    turns: list[dict[str, str]] = []
+    for turn in messages:
+        if (
+            not isinstance(turn, dict)
+            or turn.get("role") not in CHAT_TURN_ROLES
+            or not isinstance(turn.get("content"), str)
+            or not turn["content"].strip()
+        ):
+            raise ApiError("invalid_field", status=400, params={"field": "messages"})
+        turns.append({"role": turn["role"], "content": turn["content"]})
+    # 첫 턴과 마지막 턴은 사람이다 — 모델은 마지막 사용자 턴에 답하고, 첫 턴이 assistant 인
+    # 대화는 프로바이더에 따라 거절된다. 계약을 프로바이더 무관하게 둔다.
+    if turns[0]["role"] != "user" or turns[-1]["role"] != "user":
+        raise ApiError("invalid_field", status=400, params={"field": "messages"})
+    return turns
 
 
 class Pipeline:
@@ -209,6 +276,20 @@ class Pipeline:
             tenant_rules=self.tenant_guard_rules(TenantScope(tenant["id"])),
             candidate_boundaries=self._candidate_boundaries(role),
             # 분류기가 자기 자신을 다시 분류하면 무한 재귀다.
+            allow_classifier=role.name != GUARD_ROLE,
+        )
+
+    async def _inspect_many(
+        self, role: Role, tenant: Any, texts: Sequence[str], system: str | None
+    ) -> list[GuardResult]:
+        """텍스트 여러 개(임베딩 입력·대화 턴)를 각각 검사한다 — 2단 분류는 한 번만."""
+        pack = guard_pack_for(tenant["locale"])
+        return await self._guard.inspect_many(
+            texts,
+            system=system,
+            locales=[pack] if pack else [],
+            tenant_rules=self.tenant_guard_rules(TenantScope(tenant["id"])),
+            candidate_boundaries=self._candidate_boundaries(role),
             allow_classifier=role.name != GUARD_ROLE,
         )
 
@@ -442,9 +523,12 @@ class Pipeline:
                 # **같은 키면 같은 잡이다.** 끝났으면 그 결과를, 아직이면 기다린다 —
                 # 재시도한 소비자가 원본과 같은 모양을 받아야 분기가 필요 없다.
                 return await self.wait_for(scope, existing.id, seconds=wait)
-        if role_config.is_embed:
-            # 임베딩은 동기 경로다. 큐에 넣으면 소비자가 영원히 폴링한다.
-            raise ApiError("wrong_kind", status=400, params={"role": role, "kind": "embed"})
+        if role_config.is_embed or role_config.is_chat:
+            # 임베딩은 동기 경로고(큐에 넣으면 소비자가 영원히 폴링한다) 대화는 본문 형식이
+            # 다르다(턴 배열). 둘 다 이 문으로는 안 들어온다.
+            raise ApiError(
+                "wrong_kind", status=400, params={"role": role, "kind": role_config.kind}
+            )
 
         self._check_size(prompt, role_config)
 
@@ -476,12 +560,130 @@ class Pipeline:
         # 저장 앞인 이유: 판정이 잡에 스냅샷으로 박혀야 재시도해도 안 바뀐다.
         route = await self._route(role_config, verdict.prompt_for(INTERNAL))
 
-        # ③ 저장
+        # ③~⑤ 저장·배치·대기 — 대화 경로와 같은 꼬리.
+        return await self._enqueue(
+            scope, principal=principal, role_config=role_config, tenant=tenant,
+            end_user=end_user, end_user_hash=end_user_hash, verdict=verdict,
+            raw_prompt=prompt, system=effective_system, priority=priority,
+            metadata=metadata, idempotency_key=idempotency_key, route=route,
+            wait=wait, forced=forced,
+        )
+
+    async def chat(
+        self,
+        principal: Principal,
+        *,
+        role: str,
+        messages: Sequence[Mapping[str, Any]],
+        system: str | None = None,
+        end_user: str | None = None,
+        priority: int = 0,
+        metadata: Mapping[str, Any] | None = None,
+        wait: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> Submission:
+        """대화 요청. `submit` 과 같은 순서를 지나되 본문이 턴 배열이다.
+
+        턴마다 1단 가드를 따로 돌리고(스팬은 턴 안의 위치다) 2단은 한 번만 묻는다.
+        저장은 마스킹된 턴으로 다시 조립한 JSON 이고, 노드로 나가는 것도 그 JSON 을 풀어
+        만든 턴 배열이라 "가드 통과분만 나간다" 가 형식이 바뀌어도 그대로다. 서버는 대화를
+        기억하지 않는다 — 소비자가 매번 기록 전체를 보낸다(무상태).
+        """
+        scope = principal.scope()
+        end_user, forced = self._effective_end_user(principal, end_user)
+        role_config, tenant, service, end_user_hash = self._authorize(
+            principal, role, end_user
+        )
+        if idempotency_key:
+            existing = self._store.job_by_idempotency_key(
+                scope, principal.service_id, idempotency_key
+            )
+            if existing is not None:
+                return await self.wait_for(scope, existing.id, seconds=wait)
+        if not role_config.is_chat:
+            raise ApiError(
+                "wrong_kind", status=400, params={"role": role, "kind": role_config.kind}
+            )
+
+        turns = _validate_messages(messages)
+        # 길이는 턴 내용의 합이다 — JSON 껍데기는 세지 않는다(문서화된 계약).
+        self._check_size(sum(len(t["content"]) for t in turns), role_config)
+        effective_system = system or role_config.system
+
+        verdicts = await self._inspect_many(
+            role_config, tenant, [t["content"] for t in turns], effective_system
+        )
+        merged = self._merge_verdicts(role_config, verdicts, turns)
+        if merged.blocked:
+            self._record_guard_events(
+                scope, merged, job_id=None, service_id=principal.service_id
+            )
+            raise self._blocked(merged)
+
+        # 라우팅은 마지막 사용자 턴을 본다 — 분류기가 재는 것은 "이 요청" 의 난이도다.
+        route = await self._route(role_config, verdicts[-1].prompt_for(INTERNAL))
+
+        return await self._enqueue(
+            scope, principal=principal, role_config=role_config, tenant=tenant,
+            end_user=end_user, end_user_hash=end_user_hash, verdict=merged,
+            raw_prompt=encode_transcript(turns), system=effective_system,
+            priority=priority, metadata=metadata, idempotency_key=idempotency_key,
+            route=route, wait=wait, forced=forced,
+        )
+
+    def _merge_verdicts(
+        self, role: Role, verdicts: Sequence[GuardResult], turns: Sequence[Mapping[str, str]]
+    ) -> GuardResult:
+        """턴별 판정을 잡 하나의 판정으로. 경계는 교집합, 탐지는 전부, 차단 규칙은 합집합.
+
+        경계별 프롬프트는 그 경계의 마스킹본으로 다시 조립한 JSON 이다 — 저장(내부)과
+        경계 밖 전송(외부)이 이 한 객체에서 나온다.
+        """
+        allowed = frozenset(self._candidate_boundaries(role))
+        blocked_rules: list[str] = []
+        for verdict in verdicts:
+            allowed &= verdict.allowed_boundaries
+            blocked_rules.extend(verdict.blocked_rules)
+        return GuardResult(
+            allowed_boundaries=allowed,
+            prompts={
+                b: encode_transcript(
+                    [{"role": t["role"], "content": v.prompt_for(b)} for t, v in zip(turns, verdicts)]
+                )
+                for b in (INTERNAL, EXTERNAL)
+            },
+            systems={b: verdicts[0].system_for(b) for b in (INTERNAL, EXTERNAL)},
+            detections=tuple(d for v in verdicts for d in v.detections),
+            blocked_rules=tuple(dict.fromkeys(blocked_rules)),
+            classifier_attempted=any(v.classifier_attempted for v in verdicts),
+            classifier_failed=any(v.classifier_failed for v in verdicts),
+        )
+
+    async def _enqueue(
+        self,
+        scope: TenantScope,
+        *,
+        principal: Principal,
+        role_config: Role,
+        tenant: Any,
+        end_user: str | None,
+        end_user_hash: str | None,
+        verdict: GuardResult,
+        raw_prompt: str,
+        system: str | None,
+        priority: int,
+        metadata: Mapping[str, Any] | None,
+        idempotency_key: str | None,
+        route: str | None,
+        wait: float | None,
+        forced: bool,
+    ) -> Submission:
+        """③ 저장 → ④·⑤ 배치·실행 대기. `submit` 과 `chat` 이 공유하는 꼬리다."""
         job_id = self._create_job(
             scope,
             principal=principal, role_config=role_config, tenant=tenant,
-            end_user_hash=end_user_hash, verdict=verdict, raw_prompt=prompt,
-            system=effective_system, priority=priority, metadata=metadata,
+            end_user_hash=end_user_hash, verdict=verdict, raw_prompt=raw_prompt,
+            system=system, priority=priority, metadata=metadata,
             idempotency_key=idempotency_key, route=route,
         )
         if job_id is None:
@@ -506,12 +708,13 @@ class Pipeline:
         result = await self.wait_for(scope, job_id, seconds=wait)
         return _with_guard(result, self._guard_actions(verdict))
 
-    def _check_size(self, text: str, role: Role) -> None:
-        if len(text) > role.max_prompt_chars:
+    def _check_size(self, text: str | int, role: Role) -> None:
+        size = text if isinstance(text, int) else len(text)
+        if size > role.max_prompt_chars:
             raise ApiError(
                 "payload_too_large",
                 status=413,
-                params={"size": len(text), "limit": role.max_prompt_chars},
+                params={"size": size, "limit": role.max_prompt_chars},
             )
 
     def _effective_end_user(
@@ -718,7 +921,8 @@ class Pipeline:
         for text in inputs:
             self._check_size(text, role_config)
 
-        verdicts = [await self._inspect(role_config, tenant, text, None) for text in inputs]
+        # 입력마다 1단은 따로, 2단은 한 번 — `Guard.inspect_many` 가 그 구분을 안다.
+        verdicts = await self._inspect_many(role_config, tenant, list(inputs), None)
 
         allowed = frozenset(self._candidate_boundaries(role_config))
         blocked_rules: list[str] = []

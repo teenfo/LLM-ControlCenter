@@ -5,9 +5,9 @@
  * login)는 app.js 의 것을 **글자 그대로** 복제했고 테스트가 두 사본의 동일성을 본다 — 한 벌로
  * 못 만드는 이유는 test_ui.py 가 app.js 를 파일 단위로 못박기 때문이다(ES 모듈 금지 · 함수 순서 핀).
  *
- * 화면은 넷이다: 요청(역할별 단발) · 대화(chat 역할이 있을 때만) · 기록(내 작업) · 계정.
- * **API 에 없는 기능은 그리지 않는다.** 서버에 대화 API 가 없으므로 대화는 화면이 이력을 평문
- * 표식으로 이어 붙여 한 번의 요청으로 보낸다 — 표식은 roles.yaml 의 chat 역할 지시문과 한 벌이다.
+ * 화면은 넷이다: 요청(역할별 단발) · 대화(kind 가 chat 인 역할이 있을 때만) · 기록(내 작업) · 계정.
+ * **API 에 없는 기능은 그리지 않는다.** 대화는 POST /v1/chat 에 턴 배열(messages)을 보낸다 — 서버는
+ * 대화를 기억하지 않으므로 이 화면이 기록을 들고 매번 전부 보낸다(오래된 턴부터 잘라 한도에 맞춘다).
  */
 
 'use strict';
@@ -17,11 +17,6 @@ const TOKEN_KEY = 'llmcc.client.token';
 const END_USER_KEY = 'llmcc.client.end_user';
 //: 테마는 사람의 것이라 관제 UI 와 공유한다. 기기에 남는 키는 이 THEME_KEY 하나뿐이다.
 const THEME_KEY = 'llmcc:theme';
-//: 대화 합성 표식. `chat` 역할의 지시문이 같은 표식을 설명한다 — 한 벌이다. ChatML 류 제어
-//: 토큰은 쓰지 않는다 — 베이스라인 가드(injection_control_token)가 마스킹한다.
-const USER_MARK = '사용자: ';
-const ASSISTANT_MARK = '도우미: ';
-const CHAT_ROLE = 'chat';
 //: 서버의 본문 한도와 같다. 브라우저에서 읽고 프롬프트에 붙이므로 업로드 라우트가 없다.
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const TEXT_FILE = /\.(txt|md|markdown|csv|tsv|json|log|ya?ml)$/i;
@@ -329,11 +324,13 @@ function disconnect() {
 // ── 페이지 ────────────────────────────────────────────────────────────────
 
 function askRoles() {
-  return state.roles.filter((r) => r.name !== CHAT_ROLE);
+  // 대화 역할은 요청 탭에 없다 — 본문 모양(턴 배열)이 다르고 그쪽 탭이 따로 있다.
+  return state.roles.filter((r) => r.kind !== 'chat');
 }
 
 function chatRole() {
-  return state.roles.find((r) => r.name === CHAT_ROLE && r.kind === 'generate') || null;
+  // 이름이 아니라 kind 로 고른다 — 설치처가 역할 이름을 바꿔도 탭은 그대로다.
+  return state.roles.find((r) => r.kind === 'chat') || null;
 }
 
 const PAGES = [
@@ -489,10 +486,10 @@ function addFiles(files, textarea, after) {
 
 /** 제출 → 대기 → 완료. **서버의 retry_after 를 지킨다** — 고정 간격 폴링은 큐가 길수록 컨트롤 플레인을 때린다.
  *  clients/client.py 의 run() 과 같은 루프다. 재시도는 같은 Idempotency-Key 로 — 작업이 두 번 만들어지지 않는다. */
-async function runJob(body, onProgress) {
+async function runJob(path, body, onProgress) {
   const key = newKey();
   const started = Date.now();
-  let result = await api('/v1/generate', {
+  let result = await api(path, {
     method: 'POST', headers: { 'Idempotency-Key': key },
     body: Object.assign({ wait: WAIT_SECONDS }, body),
   });
@@ -521,7 +518,7 @@ async function submitAsk(role) {
     } else {
       const payload = withEndUser({ role: role.name, prompt });
       if (state.ask.system.trim()) payload.system = state.ask.system.trim();
-      const result = await runJob(payload, (r, delay) => {
+      const result = await runJob('/v1/generate', payload, (r, delay) => {
         state.ask.pending = { job_id: r.job_id, queue: r.queue_position, delay };
         render();
       });
@@ -600,20 +597,21 @@ function renderResult(result, error) {
 
 // ── 대화 ──────────────────────────────────────────────────────────────────
 
-/** 이력을 평문 표식으로 이어 붙인다. 오래된 턴부터 잘라 한도에 맞춘다 — 마지막 사용자 턴은 남긴다. */
-function composePrompt(turns, limit) {
-  const tail = ASSISTANT_MARK.trim();
-  const lines = [];
-  let used = tail.length + 1;
+/** 턴 배열을 한도에 맞춘다 — 오래된 턴부터 버리고 마지막 사용자 턴은 남긴다(그것도 넘으면 서버 413 이 뒷받침).
+ *  길이는 턴 내용의 합이다 — 서버의 `max_prompt_chars` 계약과 같다. 잘린 자리가 assistant 로 시작하면
+ *  그 턴도 버린다: 서버는 첫 턴이 user 인 기록만 받는다. */
+function trimMessages(turns, limit) {
+  const kept = [];
+  let used = 0;
   let dropped = 0;
   for (let i = turns.length - 1; i >= 0; i -= 1) {
     const turn = turns[i];
-    const line = (turn.role === 'user' ? USER_MARK : ASSISTANT_MARK) + turn.text;
-    if (lines.length && limit && used + line.length + 1 > limit) { dropped = i + 1; break; }
-    lines.unshift(line);
-    used += line.length + 1;
+    if (kept.length && limit && used + turn.text.length > limit) { dropped = i + 1; break; }
+    kept.unshift({ role: turn.role, content: turn.text });
+    used += turn.text.length;
   }
-  return { prompt: lines.join('\n') + '\n' + tail, dropped };
+  while (kept.length > 1 && kept[0].role !== 'user') { kept.shift(); dropped += 1; }
+  return { messages: kept, dropped };
 }
 
 function renderChat() {
@@ -657,7 +655,7 @@ function renderChat() {
 async function sendChat(input, role, limit) {
   const text = input.value.trim();
   if (!text || state.chat.busy) return;
-  if (limit && text.length + USER_MARK.length + ASSISTANT_MARK.length + 2 > limit) {
+  if (limit && text.length > limit) {
     state.chat.error = Object.assign(new Error(t('client.too_long')), { code: 'payload_too_large' });
     await render();
     return;
@@ -667,11 +665,12 @@ async function sendChat(input, role, limit) {
   state.chat.error = null;
   state.chat.draft = '';
   await render();
-  const composed = composePrompt(state.chat.turns, limit);
-  state.chat.trimmed = composed.dropped;
+  const trimmed = trimMessages(state.chat.turns, limit);
+  state.chat.trimmed = trimmed.dropped;
   try {
-    // system 은 보내지 않는다 — 역할의 기본 지시문(표식을 설명하는 그것)이 적용돼야 한다.
-    const result = await runJob(withEndUser({ role: role.name, prompt: composed.prompt }));
+    // system 은 보내지 않는다 — 역할의 기본 지시문이 적용돼야 한다. 서버는 대화를 기억하지 않으므로
+    // 기록 전체(한도에 맞춰 자른 것)를 매번 보낸다.
+    const result = await runJob('/v1/chat', withEndUser({ role: role.name, messages: trimmed.messages }));
     if (result.status === 'ok') {
       state.chat.turns.push({ role: 'assistant', text: result.response || '', guard: result.guard_actions });
     } else {
@@ -690,6 +689,22 @@ async function sendChat(input, role, limit) {
 }
 
 // ── 기록 ──────────────────────────────────────────────────────────────────
+
+/** chat 잡의 마스킹본은 턴 배열 JSON 이다. 파싱되면 턴 목록, 아니면 null(원문을 그대로 보여 준다). */
+function transcriptOf(j) {
+  if (j.kind !== 'chat' || !j.prompt_masked) return null;
+  try {
+    const turns = JSON.parse(j.prompt_masked).messages;
+    return Array.isArray(turns) ? turns.filter((m) => m && typeof m.content === 'string') : null;
+  } catch (_) { return null; }
+}
+
+function lastUserText(j) {
+  const turns = transcriptOf(j);
+  if (!turns) return j.prompt_masked || '';
+  const last = turns.slice().reverse().find((m) => m.role === 'user');
+  return last ? last.content : '';
+}
 
 const HISTORY_FILTERS = [
   { id: 'all', label: 'client.filter_all', match: () => true },
@@ -722,7 +737,7 @@ async function renderHistory() {
     statusPill(j.status),
     el('div', { class: 'body' }, [
       el('div', { class: 'title', text: j.role + (j.model ? ' · ' + j.model : '') }),
-      el('div', { class: 'detail', text: (j.prompt_masked || '').slice(0, 140) }),
+      el('div', { class: 'detail', text: lastUserText(j).slice(0, 140) }),
     ]),
     el('div', { class: 'time', text: when(j.created_at) }),
   ]));
@@ -747,7 +762,12 @@ function renderDetail(j) {
     ]),
     el('div', { class: 'card-body' }, [
       el('label', { text: t('client.prompt') + ' · ' + t('client.masked_only') }),
-      el('pre', { class: 'response', text: j.prompt_masked || '' }),
+      // 대화 잡은 턴 단위로 보인다 — 서버가 저장한 마스킹본 JSON 을 푼 것이고 원문은 없다.
+      transcriptOf(j)
+        ? el('div', { class: 'chat-log static' }, transcriptOf(j).map((m) => el('div', { class: 'bubble ' + (m.role === 'user' ? 'user' : 'assistant') }, [
+          el('div', { class: 'who', text: t(m.role === 'user' ? 'client.turn_user' : 'client.turn_assistant') }),
+          el('div', { class: 'text', text: m.content })])))
+        : el('pre', { class: 'response', text: j.prompt_masked || '' }),
       j.response ? el('label', { text: t('client.response') }) : null,
       j.response ? el('pre', { class: 'response', text: j.response }) : null,
       guardChips(j.guard_actions),
