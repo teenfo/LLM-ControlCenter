@@ -100,7 +100,7 @@
 
 ### AUTH-6  역할 접근 제어
 정의   토큰마다 쓸 수 있는 역할 목록을 두고, 그 밖의 역할 호출을 거부한다.
-표면   `GET /v1/roles` · `POST /v1/admin/tokens` 의 `allow_roles`
+표면   `GET /v1/roles` · `POST /v1/admin/tokens` 의 `allow_roles` · `POST/PUT /v1/admin/services` 의 `allow_roles`(AUTH-11)
 구현   `app/auth.py:check_role_allowed` · `app/meta.py:visible_roles`
 계약   목록에 없는 역할은 호출도 조회도 안 된다 · 밑줄로 시작하는 내부 역할은 와일드카드로도 안 보인다
 고정   `test_auth.py::test_allow_roles_gate`
@@ -144,7 +144,7 @@
 구현   `app/auth.py:ROLE_USER` `token_role_for_account` `account_row` · `app/main.py:tenant_accounts` `tenant_account_password` `tenant_account_disable` `_tenant_user` · `app/pipeline.py:_effective_end_user`
 계약   `user` 세션은 관리 면(`/v1/admin/*` · `/v1/platform/*`)에 닿지 않는다 · 계정은 `service_id` 없이 만들 수 없고 그 서비스는 같은 테넌트에 실재해야 한다
        테넌트 관리자는 자기 테넌트의 `user` 계정만 본다 — 남의 테넌트 것과 관리자 계정은 404(존재를 흘리지 않는다)
-       **모든 계정 세션의 `end_user` 는 파이프라인이 아이디로 강제한다** (본문 값 무시 · generate·embed 공통 · `_authorize` 보다 앞) — 사칭이 불가능하고 레이트리밋·사용량·파기가 사람 단위로 귀속된다
+       **모든 계정 세션의 `end_user` 는 파이프라인이 아이디로 강제한다** (본문 값 무시 · generate·embed·chat 공통 · `_authorize` 보다 앞) — 사칭이 불가능하고 레이트리밋·사용량·파기가 사람 단위로 귀속된다
        생성·재설정·정지는 감사에 남는다(AUTH-9 와 같은 액션 이름)
 고정   `test_accounts.py::test_a_user_account_logs_in_as_a_service_session_bound_to_its_tenant_and_service`
        `test_accounts.py::test_a_user_session_cannot_reach_admin_or_platform_routes`
@@ -154,7 +154,31 @@
        `test_accounts.py::test_user_account_actions_leave_an_audit_trail`
        `test_api.py::test_an_account_session_cannot_choose_its_end_user`
        `test_api.py::test_the_forced_end_user_applies_to_embed_too`
+       `test_api.py::test_the_forced_end_user_applies_to_chat_too`
        `test_architecture.py::test_both_submit_paths_force_the_account_end_user`
+상태   구현됨
+
+### AUTH-11  서비스 정책 수정
+정의   테넌트 관리자가 서비스의 허용 역할·요청 한도·엔드유저 한도·월 예산·엔드유저 필수 여부를 고친다. 다음 요청부터 바로 적용된다.
+표면   `PUT /v1/admin/services/{service_id}` · `GET /v1/admin/services` 의 `roles`(공개 역할 카탈로그 `{name, kind}`) · 관제 UI 연결 정보 → 편집 / 서비스 추가(같은 폼이 `POST` 도 한다)
+구현   `app/main.py:tenant_service_update` `_validate_allow_roles` `_service_view` · `app/store.py:update_service`
+계약   캐시가 없다 — `_authorize`·`limits_for`·배치가 요청마다 서비스 행을 읽으므로 저장 즉시 다음 요청에 적용된다(무효화할 것이 없다)
+       없는 키는 그대로, `null` 은 해제 · 숫자는 잘라내지 않고 거절한다(한도는 1 이상 정수, 예산은 0 이상) · `require_end_user` 는 진짜 bool 만
+       `allow_roles` 는 생성과 같은 검증(모르는 역할·내부 역할은 404 `unknown_role`) · `status` 는 이 문으로 안 바뀐다 · 플러그인이 만든 서비스는 409 `plugin_managed`(정본은 매니페스트)
+       남의 테넌트 서비스는 404(존재를 흘리지 않는다) · 서비스 토큰은 403 · 바꿀 키가 하나도 없으면 400 · 감사 `update_service` 에 바뀐 필드 이름(과 새 `allow_roles`)이 남는다
+고정   `test_api.py::test_updating_allow_roles_takes_effect_on_the_next_request`
+       `test_api.py::test_service_update_rejects_unknown_and_internal_roles`
+       `test_api.py::test_service_update_never_crosses_tenants`
+       `test_api.py::test_service_update_rejects_bad_numbers`
+       `test_api.py::test_null_clears_a_service_limit`
+       `test_api.py::test_service_update_requires_at_least_one_field`
+       `test_api.py::test_service_update_is_audited`
+       `test_api.py::test_a_service_token_cannot_update_services`
+       `test_api.py::test_service_list_carries_the_public_role_catalog`
+       `test_plugins.py::test_a_plugin_owned_service_is_not_editable_by_hand`
+       `test_store.py::test_update_service_rejects_unknown_fields`
+       `test_store.py::test_update_service_is_scoped`
+       `test_ui.py::test_the_connections_view_can_edit_and_add_a_service`
 상태   구현됨
 
 ## 2. 요청 파이프라인
@@ -163,8 +187,8 @@
 
 ### PIPE-1  제출 순서 계약
 정의   ①인증 → ②가드 → ②-b라우팅 → ③저장 → ④배치 → ⑤실행 → ⑥출력 검사 → ⑦정산. 이 순서가 안전 보증이다.
-표면   `POST /v1/generate` · `POST /v1/embed`
-구현   `app/pipeline.py:Pipeline.submit` (`_authorize` `_inspect` `_route` `_seal` `_create_job`)
+표면   `POST /v1/generate` · `POST /v1/embed` · `POST /v1/chat`
+구현   `app/pipeline.py:Pipeline.submit` `Pipeline.chat` (`_authorize` `_inspect` `_inspect_many` `_route` `_seal` `_enqueue` `_create_job`)
 계약   가드는 **잡 행이 생기기 전에** 돈다 — ② 를 ③ 뒤로 옮기면 원문이 무방비로 DB 에 남는다
        잡을 만드는 곳은 `pipeline.py` 한 곳뿐이다(다른 모듈에서 잡 생성 금지)
        프롬프트 해시는 마스킹 **후에** 계산된다
@@ -175,7 +199,7 @@
 
 ### PIPE-2  동기·비동기 흡수
 정의   `wait` 값 하나로 같은 엔드포인트가 동기 응답과 작업 접수를 모두 처리한다.
-표면   `POST /v1/generate` 의 `wait` 파라미터
+표면   `POST /v1/generate` · `POST /v1/chat` 의 `wait` 파라미터
 구현   `app/pipeline.py:Pipeline.wait_for` · `app/completion.py:CompletionSignal`
 계약   대기는 상태 컬럼만 읽는다(프롬프트 본문을 읽지 않는다) · 폴링 간격은 뒤로 물러난다
        스케줄러가 종결시키면 대기 중인 요청이 깨어난다 · 재시도는 대기자를 깨우지 않는다
@@ -191,7 +215,10 @@
 계약   키는 테넌트·서비스를 가로지르지 않는다 · 빈 키는 키가 아니다 · 길이 상한이 있다
        재시도가 두 번 과금되지 않는다 · 키가 만료돼도 잡 행은 남는다
        **페이로드를 비교하지 않는다** — 같은 키로 다른 프롬프트를 보내면 첫 잡이 온다
+       키 이름공간은 엔드포인트와 무관하다 — `/v1/generate` 와 `/v1/chat` 에 같은 키를 쓰면 먼저 만든 잡이 돌아온다
 고정   `test_idempotency.py::test_the_same_key_returns_the_same_job`
+       `test_pipeline.py::test_a_chat_idempotency_key_returns_the_same_job`
+       `test_api.py::test_chat_honors_the_idempotency_key`
        `test_idempotency.py::test_the_retry_does_not_charge_twice`
        `test_idempotency.py::test_keys_do_not_collide_across_tenants`
        `test_multiprocess.py::test_only_one_process_creates_the_job_for_a_key`
@@ -246,6 +273,40 @@
        `test_api.py::test_my_jobs_is_metered_as_a_poll`
        `test_api.py::test_job_get_carries_the_stored_guard_actions`
        `test_store.py::test_filter_actions_for_jobs_prefers_the_internal_grade_and_skips_counters`
+상태   구현됨
+
+### PIPE-10  대화 경로
+정의   `messages[]`(user/assistant 턴)를 받아 역할의 모델에 **채팅 형식**으로 보낸다. 생성과 같은 큐잉 잡이다 — 가드·배치·비용·멱등성·`wait`·취소가 그대로다. 클라이언트 페이지(OPS-11)의 대화 탭이 이것을 쓴다.
+표면   `POST /v1/chat` · 역할의 `kind: chat` · `GET /v1/jobs`·`GET /v1/admin/jobs` 행의 `kind` · 관제 UI 잡 표·드로어의 턴 렌더 · `clients/client.py:chat` `run(messages=)` · 목 서버 `/v1/chat`
+구현   `app/pipeline.py:Pipeline.chat` `_inspect_many` `_merge_verdicts` `_enqueue` `encode_transcript` `decode_transcript` · `app/guard.py:Guard.inspect_many` · `app/scheduler.py:_execute` · `app/providers/*:chat`
+계약   턴마다 **독립적으로** 1단 마스킹한다 — 스팬은 텍스트별이고, 2단 LLM 분류는 제출당 **한 번**(마스킹본을 이어 붙여) 돈다. 어느 턴이든 차단이면 요청이 차단이다
+       저장은 마스킹된 트랜스크립트 JSON(`prompt_masked`/`prompt_external`)이고 원문 JSON 은 봉인된다 — 스키마 변경 없음 · 잡을 만드는 곳은 여전히 `pipeline.py` 한 곳
+       무상태다 — 서버는 세션을 저장하지 않고 클라이언트가 전체 기록을 요청마다 보낸다(G8 판정 불변) · `system` 은 본문 `system` 또는 역할 기본값 하나뿐이고 `messages` 안의 `system` 턴은 거절된다
+       첫 턴과 마지막 턴은 `user` · 최대 200턴 · 길이 검사는 내용 글자 수의 합 · 라우팅 분류기는 마지막 사용자 턴을 본다 · `chat` 역할을 `/v1/generate` 로, `generate` 역할을 `/v1/chat` 으로 보내면 400 `wrong_kind`
+       실행은 `job.kind` 로 갈린다(프로바이더 `chat()` — ollama 는 `/api/chat`) · 깨진 트랜스크립트는 노드를 벌주지 않는 실패(`invalid_transcript`)다
+고정   `test_pipeline.py::test_chat_masks_each_message_independently`
+       `test_pipeline.py::test_chat_stores_a_json_transcript_and_seals_the_raw_one`
+       `test_pipeline.py::test_chat_blocks_when_any_turn_is_blocked`
+       `test_pipeline.py::test_chat_rejects_a_generate_role_and_generate_rejects_a_chat_role`
+       `test_pipeline.py::test_chat_enforces_shape_and_count`
+       `test_pipeline.py::test_chat_size_is_the_sum_of_contents`
+       `test_pipeline.py::test_chat_routes_on_the_last_user_turn`
+       `test_pipeline.py::test_chat_applies_the_role_default_system_when_none_is_given`
+       `test_guard.py::test_inspect_many_runs_the_classifier_once`
+       `test_guard.py::test_inspect_many_masks_each_text_by_its_own_spans`
+       `test_guard.py::test_inspect_single_still_matches_the_previous_result`
+       `test_scheduler.py::test_chat_jobs_call_the_chat_operation`
+       `test_scheduler.py::test_chat_sends_the_external_transcript_off_boundary`
+       `test_scheduler.py::test_a_corrupt_transcript_fails_without_penalising_the_node`
+       `test_providers.py::test_ollama_chat_posts_messages_with_a_leading_system`
+       `test_providers.py::test_anthropic_chat_forwards_the_transcript_and_system`
+       `test_api.py::test_chat_returns_a_submission_with_the_generate_contract`
+       `test_api.py::test_chat_goes_through_the_same_guard`
+       `test_api.py::test_chat_rejects_malformed_transcripts`
+       `test_api.py::test_my_jobs_carries_chat_transcripts_masked`
+       `test_api.py::test_the_raw_chat_transcript_is_the_original_json`
+       `test_ui.py::test_the_job_views_render_chat_transcripts`
+       `test_clients.py::test_the_sdk_chat_round_trips_through_the_mock_server`
 상태   구현됨
 
 ---
@@ -1126,17 +1187,19 @@
 계약   관제 UI 와 같은 규칙 — 빌드 단계·프레임워크·CDN·웹폰트 없음 · `innerHTML` 없음 · 토큰은 `sessionStorage` 만(키는 콘솔과 다르다) · 화면은 마스킹본만 · API 에 없는 기능은 그리지 않는다
        공용 헬퍼(`t` `applyStaticStrings` `el` `api` `login`)와 테마 토큰은 콘솔에서 글자 그대로 복제하고 테스트가 동일성을 본다 — 공용 모듈은 콘솔의 핀(`import` 금지·함수 순서)이 막는다
        폴링은 서버의 `retry_after` 를 따르고 `setInterval` 을 쓰지 않는다 · 파일은 브라우저 안에서만 읽는다(텍스트 계열 · 2MB) · 문자열은 `client.*` 만 쓰고 죽은 키는 실패한다
-       대화는 **클라이언트 측 트랜스크립트 합성**이다 — 평문 표식 `사용자:`/`도우미:` 로 `chat` 역할에 보내고 오래된 턴부터 잘라 `max_prompt_chars` 에 맞춘다. 표식은 베이스라인 인젝션 규칙에 걸리지 않는다. 트랜스크립트는 메모리에만 있다
+       대화는 `POST /v1/chat`(PIPE-10)로 턴 배열을 보낸다 — 오래된 턴부터 잘라 역할의 `max_prompt_chars` 에 맞추되 마지막 사용자 턴은 남긴다(넘치면 서버가 413). 트랜스크립트는 메모리에만 있고, 기록의 턴 말풍선은 `kind` 가 `chat` 인 행의 마스킹본에서만 그린다
 고정   `test_client_page.py::test_the_client_page_is_served_without_a_build_step`
        `test_client_page.py::test_client_has_no_external_assets`
        `test_client_page.py::test_client_keeps_the_token_in_session_storage_only`
        `test_client_page.py::test_shared_helpers_are_identical_to_the_console`
        `test_client_page.py::test_client_polls_with_the_servers_retry_after`
        `test_client_page.py::test_chat_sends_a_message_array_to_the_chat_route`
+       `test_client_page.py::test_the_chat_tab_is_keyed_on_role_kind`
+       `test_client_page.py::test_history_renders_chat_transcripts_only_from_the_masked_copy`
        `test_client_page.py::test_client_calls_only_routes_that_exist`
        `test_client_page.py::test_history_shows_masked_prompts_only`
        `test_config.py::test_shipped_config_has_a_chat_role_the_client_page_can_use`
-상태   부분 — 대화는 트랜스크립트 합성이다(서버 대화 API·스트리밍 없음, G7) · 파일 입력은 텍스트 계열만(PDF 없음)
+상태   부분 — 스트리밍 없음(G7, 답이 한 번에 온다) · 파일 입력은 텍스트 계열만(PDF 없음)
 
 ---
 
@@ -1435,7 +1498,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | PIPE-3 멱등성 키 | 키가 작업을 식별함. 페이로드를 비교하지 않고 `/v1/embed` 는 미적용 | 부분 | D7 / G3 |
 | ROUTE-4 라우팅 정확도 | 계측 도구는 있으나 픽스처가 번들에 없음. 안 재면 맞는지 아무도 모름 | 부분 | L1 |
 | OPS-10 토큰 처리율 | 보여주기만 하고 한도로 걸지 않음. 설치처 분포를 모르는 채 건 한도는 꺼짐 | 부분 | D8 |
-| OPS-11 클라이언트 페이지 | 요청·기록·계정은 API 그대로. 대화는 클라이언트가 트랜스크립트를 합성해 `chat` 역할에 보내는 형태라 서버 대화 API·스트리밍이 없고, 파일 입력은 텍스트 계열만 | 부분 | G7 |
+| OPS-11 클라이언트 페이지 | 요청·대화(`/v1/chat`)·기록·계정은 API 그대로. 스트리밍이 없어 답이 한 번에 오고, 파일 입력은 텍스트 계열만 | 부분 | G7 |
 | AUTH-8 관리 신원 연동 | 로컬 계정(AUTH-9 · AUTH-10)만 있음. IdP·MFA 없음 | 미구현 | D12 |
 | PIPE-7 선언적 체인 실행 | 없음 | 미구현 | L2 |
 | PIPE-8 스트리밍 응답 | 없음 | 미구현 | G7 |
@@ -1581,7 +1644,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 
 | 파일 | 무엇을 정하나 | 기능 |
 |---|---|---|
-| `config/roles.yaml` | 역할 = 모델·배치·레인 정책, 라우팅 옵트인 · 클라이언트 페이지의 `chat` 역할 | AUTH-6 AUTH-7 CLUSTER-3 ROUTE-1 OPS-11 |
+| `config/roles.yaml` | 역할 = 모델·배치·레인 정책(`kind` 는 generate·embed·chat), 라우팅 옵트인 · 대화 역할 `chat`(kind: chat) | AUTH-6 AUTH-7 CLUSTER-3 ROUTE-1 PIPE-10 OPS-11 |
 | `config/lanes.yaml` | 레인별 동시 실행 상한과 기아 임계 | SCHED-2 SCHED-3 |
 | `config/nodes.yaml` | 노드 시드 (DB 가 이긴다) | CLUSTER-1 CLUSTER-5 CLUSTER-10 |
 | `config/guard.yaml` | 로케일 팩·맥락 규칙·시크릿·인젝션 | GUARD-1 GUARD-2 GUARD-3 GUARD-8 GUARD-9 |

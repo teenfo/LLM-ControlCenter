@@ -192,6 +192,11 @@ python -m app serve --port 8612 --no-scheduler      # ③ API 전용
 - **새 판이 기본 설정에 역할을 더하면 사이트 `roles.yaml` 에는 사람이 옮겨 적는다** — 0.4.0 의 `chat`(클라이언트
   페이지의 대화 탭)이 그 예다. 그 diff 에서 보고 사이트의 모델 이름으로 바꿔 넣는다. `allow_roles` 가 `*` 인
   서비스에는 새 역할이 재기동 즉시 노출되므로, 원치 않는 서비스가 있으면 `GET /v1/admin/services` 로 먼저 확인한다
+  (0.5.0 부터는 `PUT /v1/admin/services/{id}` 로 그 서비스의 `allow_roles` 를 좁힐 수 있다)
+- **역할의 `kind` 를 바꾸는 판은 사이트 `roles.yaml` 도 같이 움직인다** — 0.5.0 은 `chat` 을 `kind: chat`(대화 API)
+  으로 바꿨다. 사이트 파일의 `chat:` 블록을 새 판 기본값으로 갈아 끼우고 **재기동 전에 새 이미지로 `load_config` 를
+  검증**한다(업그레이드 스크립트가 `roles.yaml.bak-<이전 버전>` 을 남긴다). 되돌릴 때는 이미지 태그와 함께 그 파일도
+  되돌린다 — 0.4.0 이미지는 `kind: chat` 을 모르고 기동에 실패한다
 - 노드 시드(`config/nodes.yaml`)는 **기동 때마다** 들어온다. 관제에서 지운 노드는 묘비(`node_tombstones`)가
   막아 되살아나지 않지만, 실제 설치에서는 시드를 비우고 노드를 관제 UI 로만 등록하는 편이 읽기 쉽다
 
@@ -256,6 +261,7 @@ Ollama 는 기본 무인증이다. 전제를 명시한다.
 | DR | **KEK 분실 = 암호문 영구 손실.** 부트스트랩에서 KEK 백업을 강제 안내 |
 | 검증 | 백업 무결성 정기 확인 + 복원 리허설 |
 | KEK 회전 | `lcc rotate-kek` — DEK 래핑만 교체하므로 **암호문 재암호화 없음**. 절차는 [런북](runbook-key-compromise.md) |
+| 감사 사본 | `python -m app audit-export --out …` 을 정기 실행(증분). 사본은 **DB 호스트 밖**에 있어야 대조가 성립한다 — 다른 기계의 타이머가 당겨 가는 형태. 절차와 타이머 예는 [런북](runbook-audit-integrity.md) |
 
 백업에서 원문 암호문을 빼는 이유: `raw_prompt_retention_days` 로 7일 뒤 암호문을 지워도,
 **30일 전 백업을 복원하면 지워졌어야 할 원문이 되살아난다.** 보관 기간 설정이 백업 앞에서

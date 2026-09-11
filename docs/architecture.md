@@ -67,7 +67,7 @@ RBAC 은 2단이다. **테넌트 관리자는 플랫폼 베이스라인 가드 �
 ```yaml
 summarize:
   model: qwen2.5:7b
-  kind: generate
+  kind: generate                    # generate | embed | chat
   lane: interactive
   timeout: 120
   placement: [internal, external]   # 티어 = 노드 태그 또는 이름. 선언 순서가 선호도
@@ -444,6 +444,8 @@ HTTP (Starlette)                                              main.py · meta.py
 라우터가 `store.create_job()` 을 직접 부를 수 있으면 언젠가 누군가 가드를 건너뛴 경로를
 만든다. 스토어의 테넌트 초크포인트와 같은 이유로, **순서를 규율이 아니라 구조로 만든다.**
 동기 임베딩도 같은 관문을 지난다 — 큐만 우회하고 가드·배치·경계·비용은 우회하지 않는다.
+대화(`Pipeline.chat`)도 같은 관문이다 — 턴마다 1단 마스킹, 2단 분류는 제출당 한 번, 저장은
+마스킹된 트랜스크립트 JSON 이고, 잡을 만드는 꼬리(`_enqueue`)는 생성과 공유한다.
 
 이 불변식은 주석이 아니라 테스트가 지킨다(`tests/test_architecture.py`):
 스토어 커넥션 단일 접근 · 잡 생성 단일 경로 · 경계는 노드 속성 · `force` 없음 ·

@@ -30,6 +30,25 @@ lcc doctor                                          # 체인 + 내보낸 팁 대
 `audit-export` 는 증분입니다 — 마지막으로 내보낸 지점 이후만 이어 붙입니다.
 1년치를 매번 내보내야 하면 아무도 안 돌리고, **안 돌리는 절차는 없는 절차입니다.**
 
+컨테이너 배포에서는 **다른 기계**의 타이머가 당겨 가는 형태가 맞습니다 — 사본이 DB 호스트에
+있으면 대조가 의미를 잃습니다. 백업 호스트에 두는 systemd 타이머의 골격:
+
+```sh
+# llmcc-audit-export.timer   OnCalendar=*-*-* 04:40:00 · Persistent=true · RandomizedDelaySec=300
+# llmcc-audit-export.service Type=oneshot · User=<백업 사용자> · ExecStart=…/llmcc-audit-export.sh
+#
+# llmcc-audit-export.sh — DB 호스트의 컨테이너 안에서 증분 내보내기 → 사본을 당겨 온다
+ssh <db-host> 'cd /opt/llm-controlcenter \
+  && docker compose exec -T controlcenter python -m app audit-export --out /data/audit-export.jsonl \
+  && docker compose cp controlcenter:/data/audit-export.jsonl /root/llmcc/audit/audit-export.jsonl'
+scp <db-host>:/root/llmcc/audit/audit-export.jsonl /backup/llmcc-audit/audit-export-$(date +%Y%m%d).jsonl
+ln -sfn audit-export-$(date +%Y%m%d).jsonl /backup/llmcc-audit/latest.jsonl
+```
+
+당겨 온 새 사본은 **이전 사본을 접두로 가져야 합니다**(증분은 이어 붙이기만 합니다). 아니면
+재계산을 의심하세요 — 스크립트가 그 비교를 하고 실패 코드로 알리게 두는 것이 `doctor` 의
+팁 대조를 밖에서 한 번 더 하는 셈입니다.
+
 `doctor` 는 두 가지를 봅니다:
 
 - 체인이 이어지는가 (내부 검증)

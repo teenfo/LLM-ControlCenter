@@ -109,7 +109,7 @@ flowchart TB
 ## 3. 요청 처리 흐름 — 순서가 계약이다
 
 ```
-요청 (role · prompt · end_user)
+요청 (role · prompt|messages · end_user)
   │
   ▼
 ① 인증 ──── 토큰 → 테넌트·서비스 확정 · 3단 레이트리밋 · end_user 해싱
