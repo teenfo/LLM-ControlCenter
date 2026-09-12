@@ -1,0 +1,33 @@
+# LLM ControlCenter 플러그인 — systemd 템플릿 유닛
+#
+#   /opt/llmcc-plugins/<이름>/        main.py · client.py · plugin.py (SDK 두 파일은 호스트의 GET /v1/client/ 에서)
+#   /etc/llmcc-plugins/<이름>.env     LCC_URL=… 와 LCC_TOKEN=… 두 줄. root:root 0600 — 토큰은 여기에만 둔다.
+#   install -m 644 llmcc-plugin@.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now llmcc-plugin@<이름>
+#
+# 값 뒤에 주석을 달지 않는다 — systemd 는 `Key=value   # 주석` 의 주석을 값의 일부로 읽는다.
+# 프로세스는 임시 비루트 사용자로 돈다(DynamicUser). 쓸 수 있는 곳은 $STATE_DIRECTORY
+# (/var/lib/llmcc-plugins/<이름>) 뿐이고 예제들은 기록을 거기에 쓴다.
+# 토큰을 회전했으면 .env 를 고치고 `systemctl restart llmcc-plugin@<이름>` — 옛 토큰은 유예 뒤에 죽는다.
+
+[Unit]
+Description=LLM ControlCenter plugin %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=llmcc-plugins/%i
+EnvironmentFile=/etc/llmcc-plugins/%i.env
+WorkingDirectory=/opt/llmcc-plugins/%i
+ExecStart=/usr/bin/python3 /opt/llmcc-plugins/%i/main.py
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

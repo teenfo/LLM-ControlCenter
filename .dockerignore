@@ -22,3 +22,6 @@ docs
 .claude
 .pytest_cache
 .ruff_cache
+
+# 예제 플러그인 — 저장소 내용이지 이미지에 넣을 것이 아니다
+examples

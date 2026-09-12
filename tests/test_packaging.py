@@ -33,6 +33,7 @@ from app.bootstrap import (
     is_bootstrapped,
     load_master_key_from,
 )
+from app import cli as cli_mod
 from app.cli import build_parser, main as cli_main
 from app.cluster import Cluster
 from app.crypto import ENV_MASTER_KEY, KeyVault
@@ -49,7 +50,7 @@ ROOT = Path(__file__).resolve().parent.parent
 @pytest.mark.parametrize("name", [
     "Dockerfile", "compose.yml", "preflight.sh", "doctor.sh",
     "backup.sh", "restore.sh", "bundle.sh", "README.md",
-    "clients/client.py", "clients/mock_server.py", "clients/plugin.py",
+    "clients/client.py", "clients/mock_server.py", "clients/plugin.py", "clients/lccp.py",
     "tls/nginx.conf",
 ])
 def test_the_bundle_has_what_the_install_needs(name):
@@ -608,6 +609,101 @@ def test_the_scheduler_can_be_turned_off_for_extra_workers():
     """**워커마다 스케줄러가 돌면 잡이 중복 배치된다.**"""
     args = build_parser().parse_args(["serve", "--no-scheduler"])
     assert args.no_scheduler is True
+
+
+def test_plugin_dev_requires_demo(tmp_path, monkeypatch):
+    """무서명 설치는 데모 한정이다 — `--demo` 없이 `--plugin-dev` 를 주면 아무것도 만들지 않고 끝난다."""
+    monkeypatch.setattr(cli_mod, "DEFAULT_DATA_DIR", tmp_path / "never")
+    monkeypatch.setattr(cli_mod, "DEFAULT_KEYS_DIR", tmp_path / "never-keys")
+    example = ROOT / "examples" / "plugins" / "finish-log"
+    assert cli_main(["serve", "--plugin-dev", str(example)]) == 2
+    assert cli_main(["serve", "--plugin-trust", str(tmp_path / "x.pub")]) == 2
+    assert not (tmp_path / "never").exists(), "거절하면서 데이터 디렉터리를 만들면 안 된다"
+    assert not (tmp_path / "never-keys").exists()
+
+
+def _demo_assembly(tmp_path):
+    assembly, _result = cli_mod.assemble(
+        config_dir=cli_mod.DEFAULT_CONFIG_DIR, data_dir=tmp_path / "data",
+        keys_dir=tmp_path / "keys", airgap=False,
+    )
+    return assembly
+
+
+def _live_service_tokens(store, plugin_id):
+    import time
+
+    row = store.get_plugin(plugin_id)
+    now = time.time()
+    return [
+        t for t in store.list_tokens(TenantScope(row["tenant_id"]))
+        if t["service_id"] == row["service_id"] and t["role"] == "service"
+        and t["revoked_at"] is None and (t["expires_at"] is None or t["expires_at"] > now)
+    ]
+
+
+def test_demo_plugin_dev_reissues_the_token_on_every_start(tmp_path):
+    """설치는 첫 번에만 토큰을 준다 — 데모 데이터가 남는 재기동에서도 배너에 쓸 토큰이 있어야 한다.
+
+    `demo_seed` 가 매 기동 토큰을 새로 발급하는 것과 같은 이유다. 첫 기동은 설치가 준 토큰, 그다음부터는
+    유예 0 회전 — 옛 토큰은 죽고 살아 있는 토큰은 늘 하나다.
+    """
+    from app.main import VERSION
+
+    example = ROOT / "examples" / "plugins" / "finish-log"
+    assembly = _demo_assembly(tmp_path)
+    try:
+        first = cli_mod._plugin_dev_install(assembly, [example], [], version=VERSION)
+        (plugin_id,) = first
+        assert plugin_id == "example.finish-log"
+        assert first[plugin_id]["token"].startswith("lcc_") and first[plugin_id]["rotated"] is False
+        assert first[plugin_id]["signature"] == "unsigned", "데모라 무서명을 받는다 — 배너가 그렇게 말한다"
+        row = assembly.store.get_plugin(plugin_id)
+        service = assembly.store.get_service(TenantScope(row["tenant_id"]), row["service_id"])
+        assert service["status"] == "active", "개발 모드는 켜진 상태로 띄운다"
+        assert len(_live_service_tokens(assembly.store, plugin_id)) == 1
+
+        second = cli_mod._plugin_dev_install(assembly, [example], [], version=VERSION)
+        assert second[plugin_id]["rotated"] is True
+        assert second[plugin_id]["token"] != first[plugin_id]["token"]
+        assert len(_live_service_tokens(assembly.store, plugin_id)) == 1, "유예 0 — 옛 토큰은 죽는다"
+        service = assembly.store.get_service(TenantScope(row["tenant_id"]), row["service_id"])
+        assert service["status"] == "active", "재설치가 끈 것을 다시 켠다"
+
+        banner = cli_mod._demo_banner({"tenants": {}, "plugins": second}, "0.0.0.0", 8683)
+        assert f"[plugin {plugin_id}]" in banner and second[plugin_id]["token"] in banner
+        assert "LCC_URL=http://localhost:8683" in banner and "event job.finished" in banner
+    finally:
+        assembly.store.close()
+
+
+def test_demo_plugin_dev_builds_a_directory_without_symlinks(tmp_path):
+    """링크를 따라가면 링크 너머의 파일이 번들에 실린다 — 데모라도 거부한다. 개발 잔재는 담지 않는다."""
+    from app.plugins import PluginError
+
+    source = tmp_path / "p"
+    source.mkdir()
+    (source / "plugin.toml").write_text("[plugin]\n", encoding="utf-8")
+    (tmp_path / "outside.txt").write_text("secret", encoding="utf-8")
+    (source / "leak").symlink_to(tmp_path / "outside.txt")
+    with pytest.raises(PluginError, match="심볼릭 링크"):
+        cli_mod._files_under(source)
+    (source / "leak").unlink()
+    (source / "linked-dir").symlink_to(tmp_path)
+    with pytest.raises(PluginError, match="심볼릭 링크"):
+        cli_mod._files_under(source)
+    (source / "linked-dir").unlink()
+
+    (source / "__pycache__").mkdir()
+    (source / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+    (source / "acme.key").write_text("secret", encoding="utf-8")
+    files = cli_mod._files_under(source)
+    assert set(files) == {"plugin.toml"}, "잔재도 비밀 키도 담지 않는다"
+
+    files = cli_mod._files_under(ROOT / "examples" / "plugins" / "finish-log")
+    assert {"plugin.toml", "main.py", "README.md"} <= set(files)
+    with pytest.raises(PluginError, match="plugin.toml"):
+        cli_mod._files_under(tmp_path)
 
 
 def test_cli_help_exits_cleanly():
@@ -1510,10 +1606,15 @@ def test_every_version_string_agrees():
         r'VERSION="\$\{LCC_VERSION:-([^}]+)\}"',
         (ROOT / "bundle.sh").read_text(encoding="utf-8"),
     )
-    assert compose and bundle, "compose.yml 이나 bundle.sh 의 기본 버전을 못 찾았다"
+    # 패키징 CLI 는 호스트 없이 도는 단일 파일이라 판을 문자열로 들고 있다 — `init` 의 `requires_host`
+    # 와 `check` 의 기본 호스트 판이 여기서 나온다. 어긋나면 골격이 이 호스트에 설치되지 않는다.
+    lccp = re.search(
+        r'^HOST_VERSION = "([^"]+)"', (ROOT / "clients" / "lccp.py").read_text(encoding="utf-8"), re.M,
+    )
+    assert compose and bundle and lccp, "compose.yml · bundle.sh · clients/lccp.py 의 기본 버전을 못 찾았다"
     versions = {
         "pyproject": declared, "app.__version__": app.__version__, "main.VERSION": VERSION,
-        "compose.yml": compose.group(1), "bundle.sh": bundle.group(1),
+        "compose.yml": compose.group(1), "bundle.sh": bundle.group(1), "clients/lccp.py": lccp.group(1),
     }
     assert len(set(versions.values())) == 1, f"버전이 어긋난다: {versions}"
 

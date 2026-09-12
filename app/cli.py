@@ -16,10 +16,11 @@ import argparse
 import getpass
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .auth import (
     ROLE_PLATFORM_ADMIN,
@@ -61,6 +62,7 @@ from .pipeline import Pipeline
 from .completion import CompletionSignal
 from .scheduler import Scheduler
 from .store import SqliteStore
+from . import plugins as plugin_mod
 
 from .cli_paths import ROOT, bundled  # noqa: E402  (경로 해석은 한 곳에)
 
@@ -174,6 +176,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     from . import main as main_module
 
+    if (args.plugin_dev or args.plugin_trust) and not args.demo:
+        # 무서명 설치는 데모 한정이다. 여기서 끝내야 한다 — 아래로 내려가면 데이터 디렉터리부터 만든다.
+        print(
+            "  --plugin-dev / --plugin-trust 는 --demo 와 함께만 쓴다 — 무서명 설치는 데모 한정이다.",
+            file=sys.stderr,
+        )
+        return 2
+
     config_dir = Path(args.config or DEFAULT_CONFIG_DIR)
     keys_dir = None if args.no_keys else Path(args.keys or DEFAULT_KEYS_DIR)
 
@@ -189,6 +199,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     if args.demo:
         handles = demo_seed(assembly.store, assembly.vault, config=assembly.config)
+        if args.plugin_dev or args.plugin_trust:
+            try:
+                handles["plugins"] = _plugin_dev_install(
+                    assembly, [Path(p) for p in args.plugin_dev], [Path(p) for p in args.plugin_trust],
+                    version=main_module.VERSION,
+                )
+            except plugin_mod.PluginError as exc:
+                print(f"\n  플러그인 개발 모드로 띄울 수 없습니다.\n  {exc}\n", file=sys.stderr)
+                return 1
         print(_demo_banner(handles, args.host, args.port), file=sys.stderr)
 
     configure_logging(args.log_level)
@@ -693,6 +712,100 @@ def _print_generated(password: str) -> None:
     print("  이 값은 **지금 한 번만** 표시됩니다. 첫 로그인 뒤 바꾸세요.")
 
 
+#: 데모 개발 모드가 디렉터리를 번들로 만들 때 빼는 것 — 개발 잔재와 저장소 메타데이터.
+_DEV_IGNORED_DIRS = frozenset({"__pycache__", ".git", ".venv", "venv", "dist", "build", "node_modules"})
+_DEV_IGNORED_SUFFIXES = (".pyc", ".pyo", ".lccp", ".key")
+
+
+def _files_under(root: Path) -> dict[str, bytes]:
+    """디렉터리를 번들 파일 맵으로. **심볼릭 링크는 거부한다** — 따라가면 링크 너머의 파일이 번들에 실린다.
+
+    `clients/lccp.py` 의 `files_under` 와 같은 규칙이다(그쪽은 호스트 없이 도는 개발자 도구라 여기서
+    import 하지 않는다). 예약 파일(체크섬·서명)은 담지 않는다 — 데모 설치는 무서명이다.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise plugin_mod.PluginError(f"디렉터리가 아닙니다: {root}")
+    files: dict[str, bytes] = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        rel_dir = here.relative_to(root)
+        for name in dirnames:
+            if (here / name).is_symlink():
+                raise plugin_mod.PluginError(f"심볼릭 링크는 담을 수 없습니다: {(rel_dir / name).as_posix()}")
+        dirnames[:] = sorted(name for name in dirnames if name not in _DEV_IGNORED_DIRS)
+        for name in sorted(filenames):
+            path = here / name
+            rel = (rel_dir / name).as_posix()
+            if path.is_symlink():
+                raise plugin_mod.PluginError(f"심볼릭 링크는 담을 수 없습니다: {rel}")
+            if name.endswith(_DEV_IGNORED_SUFFIXES) or rel in (plugin_mod.CHECKSUMS_NAME, plugin_mod.SIGNATURE_NAME):
+                continue
+            files[rel] = path.read_bytes()
+    if plugin_mod.MANIFEST_NAME not in files:
+        raise plugin_mod.PluginError(f"{root} 에 {plugin_mod.MANIFEST_NAME} 이 없습니다")
+    return files
+
+
+def _plugin_dev_install(
+    assembly: Assembly, paths: list[Path], trust: list[Path], *, version: str,
+    now: Callable[[], float] = time.time,
+) -> dict[str, dict[str, Any]]:
+    """데모 개발 모드 — 디렉터리(또는 `.lccp`)를 **무서명으로** 설치하고 켜고, **기동마다 쓸 수 있는 토큰을 찍는다.**
+
+    첫 기동은 설치가 준 토큰을, 그다음부터는 회전한 토큰을 찍는다. `demo_seed` 가 매 기동 토큰을 새로
+    발급하는 이유와 같다 — 설치는 첫 번에만 토큰을 주고 데모 데이터 디렉터리는 재기동 사이에 남으므로,
+    회전하지 않으면 두 번째 기동부터 배너가 비어 있다. 무서명 허용은 **여기뿐**이다 — 운영 설치 경로
+    (`POST /v1/platform/plugins`)는 서명을 요구한다. `--plugin-trust` 로 준 공개 키는 데모의 신뢰
+    디렉터리에 복사돼, 서명 번들이 `signed` 로 읽히는지도 여기서 볼 수 있다.
+    """
+    trust_dir = assembly.keys_dir / "plugin-trust"
+    for pub in trust:
+        if not pub.is_file():
+            raise plugin_mod.PluginError(f"공개 키 파일이 없습니다: {pub}")
+        trust_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(pub, trust_dir / (pub.name if pub.suffix == ".pub" else pub.name + ".pub"))
+
+    out: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        if path.is_dir():
+            raw = plugin_mod.build_bundle(_files_under(path))
+        elif path.is_file():
+            raw = path.read_bytes()
+        else:
+            raise plugin_mod.PluginError(f"플러그인 경로가 없습니다: {path}")
+        inspected = plugin_mod.inspect_bundle(
+            raw, trust_dir=trust_dir, host_version=version, require_signature=False,
+            known_roles=assembly.config.roles,
+        )
+        installed = plugin_mod.install(
+            assembly.store, raw, actor="demo", data_dir=assembly.data_dir, trust_dir=trust_dir,
+            tenant_id=PLATFORM_TENANT, host_version=version, require_signature=False, now=now,
+            known_roles=assembly.config.roles,
+        )
+        plugin_mod.set_active(assembly.store, installed.plugin_id, True, actor="demo", now=now)
+        token, rotated = installed.token, False
+        if token is None:
+            fresh = plugin_mod.rotate_plugin_token(
+                assembly.store, installed.plugin_id, actor="demo", actor_role=ROLE_PLATFORM_ADMIN, now=now,
+            )
+            if fresh is None:
+                raise plugin_mod.PluginError(f"방금 설치한 플러그인이 없습니다: {installed.plugin_id}")
+            token, rotated = fresh.token, True
+        manifest = inspected.manifest
+        if manifest.schedule:
+            trigger = f"schedule {manifest.schedule} ({manifest.schedule_tz})"
+        elif manifest.event:
+            trigger = f"event {manifest.event}"
+        else:
+            trigger = "트리거 없음"
+        out[installed.plugin_id] = {
+            "token": token, "rotated": rotated, "signature": installed.signature_state,
+            "trigger": trigger, "version": installed.version, "source": str(path),
+        }
+    return out
+
+
 def _demo_banner(handles: dict[str, Any], host: str, port: int) -> str:
     base = f"http://{host if host != '0.0.0.0' else 'localhost'}:{port}"
     lines = [
@@ -713,6 +826,14 @@ def _demo_banner(handles: dict[str, Any], host: str, port: int) -> str:
         lines.append(f"  [{tenant_id}]")
         lines.append(f"    tenant_admin  {tokens['tenant_admin']}")
         lines.append(f"    service       {tokens['service']}")
+    for plugin_id, info in handles.get("plugins", {}).items():
+        note = "" if info["signature"] == "signed" else " · 무서명(데모 한정 허용)"
+        lines.append(f"  [plugin {plugin_id}]  v{info['version']} · {info['trigger']}{note}")
+        lines.append(
+            f"    token         {info['token']}"
+            + ("  (기동마다 회전한다 — 옛 토큰은 죽었다)" if info["rotated"] else "  (설치 발급)")
+        )
+        lines.append(f"    env           LCC_URL={base} LCC_TOKEN={info['token']}")
     lines += ["", "-" * 72, ""]
     return "\n".join(lines)
 
@@ -747,6 +868,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--no-scheduler", action="store_true",
         help="스케줄러를 띄우지 않는다. 워커를 여러 개 띄울 때 하나만 켜기 위한 것",
+    )
+    serve.add_argument(
+        "--plugin-dev", action="append", default=[], metavar="PATH",
+        help="(--demo 전용, 반복 가능) 플러그인 디렉터리나 .lccp 를 무서명으로 설치하고 켠 뒤 "
+             "기동마다 쓸 수 있는 토큰을 배너에 찍는다 — 플러그인 개발 루프",
+    )
+    serve.add_argument(
+        "--plugin-trust", action="append", default=[], metavar="PUB",
+        help="(--demo 전용, 반복 가능) 이 공개 키(.pub)를 데모의 신뢰 디렉터리에 복사한다 — 서명 번들 확인용",
     )
     serve.set_defaults(func=cmd_serve)
 
