@@ -852,5 +852,10 @@ def integration_guide(
         "`/v1/client/` 에 단일 파일 클라이언트와 목 서버가 있다. 목 서버는 역할 목록을",
         "실제 설정에서 읽으므로 역할 이름이 어긋나지 않는다.",
         "",
+        "플러그인을 만들 때는 같은 곳의 `plugin.py`(런타임 — 처리 뒤 ack · 간격 · 401 을 대신 지킨다)와",
+        "`lccp.py`(패키징 — 호스트와 같은 규칙으로 검사하고 서명한다)를 내려받는다. 목 서버의",
+        "`--plugin-events` · `--plugin-tick-every N` 이 두 트리거를 흉내 내고, 호스트의",
+        "`serve --demo --plugin-dev <디렉터리>` 가 무서명으로 설치해 켠다. 작성 가이드는 `docs/plugin-authoring.md`.",
+        "",
     ]
     return "\n".join(lines)

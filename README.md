@@ -49,6 +49,16 @@ LCC_URL=http://localhost:8610 LCC_TOKEN=any python clients/client.py "요약할 
 목 서버는 **역할 목록을 실제 설정에서 읽습니다** — 손으로 적으면 진짜 서버와
 역할 이름이 어긋나고, 어긋난 채로 통합이 끝나면 배포 당일에 404 를 만납니다.
 
+플러그인도 같은 목으로 만듭니다 — `--plugin-events`·`--plugin-tick-every N` 이 두 트리거를 흉내 내고,
+`python -m app serve --demo --plugin-dev <디렉터리>` 는 데모 호스트에 무서명으로 설치해 켜고 토큰을 배너에 찍습니다.
+
+```sh
+python clients/mock_server.py --config config --plugin-events --plugin-tick-every 30 &
+LCC_SDK_DIR=clients LCC_URL=http://localhost:8610 LCC_TOKEN=any python examples/plugins/finish-log/main.py --once
+```
+
+작성 가이드는 [docs/plugin-authoring.md](docs/plugin-authoring.md), 예제는 [examples/plugins/](examples/plugins/).
+
 ---
 
 ## 설치
@@ -164,7 +174,7 @@ curl -X POST https://llm.example.com/v1/chat \
 | `GET /v1/integration` | 사람이 읽는 통합 가이드 |
 | `GET /v1/meta` | 기계가 읽는 계약 — 역할·한도·오류 코드 |
 | `GET /v1/openapi.json` | OpenAPI 3.1. `role` enum 에 **이 토큰이 쓸 수 있는 역할만** |
-| `GET /v1/client/*` | 단일 파일 클라이언트 + 목 서버 원본 |
+| `GET /v1/client/*` | 단일 파일 클라이언트 · 플러그인 런타임 · 플러그인 패키징 CLI · 목 서버 원본 |
 | `GET /v1/jobs` | 내 작업 목록 — 같은 테넌트·서비스·엔드유저의 것만, 마스킹본으로 |
 | `GET /healthz` | 인증 불필요 |
 
@@ -245,6 +255,7 @@ LCC_AIRGAP=1 docker compose up -d
 | [docs/qa-audit-response.md](docs/qa-audit-response.md) | QA 감사(25건) **개선 결과 회신** — 항목별 조치·커밋·재발 방지 장치 |
 | [docs/plan.md](docs/plan.md) | 착수 시점의 계획서 + **구현하면서 달라진 것** |
 | [docs/plugin-exploration.md](docs/plugin-exploration.md) | 플러그인 시스템 **기술 탐색** — 포맷·설치 절차·격리 (결정 아님) |
+| [docs/plugin-authoring.md](docs/plugin-authoring.md) | **플러그인 작성 가이드** — 매니페스트 · 두 트리거 · 토큰 · Python SDK · 개발 루프 · 패키징·서명(`lccp`) · systemd 배포 |
 | [docs/topology.md](docs/topology.md) | 서버 구조도 · 데이터 경계 |
 | [docs/capacity.md](docs/capacity.md) | 규모 산정 · 증설 트리거 |
 | [docs/deployment.md](docs/deployment.md) | 배포 프로파일 · 업그레이드 |

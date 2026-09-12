@@ -278,6 +278,7 @@ Ollama 는 기본 무인증이다. 전제를 명시한다.
 | **메트릭** | Prometheus/OpenMetrics `GET /metrics` |
 | **로그** | 구조화(JSON) stdout. **프롬프트·응답 본문·비밀 미포함** |
 | **진단 번들** | `./doctor.sh --bundle` — 설정(비밀 마스킹)·스키마 버전·노드 상태·최근 오류 |
+| **플러그인** | 올리기 전 사전 검사 `POST /v1/platform/plugins/inspect`(설치와 같은 검증, 아무것도 안 만든다) · 토큰 회전 `POST /v1/platform/plugins/{id}/rotate-token`(유예 · 살아 있는 토큰이 없으면 발급) — 둘 다 플랫폼 면이라 LAN/테일넷에서. 플러그인 자체는 공개 주소의 `/v1/plugin/*` 로 온다. 만드는 쪽은 [plugin-authoring.md](plugin-authoring.md) |
 
 알림 3원칙: 상태 전이에서만 / 기동 시 "복구됨" 을 보내지 않는다 / 비밀·프롬프트·응답을 담지 않는다.
 

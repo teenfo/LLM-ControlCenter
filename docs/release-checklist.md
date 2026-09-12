@@ -44,6 +44,10 @@
   0.5.0 은 대화 API(`POST /v1/chat` · 역할 `kind: chat`)와 서비스 정책 수정(`PUT /v1/admin/services/{id}`)을 더한 판이다 —
   새 소비자 라우트·새 역할 종류·새 관리 라우트라 마이너다. **사이트 `roles.yaml` 의 `chat` 이 `kind: chat` 으로 바뀌어야
   대화 탭이 살고, 0.4.0 으로 되돌릴 때는 그 파일도 함께 되돌린다**(0.4.0 은 `kind: chat` 을 모른다)
+  0.6.0 은 플러그인 개발 키트를 더한 판이다 — 플랫폼 라우트 둘(`POST /v1/platform/plugins/inspect` · `…/{id}/rotate-token`) ·
+  `POST /v1/plugin/events` 의 `limit: 0`(ack 만) · 번들 클라이언트 두 파일(`plugin.py` 런타임 · `lccp.py` 패키징) · 데모
+  `--plugin-dev` 라 마이너다. **스키마 변경이 없다** — `.env` 한 줄로 0.5.0 되돌리기가 그대로 성립한다. 신뢰 키(`keys/plugin-trust/*.pub`)는
+  키 볼륨에 두므로 되돌려도 남는다
   **마이너를 올리면 플러그인의 `requires_host` 범위를 본다** — `>=0.1,<0.2` 로 선언한 플러그인은 0.2.0 호스트에
   설치되지 않는다(그것이 그 필드의 뜻이다). 0.2.0 을 올릴 때 테스트 번들이 정확히 그렇게 거절됐다
 - [ ] `./bundle.sh` — 같은 이유로 도커 데몬이 있는 곳에서. 없으면 `image.tar` 없이
@@ -154,7 +158,8 @@
 - **관리 신원은 로컬 계정뿐이다.** 관제 UI 는 `admin` 계정으로 들어가지만 IdP·MFA 가 없다. 관리자 퇴사는 계정 정지(`account disable`)와 토큰 폐기로 사람이 처리한다
 - **컨트롤 플레인은 1대다**(SPOF). 의도한 선택이고 Scale 프로파일에서 푼다
 - **토큰 처리율은 보여 주기만 하고 한도로 걸지 않는다.** 설치처 분포를 본 뒤 건다
-- **플러그인은 플랫폼 테넌트 전용이고 토큰 회전 경로가 없다** ([plugin-exploration §11](plugin-exploration.md))
+- **플러그인은 플랫폼 테넌트 전용이다.** 토큰 회전·재발급은 0.6.0 부터 `rotate-token` 으로 한다 — 콘솔 「토큰 회전」은 유예 60분
+  ([plugin-authoring §5](plugin-authoring.md), [plugin-exploration §11](plugin-exploration.md))
 - **가드 2단·라우팅 분류기는 인증(certify)이 끝나야 판정한다.** 기동 직후 `doctor` 가
   `model_not_certified` 를 경고하는 것은 정상이고, 스케줄러가 자동 인증한다
 - **첫 설치처(2026-09-10)는 2코어·4GB 노트북이고 Wi-Fi 로 붙어 있다.** 컨트롤 플레인은

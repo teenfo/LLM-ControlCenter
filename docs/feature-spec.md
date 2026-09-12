@@ -1019,12 +1019,13 @@
 상태   구현됨
 
 ### META-4  번들 클라이언트
-정의   단일 파일 클라이언트와 목 서버 원본을 그대로 내려준다.
+정의   단일 파일 클라이언트 · 목 서버 · 플러그인 런타임 · 플러그인 패키징 CLI 원본을 그대로 내려준다.
 표면   `GET /v1/client` · `GET /v1/client/{name}` · `clients/`
 구현   `app/meta.py` · `app/main.py:client_index` `client_file`
-계약   목록은 실제 번들 파일을 반영한다 · 경로 순회(`../`)를 거부한다
+계약   목록은 실제 번들 파일을 반영한다 · 경로 순회(`../`)를 거부한다 · 클라이언트·목·런타임은 표준 라이브러리만 import 한다(AST 검사)
 고정   `test_meta.py::test_client_index_lists_bundled_files`
        `test_meta.py::test_client_file_refuses_path_traversal`
+       `test_packaging.py::test_bundled_client_files_import_only_the_standard_library`
 상태   구현됨
 
 ### META-5  생존 확인
@@ -1264,7 +1265,7 @@
 
 ## 12. 플러그인
 
-주 모듈: `plugins.py` · 배경: [plugin-exploration.md](plugin-exploration.md)
+주 모듈: `plugins.py` · 배경: [plugin-exploration.md](plugin-exploration.md) · 작성 가이드: [plugin-authoring.md](plugin-authoring.md)
 
 플러그인은 **앞문으로 지나는 소비자**다. LLM 을 쓸 때 `POST /v1/generate` 를 지나므로
 가드·경계·레이트리밋·예산·사용량 집계·감사가 배선 없이 붙는다. 지금 지원하는 실행
@@ -1350,7 +1351,7 @@
        test_plugins.py::test_the_lifecycle_is_audited
 계약   화면이 자체 상태를 들고 있지 않다 — 활성 여부는 서버가 서비스에서 파생해 준다
        번들 업로드는 raw body 다(멀티파트는 6번째 의존성)
-상태   부분 — `external` 외 실행 형태 없음. 트리거는 `schedule`(PLUGIN-8)·`event`(PLUGIN-9) 둘
+상태   부분 — `external` 외 실행 형태 없음. 트리거는 `schedule`(PLUGIN-8)·`event`(PLUGIN-9) 둘. 만드는 쪽의 도구는 PLUGIN-10
 
 ### PLUGIN-7  재귀 방지 — 플러그인이 만든 잡은 아무것도 깨우지 않는다
 정의   잡마다 그것을 만든 플러그인을 적어 두고, 그 잡의 완료로는 어떤 플러그인도 깨우지 않는다.
@@ -1432,6 +1433,38 @@
        test_architecture.py::test_only_the_finish_trigger_writes_plugin_events
        test_architecture.py::test_the_event_trigger_asks_the_recursion_judgment
 상태   구현됨 — 이벤트는 `job.finished` 하나. 나가기 전에 개입하는 훅(수정·차단)은 없다
+
+### PLUGIN-10  개발 키트 — 런타임 SDK · 패키징 CLI · 개발 하네스
+정의   플러그인을 **만드는 쪽**이 손에 쥐는 것: 계약을 대신 지키는 런타임(`clients/plugin.py`), 호스트와 같은 규칙으로 검사하고
+       서명하는 패키징 CLI(`clients/lccp.py`), 두 트리거를 흉내 내는 목 서버 플래그, 디렉터리를 무서명으로 설치해 켜는 데모 개발 모드,
+       예제 둘과 systemd 템플릿. 작성 가이드는 [plugin-authoring.md](plugin-authoring.md).
+표면   `GET /v1/client/plugin.py` · `GET /v1/client/lccp.py` · `mock_server.py --plugin-events --plugin-tick-every N` ·
+       `serve --demo --plugin-dev PATH [--plugin-trust PUB]` · `examples/plugins/`(`finish-log` · `daily-status` · `systemd/`)
+구현   clients/plugin.py:Plugin.run · clients/lccp.py(keygen · init · check · build · sign · verify · inspect) ·
+       clients/mock_server.py:_plugin_tick · _plugin_events · app/cli.py:_plugin_dev_install · _files_under · _demo_banner
+계약   **런타임** — 배치의 핸들러가 전부 끝난 뒤에만 ack(`limit: 0`) · `pending` 이 남으면 즉시 재풀 · 선언하지 않은 트리거는 묻지 않는다 ·
+       tick 간격은 `next_run_at` 에서 [하한 5초, 상한 300초] 로 자르고 지터 · 401 은 "꺼졌다" 로 읽고 상한 간격으로 기다린다(`exit` 선택) ·
+       404 `not_found` 는 치명 · 409 는 이벤트 풀만 멈춤 · 429 는 `retry_after` · 네트워크 오류는 지수 백오프 · SIGTERM 은 현재 배치를 끝내고 정지 ·
+       옆의 `client.py` 를 경로로 싣는다(오류 계약을 두 벌로 두지 않는다) · 표준 라이브러리만 · 3.9 문법
+       **패키징** — `check` 가 통과하면 호스트도 매니페스트 규칙에서는 통과한다: 규칙 코드(`parse_manifest`·`_parse_trigger`·`host_satisfies`·
+       `safe_names`·cron)를 그대로 옮기고 이름마다 AST 동일성으로 묶는다 · 거부 사유는 호스트와 같은 문장 · 못 보는 것은 역할 실재뿐(사전 검사 몫) ·
+       번들은 재현 가능(고정 시각·정렬) · 심볼릭 링크·상한·비밀 키(`*.key`)는 만들 때 거른다 · 공개 키는 hex 텍스트 · cryptography 는 함수 안에서만
+       **개발 모드** — 무서명 허용은 `serve --demo --plugin-dev` 뿐 · 켜진 상태로 띄운다 · 첫 기동은 설치 토큰, 그다음은 유예 0 회전 토큰을 배너에 ·
+       `--demo` 없이는 아무것도 만들지 않고 2 로 끝난다 · 디렉터리의 심볼릭 링크는 거부
+       **예제** — 기본으로 본문을 기록하지 않는다(`--with-text` 로만) · 이 호스트 판에 실제로 설치된다(`requires_host`) · systemd 템플릿은 값 뒤 주석이 없다
+고정   test_plugin_sdk.py::test_the_sdk_acks_only_after_every_handler_in_the_batch_succeeded
+       test_plugin_sdk.py::test_a_failing_handler_leaves_the_batch_unacked_and_it_is_redelivered
+       test_plugin_sdk.py::test_the_sdk_does_not_poll_what_the_plugin_did_not_declare
+       test_plugin_sdk.py::test_the_sdk_waits_on_401_and_recovers_when_the_plugin_is_switched_back_on
+       test_plugin_sdk.py::test_the_sdk_round_trips_against_the_real_host
+       test_plugin_kit.py::test_lccp_rules_are_the_host_rules_ast_for_ast
+       test_plugin_kit.py::test_lccp_check_agrees_with_the_host_on_the_manifest_corpus
+       test_plugin_kit.py::test_lccp_build_is_accepted_by_the_host_as_signed
+       test_plugin_kit.py::test_lccp_builds_are_byte_identical
+       test_plugin_kit.py::test_finish_log_records_metadata_only_by_default
+       test_packaging.py::test_demo_plugin_dev_reissues_the_token_on_every_start
+       test_packaging.py::test_bundled_client_files_import_only_the_standard_library
+상태   구현됨 — Python 만. 다른 언어는 `GET /v1/meta`·`/v1/openapi.json` 의 계약으로 직접 짠다(HTTP 계약은 가이드 §4)
 
 ### PLUGIN-11  토큰 회전 · 사전 검사
 정의   플러그인 서비스의 토큰을 회전하고(살아 있는 것이 없으면 발급하고), 번들을 설치하지 않고 설치와 같은 검증만 돌린다.
@@ -1655,12 +1688,13 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 
 | 명령 | 기능 |
 |---|---|
-| `serve` | 전체 서비스 기동 (`--demo` PKG-2 · `--airgap` CLUSTER-9 PKG-4) |
+| `serve` | 전체 서비스 기동 (`--demo` PKG-2 · `--airgap` CLUSTER-9 PKG-4 · `--plugin-dev` `--plugin-trust` PLUGIN-10) |
 | `bootstrap` | PKG-1 |
 | `doctor` | OPS-5 CRYPTO-2 CRYPTO-4 |
 | `rotate-kek` | CRYPTO-2 |
 | `audit-export` | CRYPTO-5 |
 | `account` | AUTH-9 AUTH-10 (`create` · `list` · `reset-password` · `disable` · `enable` — `--role user` 가 AUTH-10) |
+| (호스트 CLI 아님) `clients/lccp.py` | PLUGIN-10 — 플러그인 패키징 (`keygen` · `init` · `check` · `build` · `sign` · `verify` · `inspect`). `GET /v1/client/lccp.py` 로 내려받는 단일 파일 |
 
 ---
 
