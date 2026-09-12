@@ -193,6 +193,8 @@
   "ui.plugin_no_trust_key": "No trust keys — signed bundles cannot be installed",
   "ui.plugin_missing_files": "Payload files are missing",
   "ui.plugin_none": "No plugins installed",
+  "ui.plugin_rotate_token": "Rotate token",
+  "ui.plugin_token_rotated": "New token — the old one dies in {minutes} min",
   "ui.username": "Username",
   "ui.password": "Password",
   "ui.login_hint": "Sign in with an admin account. The session expires after 12 hours.",

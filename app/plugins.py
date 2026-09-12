@@ -43,7 +43,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-from .auth import ROLE_SERVICE, issue_token, service_is_active
+from .auth import ROLE_SERVICE, issue_token, rotate_token, service_is_active
 from .bootstrap import PLATFORM_TENANT
 from .config import INTERNAL
 from .schedule import ScheduleError, next_after, parse_cron
@@ -511,27 +511,37 @@ def plugin_root(data_dir: Path) -> Path:
     return Path(data_dir) / "plugins"
 
 
-def install(
-    store: SqliteStore,
+@dataclass(frozen=True)
+class Inspected:
+    """검증을 통과한 번들. **설치는 이 결과만 믿고 푼다** — 사전 검사와 설치가 같은 것을 본다."""
+
+    manifest: Manifest
+    names: tuple[str, ...]
+    signature_state: str
+    bundle_sha256: str
+    #: 검증을 통과한 바로 그 바이트. `install` 은 이것만 푼다.
+    bundle: bytes
+
+    @property
+    def payload(self) -> tuple[str, ...]:
+        """번들 안의 **내용 파일** — 체크섬·서명 같은 예약 파일은 뺀다."""
+        return tuple(name for name in self.names if name not in _RESERVED)
+
+
+def inspect_bundle(
     bundle: bytes,
     *,
-    actor: str,
-    data_dir: Path,
     trust_dir: Path,
-    tenant_id: str,
     host_version: str,
     require_signature: bool = True,
-    now: Callable[[], float] = time.time,
     known_roles: Iterable[str] | None = None,
-) -> Installed:
-    """번들을 검증하고 **서비스를 만들고 토큰을 발급한다.**
+) -> Inspected:
+    """번들을 **설치하지 않고** 설치와 같은 순서로 검증한다.
 
-    설치가 곧 서비스 등록인 것이 요점이다. 이 함수가 끝나는 순간 플러그인은 아직
-    한 줄도 안 돌았지만, 사용량 화면에 서비스 축으로 이미 잡히고 레이트리밋에 걸리고
-    예산에 계산된다 — 배선을 따로 하지 않는다.
-
-    `known_roles` 를 주면 이벤트 구독의 역할 필터를 그 목록에 대고 검사한다. 오타 난
-    역할은 조용히 아무것도 안 받는 플러그인이 되므로 **설치 시점에** 거부한다.
+    `install` 이 이 함수를 부른다 — 검증이 두 벌이면 사전 검사는 통과했는데 설치가
+    거절하는(또는 그 반대) 날이 온다. 구조 검사가 `install` 이 직접 검증하지 않는 것을
+    지킨다(`test_install_delegates_validation_to_inspect_bundle`). 사전 검사 라우트
+    (`platform_plugin_inspect`)는 이 함수만 부르고 DB 도 디스크도 건드리지 않는다.
     """
     _require(
         len(bundle) <= MAX_BUNDLE_BYTES,
@@ -573,6 +583,44 @@ def install(
                 f"{trust_dir} 에 `<이름>.pub` 으로 두세요"
             )
 
+    return Inspected(
+        manifest=manifest,
+        names=tuple(names),
+        signature_state=state,
+        bundle_sha256=hashlib.sha256(bundle).hexdigest(),
+        bundle=bundle,
+    )
+
+
+def install(
+    store: SqliteStore,
+    bundle: bytes,
+    *,
+    actor: str,
+    data_dir: Path,
+    trust_dir: Path,
+    tenant_id: str,
+    host_version: str,
+    require_signature: bool = True,
+    now: Callable[[], float] = time.time,
+    known_roles: Iterable[str] | None = None,
+) -> Installed:
+    """번들을 검증하고 **서비스를 만들고 토큰을 발급한다.**
+
+    설치가 곧 서비스 등록인 것이 요점이다. 이 함수가 끝나는 순간 플러그인은 아직
+    한 줄도 안 돌았지만, 사용량 화면에 서비스 축으로 이미 잡히고 레이트리밋에 걸리고
+    예산에 계산된다 — 배선을 따로 하지 않는다.
+
+    `known_roles` 를 주면 이벤트 구독의 역할 필터를 그 목록에 대고 검사한다. 오타 난
+    역할은 조용히 아무것도 안 받는 플러그인이 되므로 **설치 시점에** 거부한다.
+    """
+    inspected = inspect_bundle(
+        bundle, trust_dir=trust_dir, host_version=host_version,
+        require_signature=require_signature, known_roles=known_roles,
+    )
+    manifest, names, state = inspected.manifest, list(inspected.names), inspected.signature_state
+
+    with zipfile.ZipFile(io.BytesIO(inspected.bundle)) as archive:
         target = plugin_root(data_dir) / manifest.plugin_id / manifest.version
         staging = target.with_name(target.name + ".incoming")
         if staging.exists():
@@ -619,7 +667,7 @@ def install(
         "service_id": service_id,
         "endpoint": manifest.endpoint,
         "manifest_json": json.dumps(manifest.raw, ensure_ascii=False, sort_keys=True),
-        "bundle_sha256": hashlib.sha256(bundle).hexdigest(),
+        "bundle_sha256": inspected.bundle_sha256,
         "signature_state": state,
         "last_error": None,
         "installed_by": actor,
@@ -716,6 +764,87 @@ def uninstall(store: SqliteStore, plugin_id: str, *, actor: str, data_dir: Path)
     shutil.rmtree(plugin_root(data_dir) / plugin_id, ignore_errors=True)
     store.audit(actor, "uninstall_plugin", target=plugin_id)
     return True
+
+
+@dataclass(frozen=True)
+class RotatedToken:
+    """플러그인 토큰 회전의 결과. `token` 원값은 **이때가 마지막이다.**"""
+
+    plugin_id: str
+    service_id: str
+    token_id: str
+    token: str
+    grace_seconds: float
+    #: 회전이 아니라 발급이었다 — 살아 있는 토큰이 하나도 없었다.
+    reissued: bool
+    old_token_id: str | None
+    #: 유예를 주었을 때 옛 토큰이 죽는 시각. 즉시 폐기(유예 0)나 발급이면 `None`.
+    old_token_expires_at: float | None
+
+
+def rotate_plugin_token(
+    store: SqliteStore,
+    plugin_id: str,
+    *,
+    actor: str,
+    actor_role: str,
+    grace_seconds: float = 0.0,
+    now: Callable[[], float] = time.time,
+) -> RotatedToken | None:
+    """플러그인의 토큰을 회전한다 — **살아 있는 토큰이 없으면 발급한다.**
+
+    재설치는 토큰을 다시 주지 않고(`install`), 제거는 서비스 행을 남긴다(`uninstall`).
+    그래서 토큰을 잃거나 폐기한 플러그인이 새 토큰을 받는 길은 여기뿐이다. 회전은
+    발급이므로 `auth.rotate_token` 을 그대로 지난다 — 규칙을 두 곳에 적지 않는다.
+
+    회전 대상은 **가장 최근에 산 토큰** 하나다. 유예 회전은 옛 토큰을 폐기하지 않고
+    만료만 걸어 두므로, 살아 있는 토큰을 고를 때 `expires_at` 도 본다 — 안 그러면
+    유예 중인 옛 토큰을 또 회전시켜 새 토큰을 두 장 만든다.
+    `None` 은 플러그인이 없다는 뜻이다.
+    """
+    row = store.get_plugin(plugin_id)
+    if row is None:
+        return None
+    scope = TenantScope(row["tenant_id"])
+    moment = now()
+    live = sorted(
+        (
+            t for t in store.list_tokens(scope)
+            if t["service_id"] == row["service_id"] and t["role"] == ROLE_SERVICE
+            and t["revoked_at"] is None
+            and (t["expires_at"] is None or t["expires_at"] > moment)
+        ),
+        key=lambda t: t["created_at"], reverse=True,
+    )
+    if live:
+        old = live[0]
+        token_id, raw = rotate_token(
+            store, scope, old["id"], actor=actor, actor_role=actor_role,
+            grace_seconds=grace_seconds, now=now,
+        )
+        old_id: str | None = old["id"]
+        old_expires = moment + grace_seconds if grace_seconds > 0 else None
+        reissued = False
+    else:
+        token_id, raw = issue_token(
+            store, scope, row["service_id"], role=ROLE_SERVICE,
+            note=f"plugin {plugin_id}", actor=actor,
+        )
+        old_id = None
+        old_expires = None
+        reissued = True
+    store.audit(
+        actor, "rotate_plugin_token", tenant_id=scope.tenant_id, target=plugin_id,
+        detail={
+            "service": row["service_id"], "new_token_id": token_id,
+            "grace_seconds": grace_seconds, "reissued": reissued,
+        },
+    )
+    return RotatedToken(
+        plugin_id=plugin_id, service_id=row["service_id"], token_id=token_id, token=raw,
+        grace_seconds=grace_seconds, reissued=reissued,
+        old_token_id=old_id, old_token_expires_at=old_expires,
+    )
 
 
 # ── 스케줄 클레임 ────────────────────────────────────────────────────────────
@@ -974,7 +1103,8 @@ def pull_events(
     tenant = visible_tenant(row)
     roles = subscribed_roles(row) or None
     batch = store.plugin_events_after(
-        cursor, tenant_id=tenant, roles=roles, limit=max(1, min(int(limit), MAX_EVENT_BATCH)),
+        # `limit: 0` 은 "ack 만" 이다 — 처리를 끝낸 배치를 확정하려고 한 건을 더 받을 필요가 없다.
+        cursor, tenant_id=tenant, roles=roles, limit=max(0, min(int(limit), MAX_EVENT_BATCH)),
     )
 
     events: list[dict[str, Any]] = []

@@ -684,3 +684,13 @@ def test_the_connections_view_can_edit_and_add_a_service():
     assert "'/v1/admin/services/'" in form and "method: 'PUT'" in form
     assert "'/v1/admin/services'" in form and "method: 'POST'" in form
     assert "allow_roles" in form and "require_end_user" in form and "openDrawer(" in form
+
+
+def test_the_plugin_panel_can_rotate_a_token():
+    """토큰을 잃은 플러그인의 유일한 재발급 경로가 화면에 있어야 한다 — 회전 버튼과 1회 표시 드로어."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    panel = source[source.index("async function renderPlugins"):source.index("async function rotatePluginToken")]
+    assert "rotatePluginToken(p.id)" in panel and "'ui.plugin_rotate_token'" in panel
+    rotate = source[source.index("async function rotatePluginToken"):source.index("function triggerCell")]
+    assert "/rotate-token'" in rotate and "grace_seconds: 3600" in rotate
+    assert "openDrawer(" in rotate and "'ui.plugin_token_rotated'" in rotate and "'ui.plugin_token_once'" in rotate

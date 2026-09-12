@@ -1303,7 +1303,7 @@
 구현   app/plugins.py:install · parse_manifest · host_satisfies · app/plugins.py:plugin_root
 계약   **권한 모델을 새로 만들지 않는다** — 관리자가 읽는 문장과 DB 값과 강제되는 것이 같다
        설치는 켜는 것이 아니다(항상 inactive 로 착지) · 업그레이드도 inactive 로 착지한다
-       재설치는 토큰을 재발급하지 않는다 — 갈아 치우면 도는 플러그인이 조용히 죽는다
+       재설치는 토큰을 재발급하지 않는다 — 갈아 치우면 도는 플러그인이 조용히 죽는다 · 토큰은 `rotate-token` 으로 회전·재발급한다(PLUGIN-11)
        설치본은 데이터 디렉터리로 간다(`config/` 는 읽기 전용 마운트)
        내부(밑줄) 역할은 요청할 수 없다 · 호스트 버전 범위를 못 맞추면 거부한다
        거부 사유는 사람이 읽고 고칠 수 있는 문장이다
@@ -1414,7 +1414,7 @@
        아웃박스를 쓰는 곳은 DB 트리거 하나다 — 종결 경로가 여덟 개 남짓이라 파이썬에서 하나씩 넣으면 하나가
        빠진다. 종결과 같은 트랜잭션이고, 종결에서 종결로(검토 판정)는 새 이벤트가 아니다
        본문을 복제하지 않는다 — 행은 잡을 가리키고 내용은 읽을 때 합친다. 보존·파기가 잡과 함께 간다
-       풀이다(PLUGIN-8 과 같은 이유) · at-least-once · 커서는 `ack` 로만 앞으로 간다(CAS) · 없는 이벤트는 ack 못 한다
+       풀이다(PLUGIN-8 과 같은 이유) · at-least-once · 커서는 `ack` 로만 앞으로 간다(CAS) · 없는 이벤트는 ack 못 한다 · `limit: 0` 은 ack 만 하고 아무것도 받지 않는다
        **플러그인이 만든 잡의 종결은 어떤 플러그인에게도 안 준다** — PLUGIN-7 의 판정을 내주기 직전에 묻는다
        켜는 순간부터다 — 커서가 켤 때 그 시점으로 잡힌다. 꺼져 있던 동안의 종결은 안 준다
        **끄면 선다** — 이 경로도 `auth.active_service` 를 지난다
@@ -1432,6 +1432,28 @@
        test_architecture.py::test_only_the_finish_trigger_writes_plugin_events
        test_architecture.py::test_the_event_trigger_asks_the_recursion_judgment
 상태   구현됨 — 이벤트는 `job.finished` 하나. 나가기 전에 개입하는 훅(수정·차단)은 없다
+
+### PLUGIN-11  토큰 회전 · 사전 검사
+정의   플러그인 서비스의 토큰을 회전하고(살아 있는 것이 없으면 발급하고), 번들을 설치하지 않고 설치와 같은 검증만 돌린다.
+표면   `POST /v1/platform/plugins/{plugin_id}/rotate-token` (`grace_seconds`) · `POST /v1/platform/plugins/inspect` (raw body) · 관제 UI 플러그인 탭 「토큰 회전」
+구현   app/plugins.py:inspect_bundle · rotate_plugin_token · app/main.py:platform_plugin_inspect · platform_plugin_rotate_token
+계약   회전은 발급이다 — `auth.rotate_token` 을 그대로 지난다 · 새 토큰은 응답에 한 번 · 옛 토큰은 유예(`grace_seconds`, 기본 0) 뒤 401
+       살아 있는 토큰이 없으면 발급한다 — PLUGIN-3 의 "재설치는 재발급하지 않는다" 의 짝이라 이것이 유일한 재발급 경로다
+       회전 대상은 가장 최근에 산 토큰 하나 · 유예 중인 옛 토큰은 그대로 만료를 기다린다
+       **검증은 한 함수다** — `install` 은 `inspect_bundle` 을 부르고 직접 검증하지 않는다(구조 검사가 지킨다)
+       사전 검사는 DB 도 디스크도 건드리지 않는다 · 거부 사유는 설치와 같은 문장이다 · 둘 다 플랫폼 관리자 전용
+       이벤트 풀은 `limit: 0` 을 "ack 만" 으로 받는다 — 처리를 끝낸 배치를 확정하려고 한 건을 더 받을 필요가 없다
+고정   test_plugins.py::test_rotating_a_plugin_token_keeps_the_plugin_alive_within_the_grace
+       test_plugins.py::test_the_old_plugin_token_dies_after_the_grace
+       test_plugins.py::test_a_plugin_whose_token_was_revoked_can_get_a_new_one
+       test_plugins.py::test_rotation_picks_the_newest_live_token_when_several_exist
+       test_plugins.py::test_plugin_token_rotation_is_platform_admin_only_and_audited
+       test_plugins.py::test_inspect_validates_without_installing
+       test_plugins.py::test_inspect_rejects_exactly_what_install_rejects
+       test_plugins.py::test_install_delegates_validation_to_inspect_bundle
+       test_plugins.py::test_an_ack_only_pull_moves_the_cursor_and_returns_nothing
+       test_ui.py::test_the_plugin_panel_can_rotate_a_token
+상태   구현됨
 
 ---
 
@@ -1609,6 +1631,8 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_plugins` | `GET/POST /v1/platform/plugins` | PLUGIN-1 PLUGIN-3 PLUGIN-6 |
 | `platform_plugin_activate` | `POST /v1/platform/plugins/{id}/activate` | PLUGIN-4 |
 | `platform_plugin_delete` | `DELETE /v1/platform/plugins/{id}` | PLUGIN-5 |
+| `platform_plugin_inspect` | `POST /v1/platform/plugins/inspect` | PLUGIN-11 |
+| `platform_plugin_rotate_token` | `POST /v1/platform/plugins/{id}/rotate-token` | PLUGIN-11 |
 | `plugin_tick` | `POST /v1/plugin/tick` | PLUGIN-8 |
 | `plugin_events` | `POST /v1/plugin/events` | PLUGIN-9 |
 | `platform_diagnostics` | `GET /v1/platform/diagnostics` | OPS-3 |

@@ -1430,6 +1430,8 @@ async function renderPlugins() {
     el('span', { class: 'mono', text: triggerCell(p) }),
     p.files_present ? '' : pill(t('ui.plugin_missing_files'), 'danger'),
     el('div', { class: 'row end' }, [
+      // 토큰을 잃은 플러그인의 유일한 재발급 경로 — 재설치는 토큰을 다시 주지 않는다.
+      el('button', { type: 'button', class: 'sm', text: t('ui.plugin_rotate_token'), onclick: () => rotatePluginToken(p.id) }),
       el('button', {
         type: 'button', class: 'danger sm', text: t('ui.plugin_remove'),
         onclick: async () => {
@@ -1452,6 +1454,23 @@ async function renderPlugins() {
           rows)]
       : [emptyState(t('ui.plugin_none'))]),
   ];
+}
+
+/** 플러그인 토큰 회전. 새 토큰은 이 응답이 마지막이라 드로어에 띄운다 — 갱신이 드로어를 지우지 않는다.
+ *  유예 3600초는 서비스 토큰 회전(rotateToken)과 같다 — 운영자가 플러그인 설정을 고치고 재시작할 시간이다.
+ *  살아 있는 토큰이 없으면 서버가 발급한다(응답의 reissued).
+ */
+async function rotatePluginToken(pluginId) {
+  if (!window.confirm(pluginId)) return;
+  try {
+    const rotated = await api('/v1/platform/plugins/' + encodeURIComponent(pluginId) + '/rotate-token', {
+      method: 'POST', body: { grace_seconds: 3600 },
+    });
+    openDrawer(t('ui.plugin_token_rotated', { minutes: 60 }), [
+      el('p', { class: 'hint', text: t('ui.plugin_token_once') }),
+      el('pre', { class: 'reveal', text: rotated.token }),
+    ], [el('button', { type: 'button', class: 'right primary', text: t('ui.close'), onclick: () => { closeDrawer(); refresh(); } })]);
+  } catch (err) { showError(err); }
 }
 
 /** 트리거 칸. 스케줄이면 cron(한 번도 안 돌았으면 그 사실), 이벤트면 구독한 것과 밀린 건수.

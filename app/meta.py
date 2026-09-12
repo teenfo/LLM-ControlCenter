@@ -201,6 +201,16 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
         "플러그인 제거. **서비스 행은 남긴다** — 사용량·감사가 이름을 잃지 않게.",
         "platform_admin", False,
     ),
+    "platform_plugin_inspect": (
+        "번들 사전 검사 — 설치와 **같은 함수**로 검증만 하고 아무것도 만들지 않는다. "
+        "거부 사유는 설치와 같은 문장이다.",
+        "platform_admin", False,
+    ),
+    "platform_plugin_rotate_token": (
+        "플러그인 토큰 회전. 새 토큰은 **이 응답에 한 번만** 실리고 옛 토큰은 `grace_seconds` 뒤에 죽는다(기본 0). "
+        "살아 있는 토큰이 없으면 새로 발급한다 — 재설치는 토큰을 다시 주지 않으므로 이것이 유일한 재발급 경로다.",
+        "platform_admin", False,
+    ),
     "plugin_tick": (
         "스케줄 클레임 — 플러그인이 자기 토큰으로 \"지금 내 차례인가\" 를 묻는다. "
         "예정이 지났으면 **한 번만** 준다(복제본이 여럿이어도). "
@@ -210,7 +220,7 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "plugin_events": (
         "잡 종결 이벤트 풀 — 플러그인이 자기 토큰으로 \"못 본 종결이 있나\" 를 묻는다. "
         "모델이 본 프롬프트(마스킹본)와 나간 응답을 종결 순서로 준다. "
-        "at-least-once 이고 커서는 `ack` 로만 앞으로 간다. 플러그인이 만든 잡의 종결은 안 준다.",
+        "at-least-once 이고 커서는 `ack` 로만 앞으로 간다(`limit: 0` 은 ack 만). 플러그인이 만든 잡의 종결은 안 준다.",
         "service", True,
     ),
     "platform_diagnostics": ("진단 번들 — 비밀은 마스킹, 프롬프트 본문은 미포함.", "platform_admin", False),

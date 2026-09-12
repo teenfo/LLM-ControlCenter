@@ -193,6 +193,8 @@
   "ui.plugin_no_trust_key": "신뢰 키가 없습니다 — 서명된 번들을 설치할 수 없습니다",
   "ui.plugin_missing_files": "설치본 파일이 없습니다",
   "ui.plugin_none": "설치된 플러그인이 없습니다",
+  "ui.plugin_rotate_token": "토큰 회전",
+  "ui.plugin_token_rotated": "새 토큰 — 옛 토큰은 {minutes}분 뒤 죽습니다",
   "ui.username": "아이디",
   "ui.password": "비밀번호",
   "ui.login_hint": "관리자 계정으로 로그인합니다. 세션은 12시간 뒤 만료됩니다.",

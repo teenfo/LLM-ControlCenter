@@ -510,6 +510,12 @@ def test_the_routes_need_platform_admin(client, acme):
     assert client.post(
         "/v1/platform/plugins", content=b"x", headers=auth(acme["tenant_admin"])
     ).status_code == 403
+    assert client.post(
+        "/v1/platform/plugins/inspect", content=b"x", headers=auth(acme["tenant_admin"])
+    ).status_code == 403
+    assert client.post(
+        "/v1/platform/plugins/x/rotate-token", json={}, headers=auth(acme["tenant_admin"])
+    ).status_code == 403
 
 
 def test_install_activate_and_deactivate_over_http(client, harness, acme, signing_key, platform_tenant):
@@ -1306,7 +1312,7 @@ def test_an_ordinary_service_token_gets_no_events(harness, client, acme):
 
 
 @pytest.mark.parametrize(
-    "body", [{"ack": -1}, {"ack": "x"}, {"ack": True}, {"limit": 0}, {"limit": "many"}],
+    "body", [{"ack": -1}, {"ack": "x"}, {"ack": True}, {"limit": -1}, {"limit": "many"}],
 )
 def test_a_malformed_ack_or_limit_is_rejected(harness, client, signing_key, platform_tenant, body):
     result = install_evented(harness, signing_key)
@@ -1349,3 +1355,209 @@ def test_a_plugin_owned_service_is_not_editable_by_hand(harness, client, signing
     assert response.status_code == 409
     assert response.json()["code"] == "plugin_managed"
     assert json.loads(harness.store.get_service(platform_tenant, result.service_id)["allow_roles_json"]) == ["summarize"]
+
+
+# ── 토큰 회전 · 사전 검사 (PLUGIN-11) ────────────────────────────────────────
+
+
+def _live_plugin_tokens(harness, plugin_id="acme.daily-digest"):
+    row = harness.store.get_plugin(plugin_id)
+    now = harness.clock()
+    return [
+        t for t in harness.store.list_tokens(TenantScope(row["tenant_id"]))
+        if t["service_id"] == row["service_id"] and t["role"] == "service"
+        and t["revoked_at"] is None and (t["expires_at"] is None or t["expires_at"] > now)
+    ]
+
+
+def _rotate(client, acme, plugin_id="acme.daily-digest", **body):
+    return client.post(
+        f"/v1/platform/plugins/{plugin_id}/rotate-token", json=body,
+        headers=auth(acme["platform_admin"]),
+    )
+
+
+def _install_and_activate(client, acme, signing_key) -> str:
+    admin = auth(acme["platform_admin"])
+    created = client.post("/v1/platform/plugins", content=bundle(key=signing_key), headers=admin)
+    assert created.status_code == 201, created.text
+    on = client.post(
+        "/v1/platform/plugins/acme.daily-digest/activate", json={"active": True}, headers=admin
+    )
+    assert on.status_code == 200, on.text
+    return created.json()["token"]
+
+
+def test_rotating_a_plugin_token_keeps_the_plugin_alive_within_the_grace(
+    client, harness, acme, signing_key, platform_tenant
+):
+    """회전은 발급이다 — 새 토큰은 응답에 한 번, 옛 토큰은 유예 동안 산다(배포하는 사이 끊기지 않게)."""
+    old = _install_and_activate(client, acme, signing_key)
+
+    rotated = _rotate(client, acme, grace_seconds=600)
+    assert rotated.status_code == 200, rotated.text
+    body = rotated.json()
+    assert body["token"] and body["token"] != old and body["reissued"] is False
+    assert body["grace_seconds"] == 600
+    assert body["old_token_expires_at"] == pytest.approx(harness.clock() + 600)
+
+    # 둘 다 산다 — 플러그인 자기 경로(tick)로 확인한다.
+    assert client.post("/v1/plugin/tick", headers=auth(old)).status_code == 200
+    assert client.post("/v1/plugin/tick", headers=auth(body["token"])).status_code == 200
+    assert len(_live_plugin_tokens(harness)) == 2
+
+
+def test_the_old_plugin_token_dies_after_the_grace(client, harness, acme, signing_key, platform_tenant):
+    """유예가 지나면 옛 토큰은 401 이다. 유예 0 은 즉시다."""
+    old = _install_and_activate(client, acme, signing_key)
+    new = _rotate(client, acme, grace_seconds=60).json()["token"]
+
+    harness.clock.advance(61)
+    assert client.post("/v1/plugin/tick", headers=auth(old)).status_code == 401
+    assert client.post("/v1/plugin/tick", headers=auth(new)).status_code == 200
+
+    newest = _rotate(client, acme).json()
+    assert newest["old_token_expires_at"] is None, "유예 0 은 만료가 아니라 즉시 폐기다"
+    assert client.post("/v1/plugin/tick", headers=auth(new)).status_code == 401
+    assert client.post("/v1/plugin/tick", headers=auth(newest["token"])).status_code == 200
+
+
+def test_a_plugin_whose_token_was_revoked_can_get_a_new_one(
+    client, harness, acme, signing_key, platform_tenant
+):
+    """재설치도 제거도 토큰을 다시 주지 않는다 — 회전이 유일한 재발급 경로라 살아 있는 것이 없으면 발급한다."""
+    _install_and_activate(client, acme, signing_key)
+    row = harness.store.get_plugin("acme.daily-digest")
+    scope = TenantScope(row["tenant_id"])
+    for token in _live_plugin_tokens(harness):
+        assert harness.store.revoke_token(scope, token["id"])
+    assert _live_plugin_tokens(harness) == []
+
+    reissued = _rotate(client, acme).json()
+    assert reissued["reissued"] is True
+    assert reissued["old_token_id"] is None and reissued["old_token_expires_at"] is None
+    assert client.post("/v1/plugin/tick", headers=auth(reissued["token"])).status_code == 200
+
+
+def test_rotation_picks_the_newest_live_token_when_several_exist(
+    client, harness, acme, signing_key, platform_tenant
+):
+    """유예 회전 두 번 — 회전 대상은 가장 최근에 산 토큰이고, 유예 중인 옛 토큰은 그대로 만료를 기다린다."""
+    first = _install_and_activate(client, acme, signing_key)
+    harness.clock.advance(1)
+    second = _rotate(client, acme, grace_seconds=3600).json()
+    harness.clock.advance(1)
+    third = _rotate(client, acme, grace_seconds=3600).json()
+
+    assert third["old_token_id"] == second["token_id"], "가장 최근 토큰이 회전 대상이다"
+    assert len(_live_plugin_tokens(harness)) == 3
+    for raw in (first, second["token"], third["token"]):
+        assert client.post("/v1/plugin/tick", headers=auth(raw)).status_code == 200
+
+
+def test_plugin_token_rotation_is_platform_admin_only_and_audited(
+    client, harness, acme, signing_key, platform_tenant
+):
+    _install_and_activate(client, acme, signing_key)
+    tenant_admin = auth(acme["tenant_admin"])
+    admin = auth(acme["platform_admin"])
+    assert client.post(
+        "/v1/platform/plugins/acme.daily-digest/rotate-token", json={}, headers=tenant_admin
+    ).status_code == 403
+    assert client.post(
+        "/v1/platform/plugins/nope.plugin/rotate-token", json={}, headers=admin
+    ).status_code == 404
+    assert client.post(
+        "/v1/platform/plugins/acme.daily-digest/rotate-token", json={"grace_seconds": "soon"}, headers=admin
+    ).status_code == 400
+    # 음수 유예는 서비스 토큰 회전과 같은 `_float(minimum=0)` 을 지나 0(즉시)으로 읽힌다.
+    clamped = _rotate(client, acme, grace_seconds=-1)
+    assert clamped.status_code == 200 and clamped.json()["grace_seconds"] == 0
+
+    actions = [
+        row["action"] for row in harness.store._conn.execute("SELECT action FROM admin_audit")
+    ]
+    assert "rotate_plugin_token" in actions and "rotate_token" in actions
+
+
+def test_inspect_validates_without_installing(client, harness, acme, signing_key, platform_tenant):
+    """사전 검사는 설치와 같은 함수를 지나지만 아무것도 만들지 않는다 — DB 도 디스크도."""
+    admin = auth(acme["platform_admin"])
+    checked = client.post("/v1/platform/plugins/inspect", content=bundle(key=signing_key), headers=admin)
+    assert checked.status_code == 200, checked.text
+    body = checked.json()
+    assert body["ok"] is True and body["id"] == "acme.daily-digest" and body["signature"] == "signed"
+    assert body["upgraded"] is False and body["files"] == 1
+    assert body["service"]["allow_roles"] == ["summarize"] and body["trigger"]["kind"] is None
+
+    assert harness.store.get_plugin("acme.daily-digest") is None
+    assert harness.store.get_service(TenantScope(PLATFORM), "acme.daily-digest") is None
+    assert not (plugins.plugin_root(harness.data_dir) / "acme.daily-digest").exists()
+    assert client.get("/v1/platform/plugins", headers=admin).json()["plugins"] == []
+
+    # 설치 뒤에는 같은 번들이 "판올림" 으로 읽힌다.
+    client.post("/v1/platform/plugins", content=bundle(key=signing_key), headers=admin)
+    again = client.post("/v1/platform/plugins/inspect", content=bundle(key=signing_key), headers=admin)
+    assert again.json()["upgraded"] is True
+
+
+@pytest.mark.parametrize("variant", ["unsigned", "other_host", "unknown_role"])
+def test_inspect_rejects_exactly_what_install_rejects(
+    client, harness, acme, signing_key, platform_tenant, variant
+):
+    """거부 사유가 설치와 한 글자라도 다르면 사전 검사는 거짓말이 된다."""
+    admin = auth(acme["platform_admin"])
+    if variant == "unsigned":
+        raw = bundle()
+    elif variant == "other_host":
+        raw = bundle(MANIFEST.replace(HOST_RANGE, ">=99.0,<100.0"), key=signing_key)
+    else:
+        raw = bundle(EVENTED + 'roles = ["no-such-role"]\n', key=signing_key)
+
+    checked = client.post("/v1/platform/plugins/inspect", content=raw, headers=admin)
+    installed = client.post("/v1/platform/plugins", content=raw, headers=admin)
+    assert checked.status_code == installed.status_code == 400
+    assert checked.json()["code"] == installed.json()["code"] == "plugin_rejected"
+    assert checked.json()["message"] == installed.json()["message"]
+    assert harness.store.get_plugin("acme.daily-digest") is None
+
+
+def test_install_delegates_validation_to_inspect_bundle():
+    """검증이 두 벌이면 사전 검사가 통과한 번들을 설치가 거절하는 날이 온다 — 구조로 막는다."""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(plugins.__file__).read_text(encoding="utf-8"))
+    install = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "install")
+    called = {
+        n.func.id for n in ast.walk(install)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    assert "inspect_bundle" in called
+    assert not called & {"parse_manifest", "safe_names", "verify_bundle", "host_satisfies"}, called
+
+
+def test_an_ack_only_pull_moves_the_cursor_and_returns_nothing(
+    harness, client, signing_key, platform_tenant, acme
+):
+    """처리를 끝낸 배치를 확정하려고 한 건을 더 받을 필요가 없다 — `limit: 0` 은 ack 만이다."""
+    installed = install_evented(harness, signing_key)
+    submit(client, acme["service"], prompt="첫 번째")
+    drive(harness)
+    first = pull(harness)
+    assert len(first.events) == 1
+
+    acked = pull(harness, ack=first.cursor, limit=0)
+    assert acked.events == [] and acked.pending == 0
+    assert harness.store.get_plugin("acme.daily-digest")["event_cursor"] == first.cursor
+
+    # 라우트도 0 을 받는다 — 플러그인 자기 토큰으로. 음수는 여전히 거절이다.
+    submit(client, acme["service"], prompt="두 번째")
+    drive(harness)
+    token = auth(installed.token)
+    got = client.post("/v1/plugin/events", json={"limit": 50}, headers=token).json()
+    assert len(got["events"]) == 1
+    only_ack = client.post("/v1/plugin/events", json={"ack": got["cursor"], "limit": 0}, headers=token)
+    assert only_ack.status_code == 200, only_ack.text
+    assert only_ack.json()["events"] == [] and only_ack.json()["pending"] == 0
+    assert client.post("/v1/plugin/events", json={"limit": -1}, headers=token).status_code == 400

@@ -101,7 +101,7 @@ from .store import (
     TenantScope,
 )
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -2030,6 +2030,75 @@ async def platform_plugin_delete(request: Request) -> Response:
     return _ok(request, {"id": plugin_id, "removed": True})
 
 
+async def platform_plugin_inspect(request: Request) -> Response:
+    """번들 사전 검사 — 설치와 **같은 함수**(`plugins.inspect_bundle`)로 검증만 한다.
+
+    별도 라우트인 이유: 설치 라우트의 `?dry_run` 플래그였다면 쿼리를 빠뜨리는 순간
+    진짜 설치가 되고, 그 응답에 한 번 실리는 토큰을 잃는다. 검사와 설치는 URL 부터
+    다른 것이 안전하다. DB 도 디스크도 건드리지 않는다.
+    """
+    ctx, _principal_unused = _platform_admin(request)
+    bundle = await request.body()
+    try:
+        inspected = plugin_mod.inspect_bundle(
+            bundle, trust_dir=ctx.plugin_trust_dir, host_version=ctx.version,
+            known_roles=ctx.config.roles,
+        )
+    except plugin_mod.PluginError as exc:
+        # 설치와 같은 코드·같은 문장 — 사전 검사가 설치와 다른 말을 하면 거짓말이다.
+        raise ApiError("plugin_rejected", status=400, params={"reason": str(exc)}) from exc
+    manifest = inspected.manifest
+    trigger_kind = "schedule" if manifest.schedule else ("event" if manifest.event else None)
+    return _ok(request, {
+        "ok": True,
+        "id": manifest.plugin_id,
+        "version": manifest.version,
+        "name": manifest.name,
+        "signature": inspected.signature_state,
+        "requires_host": manifest.requires_host,
+        "trigger": {
+            "kind": trigger_kind,
+            "schedule": manifest.schedule,
+            "timezone": manifest.schedule_tz if manifest.schedule else None,
+            "event": manifest.event,
+            "roles": list(manifest.event_roles),
+        },
+        "service": manifest.service_fields(),
+        "files": len(inspected.payload),
+        "sha256": inspected.bundle_sha256,
+        "upgraded": ctx.store.get_plugin(manifest.plugin_id) is not None,
+    })
+
+
+async def platform_plugin_rotate_token(request: Request) -> Response:
+    """플러그인 토큰 회전 — 살아 있는 토큰이 없으면 발급한다.
+
+    재설치도 제거도 토큰을 다시 주지 않으므로 이것이 **유일한 재발급 경로**다.
+    새 토큰은 이 응답이 마지막이다. `grace_seconds`(기본 0) 동안 옛 토큰이 더 산다 —
+    운영자가 플러그인 설정을 고치고 재시작하는 창이다.
+    """
+    ctx, principal = _platform_admin(request)
+    plugin_id = request.path_params["plugin_id"]
+    body = await _body(request)
+    grace = _float(body.get("grace_seconds"), "grace_seconds", minimum=0.0)
+    rotated = plugin_mod.rotate_plugin_token(
+        ctx.store, plugin_id, actor=principal.token_id, actor_role=principal.role,
+        grace_seconds=grace, now=ctx.now,
+    )
+    if rotated is None:
+        raise ApiError("not_found", status=404)
+    return _ok(request, {
+        "id": plugin_id,
+        "token_id": rotated.token_id,
+        "token": rotated.token,
+        "grace_seconds": rotated.grace_seconds,
+        "old_token_id": rotated.old_token_id,
+        "old_token_expires_at": rotated.old_token_expires_at,
+        "reissued": rotated.reissued,
+        "note": "이 값은 지금 한 번만 보입니다. 다시 볼 수 없습니다.",
+    })
+
+
 async def plugin_tick(request: Request) -> Response:
     """플러그인이 "지금 내 차례인가" 를 묻는다. **플러그인 자신의 토큰으로.**
 
@@ -2063,7 +2132,8 @@ async def plugin_events(request: Request) -> Response:
     """플러그인이 "내가 못 본 종결이 있나" 를 묻는다. **플러그인 자신의 토큰으로.**
 
     본문은 `{"ack": <직전에 받은 cursor>, "limit": <최대 건수>}` 이고 둘 다 선택이다.
-    ack 없이 다시 물으면 같은 배치를 다시 받는다(at-least-once). 판단과 근거는
+    ack 없이 다시 물으면 같은 배치를 다시 받는다(at-least-once). `limit: 0` 은 ack 만
+    하고 아무것도 받지 않는다. 판단과 근거는
     `plugins.pull_events` 에 있다 — 여기는 신원과 인자만 다룬다.
 
     `active_service` 를 지난다 — 끄면 이 경로도 401 이다(`plugin_tick` 과 같다).
@@ -2083,7 +2153,8 @@ async def plugin_events(request: Request) -> Response:
     if ack is not None and (isinstance(ack, bool) or not isinstance(ack, int) or ack < 0):
         raise ApiError("invalid_field", status=400, params={"field": "ack"})
     limit = body.get("limit", 50)
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+    # `limit: 0` 은 "ack 만" 이다 — SDK 가 처리를 끝낸 배치를 확정할 때 한 건을 더 받지 않게.
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         raise ApiError("invalid_field", status=400, params={"field": "limit"})
 
     # 노드의 경계는 스케줄러가 디스패치 때 본 것과 같은 출처(클러스터)에서 읽는다 —
@@ -2409,8 +2480,13 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["POST"], name="platform_account_disable"),
         Route(f"{v}/platform/plugins", platform_plugins,
               methods=["GET", "POST"], name="platform_plugins"),
+        # 고정 경로는 `{plugin_id}` 앞에 — 뒤에 두면 "inspect" 라는 플러그인을 찾는다.
+        Route(f"{v}/platform/plugins/inspect", platform_plugin_inspect,
+              methods=["POST"], name="platform_plugin_inspect"),
         Route(f"{v}/platform/plugins/{{plugin_id}}/activate", platform_plugin_activate,
               methods=["POST"], name="platform_plugin_activate"),
+        Route(f"{v}/platform/plugins/{{plugin_id}}/rotate-token", platform_plugin_rotate_token,
+              methods=["POST"], name="platform_plugin_rotate_token"),
         Route(f"{v}/platform/plugins/{{plugin_id}}", platform_plugin_delete,
               methods=["DELETE"], name="platform_plugin_delete"),
         Route(f"{v}/plugin/tick", plugin_tick, methods=["POST"], name="plugin_tick"),
