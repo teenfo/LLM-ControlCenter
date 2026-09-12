@@ -6,6 +6,11 @@
     python mock_server.py --port 8610
     LCC_URL=http://localhost:8610 LCC_TOKEN=any python client.py "요약할 내용"
 
+플러그인을 만들 때는 트리거 흉내를 켠다 — `--plugin-events` 는 끝난 잡마다 `job.finished`
+이벤트를 아웃박스에 쌓고(`POST /v1/plugin/events`, ack 커서·at-least-once·`limit: 0` 은 ack 만),
+`--plugin-tick-every N` 은 N 초마다 한 번 `POST /v1/plugin/tick` 이 `due: true` 를 준다. 플래그가
+없으면 진짜처럼 tick 은 `due: false`, events 는 409 `plugin_no_event_trigger` 다.
+
 **역할 목록을 실제 설정에서 읽는다** — 손으로 적으면 진짜 서버와 역할 이름이
 어긋나고, 어긋난 채로 통합이 끝나면 배포 당일에 404 를 만난다. 설정을 못 찾으면
 그 사실을 말하고 최소 목록으로 뜬다(조용히 다른 이름을 쓰지 않는다).
@@ -45,6 +50,13 @@ MOCK_GUARD = (
 )
 
 _jobs: dict[str, dict[str, Any]] = {}
+
+#: 플러그인 트리거 흉내의 상태. 진짜의 `plugin_events` 아웃박스와 `event_cursor` 에 해당한다.
+_outbox: list[dict[str, Any]] = []          # 종결 이벤트 — id 는 1부터 순서대로
+_event_cursor = 0                           # ack 로만 앞으로 가는 커서
+_next_tick_at: float | None = None          # 다음 예정 시각. 첫 질문 뒤 한 주기부터
+_plugin_off = False                         # True 면 플러그인 경로가 401 — "끄면 선다" 를 흉내 낸다
+_plugin_calls: list[tuple[str, dict[str, Any]]] = []   # 플러그인 경로 호출 기록 (테스트용)
 
 
 def load_roles(config_dir: Path | None) -> tuple[dict[str, dict[str, Any]], str]:
@@ -90,6 +102,9 @@ def load_roles(config_dir: Path | None) -> tuple[dict[str, dict[str, Any]], str]
 class Handler(BaseHTTPRequestHandler):
     roles: dict[str, dict[str, Any]] = dict(DEFAULT_ROLES)
     latency: float = 0.0
+    #: 플러그인 트리거 흉내. 없으면 진짜처럼 tick 은 `due: false`, events 는 409 다.
+    plugin_tick_every: float | None = None
+    plugin_events: bool = False
 
     server_version = "llmcc-mock"
 
@@ -183,6 +198,10 @@ class Handler(BaseHTTPRequestHandler):
             self._chat(body)
         elif path == "/v1/embed":
             self._embed(body)
+        elif path == "/v1/plugin/tick":
+            self._plugin_tick(body)
+        elif path == "/v1/plugin/events":
+            self._plugin_events(body)
         else:
             self._error(404, "not_found", "요청한 리소스를 찾을 수 없습니다.")
 
@@ -194,6 +213,7 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "job_not_found", "작업을 찾을 수 없습니다.")
             return
         job["status"] = "cancelled"
+        self._emit_finish(job)
         self._send(200, self._settle(job))
 
     # -- 동작 -----------------------------------------------------------------
@@ -279,11 +299,20 @@ class Handler(BaseHTTPRequestHandler):
         """가짜 잡을 만들고 `wait` 만큼 기다렸다가 돌려준다 — generate 와 chat 이 같은 꼬리를 쓴다."""
         job_id = uuid.uuid4().hex[:16]
         digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+        end_user = body.get("end_user")
         _jobs[job_id] = {
             "job_id": job_id, "role": role, "attempts": 0, "guard_actions": {},
             "status": "pending", "ready_at": time.time() + self.latency,
             "response": f"[mock:{role}] {digest}",
             "model": "mock-model", "node": "mock-node", "tier": "internal",
+            # 플러그인 이벤트 흉내가 쓰는 것 — 응답 모양에는 안 실린다(`_settle` 이 뺀다).
+            "_kind": "chat" if "messages" in body else "generate",
+            "_prompt": (
+                json.dumps({"messages": body.get("messages")}, ensure_ascii=False)
+                if "messages" in body else str(body.get("prompt") or "")
+            ),
+            "_end_user": hashlib.sha256(str(end_user).encode("utf-8")).hexdigest()[:32] if end_user else None,
+            "_created_at": time.time(),
         }
         wait = float(body.get("wait", 30) or 0)
         deadline = time.time() + min(wait, 300.0)
@@ -319,17 +348,98 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _settle(self, job: dict[str, Any]) -> dict[str, Any]:
-        result = dict(job)
+        result = {k: v for k, v in job.items() if not k.startswith("_")}
         ready_at = result.pop("ready_at", 0)
         if result["status"] == "pending":
             if time.time() >= ready_at:
                 result["status"] = "ok"
                 job["status"] = "ok"
+                self._emit_finish(job)
             else:
                 result.pop("response", None)
                 result["queue_position"] = 0
                 result["retry_after"] = 2.0
         return result
+
+    # -- 플러그인 트리거 흉내 ---------------------------------------------------
+
+    def _emit_finish(self, job: dict[str, Any]) -> None:
+        """종결 한 건을 아웃박스에 쌓는다 — 진짜의 `event_payload` 와 같은 칸이다.
+
+        진짜는 DB 트리거가 종결과 같은 트랜잭션에서 쌓고, 플러그인이 만든 잡의 종결은 내주지
+        않는다(재귀 방지). 목은 "종결 하나 = 이벤트 하나" 만 흉내 낸다 — 통합 코드가 배치·ack·
+        at-least-once 를 다루게 만드는 것이 목적이지 판정 정확도가 아니다.
+        """
+        if not self.plugin_events or job.get("_emitted"):
+            return
+        job["_emitted"] = True
+        finished = time.time()
+        _outbox.append({
+            "id": len(_outbox) + 1, "kind": "job.finished", "ts": finished,
+            "job_id": job["job_id"], "tenant": "mock", "service": "mock-web",
+            "end_user": job.get("_end_user"), "job_kind": job.get("_kind", "generate"),
+            "role": job["role"], "route": None, "status": job["status"],
+            "error": None, "error_code": None,
+            "model": job["model"], "node": job["node"], "boundary": "internal",
+            "prompt": job.get("_prompt"), "system": None,
+            "output": job["response"] if job["status"] == "ok" else None,
+            "usage": {"input_tokens": len(job.get("_prompt") or "") // 4,
+                      "output_tokens": len(job["response"]) // 4, "cost_usd": 0.0},
+            "created_at": job.get("_created_at"), "started_at": job.get("_created_at"),
+            "finished_at": finished,
+        })
+
+    def _plugin_gate(self, path: str, body: dict[str, Any]) -> bool:
+        _plugin_calls.append((path, dict(body)))
+        if _plugin_off:
+            # 끄면 선다 — 진짜는 `active_service` 가 401 을 낸다.
+            self._error(401, "unauthorized", "이 서비스는 비활성 상태입니다.")
+            return False
+        return True
+
+    def _plugin_tick(self, body: dict[str, Any]) -> None:
+        global _next_tick_at
+        if not self._plugin_gate("/v1/plugin/tick", body):
+            return
+        every = self.plugin_tick_every
+        if not every:
+            self._send(200, {"id": "mock.plugin", "due": False, "scheduled_for": None, "next_run_at": None})
+            return
+        now = time.time()
+        if _next_tick_at is None:
+            _next_tick_at = now + every
+        if now >= _next_tick_at:
+            scheduled = _next_tick_at
+            # 밀린 것을 몰아 돌리지 않는다 — 다음 예정은 지금 기준이다(진짜와 같다).
+            _next_tick_at = now + every
+            self._send(200, {"id": "mock.plugin", "due": True, "scheduled_for": scheduled, "next_run_at": _next_tick_at})
+            return
+        self._send(200, {"id": "mock.plugin", "due": False, "scheduled_for": None, "next_run_at": _next_tick_at})
+
+    def _plugin_events(self, body: dict[str, Any]) -> None:
+        global _event_cursor
+        if not self._plugin_gate("/v1/plugin/events", body):
+            return
+        if not self.plugin_events:
+            self._error(409, "plugin_no_event_trigger", "이 플러그인은 이벤트 트리거를 선언하지 않았습니다.")
+            return
+        ack = body.get("ack")
+        if ack is not None and (isinstance(ack, bool) or not isinstance(ack, int) or ack < 0):
+            self._error(400, "invalid_field", "필드 값이 올바르지 않습니다: ack", field="ack")
+            return
+        limit = body.get("limit", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            self._error(400, "invalid_field", "필드 값이 올바르지 않습니다: limit", field="limit")
+            return
+        if ack is not None:
+            # 앞으로만, 있는 것까지만 — 진짜의 CAS 와 같은 성질이다.
+            _event_cursor = max(_event_cursor, min(int(ack), len(_outbox)))
+        batch = _outbox[_event_cursor:_event_cursor + min(limit, 200)]
+        cursor = batch[-1]["id"] if batch else _event_cursor
+        self._send(200, {
+            "id": "mock.plugin", "events": batch, "cursor": cursor,
+            "pending": len(_outbox) - cursor,
+        })
 
     def _meta(self) -> dict[str, Any]:
         return {
@@ -357,11 +467,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", help="roles.yaml 이 있는 설정 디렉터리")
     parser.add_argument("--latency", type=float, default=0.0,
                         help="완료까지의 지연(초). 폴링 경로를 시험할 때 쓴다")
+    parser.add_argument("--plugin-events", action="store_true",
+                        help="끝난 잡마다 job.finished 이벤트를 쌓는다 — POST /v1/plugin/events 로 받는다")
+    parser.add_argument("--plugin-tick-every", type=float, default=None, metavar="SECONDS",
+                        help="N 초마다 한 번 POST /v1/plugin/tick 이 due: true 를 준다")
     args = parser.parse_args(argv)
 
     roles, note = load_roles(Path(args.config) if args.config else None)
     Handler.roles = roles
     Handler.latency = args.latency
+    Handler.plugin_events = bool(args.plugin_events)
+    Handler.plugin_tick_every = args.plugin_tick_every
+    if args.plugin_events or args.plugin_tick_every:
+        print(f"  플러그인 트리거 흉내: events={'on' if args.plugin_events else 'off'} "
+              f"tick_every={args.plugin_tick_every or '-'}", file=sys.stderr)
 
     print(f"  {note}", file=sys.stderr)
     print(f"  역할: {', '.join(sorted(roles))}", file=sys.stderr)

@@ -49,7 +49,7 @@ ROOT = Path(__file__).resolve().parent.parent
 @pytest.mark.parametrize("name", [
     "Dockerfile", "compose.yml", "preflight.sh", "doctor.sh",
     "backup.sh", "restore.sh", "bundle.sh", "README.md",
-    "clients/client.py", "clients/mock_server.py",
+    "clients/client.py", "clients/mock_server.py", "clients/plugin.py",
     "tls/nginx.conf",
 ])
 def test_the_bundle_has_what_the_install_needs(name):
@@ -131,6 +131,27 @@ def test_mock_server_uses_only_the_standard_library():
     text = (ROOT / "clients" / "mock_server.py").read_text(encoding="utf-8")
     for third_party in ("import httpx", "import requests", "import yaml", "import starlette"):
         assert third_party not in text, third_party
+
+
+@pytest.mark.parametrize("name", ["client.py", "mock_server.py", "plugin.py"])
+def test_bundled_client_files_import_only_the_standard_library(name):
+    """부분 문자열 검사는 `from cryptography import …` 를 놓친다 — import 문을 AST 로 본다.
+
+    플러그인은 호스트와 다른 기계에서 돈다. 그 기계에 pip 승인 절차가 있다면 표준 라이브러리만
+    쓰는 파일 하나가 우회로를 만들지 않는 유일한 길이다.
+    """
+    import ast
+    import sys
+
+    tree = ast.parse((ROOT / "clients" / name).read_text(encoding="utf-8"))
+    roots = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots.add(node.module.split(".")[0])
+    foreign = sorted(root for root in roots if root not in sys.stdlib_module_names)
+    assert not foreign, f"{name} 가 표준 라이브러리 밖을 import 한다: {foreign}"
 
 
 def test_readme_states_what_the_product_does_not_do():
