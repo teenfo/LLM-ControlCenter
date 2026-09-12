@@ -150,3 +150,25 @@ def test_the_mock_server_delivers_finished_jobs_at_least_once():
         assert exc.value.code == "invalid_field"
     finally:
         httpd.shutdown(); httpd.server_close()
+
+
+def test_the_socket_timeout_outlives_the_server_wait():
+    """`wait` 만큼 서버가 붙드는 요청은 소켓 타임아웃이 그보다 길어야 한다 — 같으면 답하기 직전에 끊긴다.
+
+    실제로 겪었다: 플러그인 런타임이 30초 타임아웃으로 만든 클라이언트로 `generate(wait=30)` 을 불렀고,
+    노드가 느린 날 매번 `TimeoutError` 로 죽으면서 잡은 큐에 남았다.
+    """
+    server = _load("mock_server")
+    httpd, base = _serve(server, latency=0.6)
+    try:
+        sdk = _load("client")
+        api = sdk.ControlCenter(base, "lcc_test_token", timeout=0.2)     # 서버 대기(0.4)보다 짧은 소켓 타임아웃
+        first = api.generate("summarize", "느린 노드", wait=0.4)         # 0.4초 뒤 pending 으로 돌아와야 한다
+        assert first.status == "pending" and first.job_id
+        done = api.run("summarize", "느린 노드", wait=0.4, deadline=5.0)  # 폴링도 같은 규칙 — 끝까지 간다
+        assert done.ok, done
+        assert sdk._wait_seconds("/v1/jobs/x?wait=7.5", None) == 7.5
+        assert sdk._wait_seconds("/v1/generate", {"wait": "3"}) == 3.0
+        assert sdk._wait_seconds("/v1/generate", {"wait": "soon"}) == 0.0
+    finally:
+        httpd.shutdown(); httpd.server_close()

@@ -100,7 +100,8 @@ timezone = "Asia/Seoul"          # IANA. 모르는 이름은 거부(조용히 UT
 - **401 은 "꺼졌다"** 는 뜻이다(관리자가 껐거나 토큰이 회전·폐기됐다). 다시 켜면 그대로 살아나므로 죽지 말고 느리게 계속 묻는 것이
   기본이다. **404 `not_found`** 는 이 토큰이 플러그인 것이 아니라는 뜻이라 즉시 멈춘다. **409 `plugin_no_event_trigger`** 는
   이벤트를 선언하지 않았다는 뜻 — tick 은 계속. **429** 는 `retry_after` 를 지킨다.
-- 공개 주소로는 `/v1/plugin/*` 와 소비자 라우트만 열려 있다. `/v1/platform/*`(설치·검사·켜기·회전)은 프록시가 막는다 — 운영자 몫이다.
+- 공개 주소에 열어 두는 것은 `/v1/plugin/*` 와 소비자 라우트다. `/v1/platform/*`(설치·검사·켜기·회전)은 프록시에서 감추는 것이
+  기본이다(번들의 nginx 가 그렇게 하고, 이유는 [topology.md §2](topology.md#2-신뢰-경계를-넘는-것--넘지-않는-것)) — 프록시는 운영자 몫이다.
 
 ## 5. 토큰
 
@@ -113,12 +114,13 @@ timezone = "Asia/Seoul"          # IANA. 모르는 이름은 거부(조용히 UT
 
 ## 6. Python SDK — 두 파일
 
-호스트에서 내려받는다. 둘 다 **표준 라이브러리만** 쓰고 Python 3.9 이상에서 돈다 — 플러그인이 도는 기계에 pip 승인 절차가 있어도
-파일 두 개면 끝난다.
+호스트에서 내려받는다(어떤 토큰이든 인증은 필요하다 — 플러그인 자기 토큰이면 된다). 둘 다 **표준 라이브러리만** 쓰고 Python 3.9
+이상에서 돈다 — 플러그인이 도는 기계에 pip 승인 절차가 있어도 파일 두 개면 끝난다.
 
 ```sh
-curl -fsSL https://<호스트>/v1/client/client.py -o client.py     # HTTP · 오류 계약 (소비자 SDK 와 같은 파일)
-curl -fsSL https://<호스트>/v1/client/plugin.py -o plugin.py     # 런타임 — 옆의 client.py 를 쓴다
+H='Authorization: Bearer <토큰>'
+curl -fsSL -H "$H" https://<호스트>/v1/client/client.py -o client.py     # HTTP · 오류 계약 (소비자 SDK 와 같은 파일)
+curl -fsSL -H "$H" https://<호스트>/v1/client/plugin.py -o plugin.py     # 런타임 — 옆의 client.py 를 쓴다
 ```
 
 ```python
@@ -177,7 +179,7 @@ curl -sS -X POST https://<LAN 주소>/v1/platform/plugins/inspect -H "Authorizat
 
 ## 8. 패키징 · 서명 — `lccp`
 
-`GET /v1/client/lccp.py` 로 내려받는다. Python 3.11 이상(`tomllib`) · `init`·`check`·`build`(무서명)·`inspect` 는 표준
+`GET /v1/client/lccp.py` 로 내려받는다(토큰 필요). Python 3.11 이상(`tomllib`) · `init`·`check`·`build`(무서명)·`inspect` 는 표준
 라이브러리만 · 서명·검증·`keygen` 에만 `cryptography`. 낮은 파이썬뿐이면 호스트 이미지로 돌린다:
 `docker run --rm -v "$PWD:/w" -w /w --entrypoint python llm-controlcenter:<판> /app/clients/lccp.py check .`
 

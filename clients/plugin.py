@@ -222,13 +222,19 @@ class Plugin:
         base_url: str,
         token: str,
         *,
-        timeout: float = 30.0,
+        timeout: Optional[float] = None,
         locale: Optional[str] = None,
         name: str = "plugin",
         log: Optional[logging.Logger] = None,
         sleep: Optional[Callable[[float], None]] = None,
     ) -> None:
-        self.llm = ControlCenter(base_url, token, timeout=timeout, locale=locale)
+        # 타임아웃은 클라이언트의 기본값(긴 쪽)을 따른다. 처음엔 tick/events 가 빠르다고 30초로 줄였다가,
+        # 같은 클라이언트로 `generate(wait=30)` 을 부른 예제가 서버가 답하기 직전에 끊겼다 — 소켓 타임아웃은
+        # 서버 대기보다 길어야 하고, 그 판단은 클라이언트가 한다(`wait` 만큼 늘린다).
+        kwargs: dict = {"locale": locale}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        self.llm = ControlCenter(base_url, token, **kwargs)
         self.name = name
         self.log = log or logging.getLogger(f"lcc.plugin.{name}")
         # 잠은 주입할 수 있다 — 테스트가 실제로 잠들지 않게. 기본은 `stop` 이 서면 바로 깨는 대기다.
@@ -308,7 +314,13 @@ class Plugin:
                         tick = self.tick()
                         if tick.due:
                             report.ticks += 1
-                            _call(on_tick, tick)
+                            try:
+                                _call(on_tick, tick)
+                            except _HandlerFailed as failed:
+                                # tick 은 배치가 아니다 — 클레임은 한 번뿐이라 이 예정은 그냥 지나간다. 다음 예정은 온다.
+                                report.errors += 1
+                                self.log.error("tick 핸들러 예외 %r — 예정 %s 은(는) 지나갔다(클레임은 한 번뿐). 다음 예정을 기다린다",
+                                               failed.cause, tick.scheduled_for)
                         delay = min(delay, self._delay_until(tick.next_run_at, lo, hi))
                     if want_events:
                         subscribed = self._drain(on_event, batch, report)
@@ -338,9 +350,9 @@ class Plugin:
                         delay = backoff
                         backoff = min(backoff * 2, hi)
                 except _HandlerFailed as failed:
-                    # 핸들러의 예외. ack 하지 않았으므로 그 배치는 다시 온다.
+                    # 이벤트 핸들러의 예외. ack 하지 않았으므로 그 배치는 다시 온다.
                     report.errors += 1
-                    self.log.error("핸들러 예외 %r — 이 배치는 ack 하지 않았다. %.0f초 뒤 다시 받는다",
+                    self.log.error("이벤트 핸들러 예외 %r — 이 배치는 ack 하지 않았다. %.0f초 뒤 다시 받는다",
                                    failed.cause, backoff)
                     delay = backoff
                     backoff = min(backoff * 2, hi)

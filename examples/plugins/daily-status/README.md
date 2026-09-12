@@ -5,8 +5,9 @@
 한 곳만 `due` 를 받고, 사흘 꺼져 있다 켜져도 사흘치를 몰아 돌지 않는다. 6시간 넘게 늦은 tick 은 만들지 않는다.
 
 ```sh
-curl -fsSL https://llmcc.example.com/v1/client/client.py -o client.py
-curl -fsSL https://llmcc.example.com/v1/client/plugin.py -o plugin.py
+H='Authorization: Bearer <토큰>'          # 어떤 토큰이든 인증은 필요하다 — 플러그인 자기 토큰이면 된다
+curl -fsSL -H "$H" https://llmcc.example.com/v1/client/client.py -o client.py
+curl -fsSL -H "$H" https://llmcc.example.com/v1/client/plugin.py -o plugin.py
 
 # 목 서버 — 30초마다 한 번 tick 이 due 가 된다
 python ../../../clients/mock_server.py --plugin-tick-every 30 &

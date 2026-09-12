@@ -7,9 +7,10 @@
 이 플러그인은 LLM 을 부르지 않는다. 매니페스트의 예산이 0 이라 이 토큰으로는 유료 호출이 안 된다.
 
 ```sh
-# 1. SDK 두 파일을 옆에 둔다 (호스트에서 내려받는다)
-curl -fsSL https://llmcc.example.com/v1/client/client.py -o client.py
-curl -fsSL https://llmcc.example.com/v1/client/plugin.py -o plugin.py
+# 1. SDK 두 파일을 옆에 둔다 (호스트에서 내려받는다 — 어떤 토큰이든 인증은 필요하다)
+H='Authorization: Bearer <토큰>'
+curl -fsSL -H "$H" https://llmcc.example.com/v1/client/client.py -o client.py
+curl -fsSL -H "$H" https://llmcc.example.com/v1/client/plugin.py -o plugin.py
 
 # 2. 목 서버로 먼저 — 끝난 잡마다 이벤트가 쌓인다
 python ../../../clients/mock_server.py --plugin-events &

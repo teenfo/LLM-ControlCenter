@@ -315,3 +315,33 @@ def test_the_sdk_reads_401_as_switched_off_on_the_real_host(
     # 플러그인 토큰이 아닌 보통 서비스 토큰은 404 — 멈춘다.
     stranger = sdk.Plugin(live_base_url, acme["service"], name="stranger")
     assert stranger.run(once=True, on_event=lambda e: None).stopped_by == "not_a_plugin_token"
+
+
+def test_a_failing_tick_handler_is_a_missed_run_not_an_unacked_batch(sdk, mock, caplog):
+    """tick 은 배치가 아니다 — 클레임은 한 번뿐이라 핸들러가 죽으면 그 예정은 지나간다. 이벤트 풀은 계속된다."""
+    import logging
+
+    base, server, handler = mock
+    handler.plugin_tick_every = 3600.0
+    server._next_tick_at = time.time() - 1      # 예정이 이미 지났다 — 이번 바퀴에 due 다
+    _finish_jobs(sdk, base, 1)
+    seen = []
+
+    def on_tick(_tick):
+        raise RuntimeError("보고서 생성 실패")
+
+    with caplog.at_level(logging.ERROR, logger="lcc.plugin.plugin"):
+        report = _plugin(sdk, base).run(on_tick=on_tick, on_event=seen.append, once=True)
+
+    assert (report.ticks, report.errors, report.events, report.acked) == (1, 1, 1, 1), report
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("tick 핸들러 예외" in m and "지나갔다" in m for m in messages), messages
+    assert not any("ack 하지 않았다" in m for m in messages), "tick 실패를 배치 미확정처럼 말하면 사람이 재전달을 기다린다"
+
+
+def test_the_plugin_runtime_keeps_the_clients_default_timeout(sdk, mock):
+    """런타임이 클라이언트 타임아웃을 줄이면 같은 클라이언트의 `generate(wait=30)` 이 서버보다 먼저 끊긴다 — 실제로 겪었다."""
+    base, _server, _handler = mock
+    client_module = sys.modules[[m for m in sys.modules if m in ("bundled_client", "lcc_client")][0]]
+    assert _plugin(sdk, base).llm.timeout == client_module.DEFAULT_TIMEOUT
+    assert _plugin(sdk, base, timeout=7.0).llm.timeout == 7.0

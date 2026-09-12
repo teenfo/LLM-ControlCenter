@@ -37,6 +37,8 @@ PROMPT = """다음은 LLM 클러스터의 지금 상태를 담은 JSON 이다. �
 
 #: 예정보다 이만큼 넘게 늦은 tick 은 "아침 상태문" 이 아니다 — 만들지 않고 기록만 남긴다.
 TOO_LATE_SECONDS = 6 * 3600
+#: 결과를 이만큼 기다리고도 안 끝나면 **잡을 취소하고** 포기한다 — 노드가 죽어 있을 때 큐에 고아 잡을 남기지 않는다.
+DEADLINE_SECONDS = float(os.environ.get("LCC_PLUGIN_DEADLINE") or 600)
 
 
 def state_dir() -> Path:
@@ -52,12 +54,13 @@ class Reporter:
         """상태를 읽고 한 문단을 만든다. 성공 여부를 돌려준다."""
         status = self.plugin.llm.status()
         facts = json.dumps(status, ensure_ascii=False, sort_keys=True)
-        result = self.plugin.llm.generate("summarize", PROMPT.format(facts=facts), wait=30)
-        while not result.done:                                   # 서버가 기다려 준 뒤에도 안 끝났으면 폴링한다
-            time.sleep(result.retry_after or 2.0)
-            result = self.plugin.llm.job(result.job_id, wait=30)
+        # run() 은 서버가 기다려 준 뒤에도 안 끝났으면 retry_after 를 지켜 폴링한다 — deadline 까지만.
+        result = self.plugin.llm.run("summarize", PROMPT.format(facts=facts), wait=30, deadline=DEADLINE_SECONDS)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S %z")
-        if result.ok:
+        if not result.done:
+            self.plugin.llm.cancel(result.job_id)
+            line = f"[{stamp}] 포기: {DEADLINE_SECONDS:.0f}초 안에 답이 없어 잡 {result.job_id} 을(를) 취소했다 (노드가 죽어 있나?)"
+        elif result.ok:
             line = f"[{stamp}] {result.text.strip()}"
         else:
             line = f"[{stamp}] 실패: status={result.status} error_code={result.error_code} error={result.error}"

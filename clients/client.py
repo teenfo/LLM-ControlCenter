@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -289,8 +290,11 @@ class ControlCenter:
         request = urllib.request.Request(
             self.base_url + path, data=payload, headers=headers, method=method
         )
+        # 서버가 `wait` 만큼 붙들 수 있는 요청은 소켓 타임아웃이 그보다 길어야 한다. 같으면 서버가 답하기
+        # 직전에 이쪽이 끊고, 잡은 큐에 남는다 — 플러그인 런타임이 짧은 타임아웃으로 이 클라이언트를 쓰다가 실제로 겪었다.
+        timeout = self.timeout + _wait_seconds(path, body)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
@@ -300,6 +304,18 @@ class ControlCenter:
                 parsed = {"code": "unknown", "message": raw}
             raise _error_for(exc.code, parsed) from None
         return json.loads(raw) if raw else {}
+
+
+def _wait_seconds(path: str, body: Mapping[str, Any] | None) -> float:
+    """요청이 서버에 부탁한 대기 시간 — 본문의 `wait` 또는 질의의 `?wait=`. 없으면 0."""
+    value: Any = (body or {}).get("wait")
+    if value is None:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+        value = (query.get("wait") or [None])[0]
+    try:
+        return max(0.0, float(value)) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _error_for(status: int, body: Mapping[str, Any]) -> ControlCenterError:
