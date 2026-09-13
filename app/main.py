@@ -1,0 +1,2518 @@
+"""HTTP API — 라우터와 조립.
+
+`build_app()` 은 **전부 주입식**이다. 테스트가 목 클러스터를 넣고, 데모 프로파일이
+목 프로바이더를 넣고, 실제 설치가 진짜 노드를 넣는다 — 세 경로가 같은 코드를 지난다.
+
+이 모듈은 **잡을 만들지 않는다.** 요청 순서(인증 → 가드 → 저장 → 배치 → 실행)는
+`pipeline.Pipeline` 이 강제하고, 라우터는 HTTP 를 파이프라인 호출로 옮기기만 한다.
+라우터가 `store.create_job()` 을 직접 부를 수 있으면 언젠가 누군가 가드를 건너뛴
+경로를 만든다.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hmac
+import json
+import hashlib
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import (
+    RedirectResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+)
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
+
+from . import meta as meta_mod
+from .bootstrap import GRACE_KEY, PLATFORM_TENANT
+from .auth import (
+    ROLE_PLATFORM_ADMIN,
+    ROLE_SERVICE,
+    ROLE_TENANT_ADMIN,
+    ROLE_USER,
+    Principal,
+    RateLimiter,
+    account_row,
+    account_session,
+    active_service,
+    authenticate,
+    bearer_from_header,
+    change_password,
+    create_account,
+    issue_token,
+    limits_for,
+    login as account_login,
+    logout as account_logout,
+    normalize_username,
+    require_can_issue,
+    require_platform_admin,
+    require_tenant_admin,
+    reset_password,
+    rotate_token,
+    set_account_enabled,
+)
+from .cli_paths import bundled
+from .cluster import Cluster
+from .config import (
+    EXTERNAL,
+    INTERNAL,
+    MAX_KEEP_TAIL,
+    Config,
+    ConfigError,
+    validate_role_fields,
+)
+from .cost import CostAccountant
+from .crypto import (
+    CryptoError,
+    KeyDestroyed,
+    KeyVault,
+    Sealed,
+    prompt_aad,
+    response_aad,
+)
+from .evals import Evaluator
+from .guard import Guard
+from .i18n import ApiError, Translator, guard_pack_for, negotiate_locale
+from .identity import hash_end_user, new_salt
+from .models import ModelRegistrar
+from .notify import Notifier, channels_from_env
+from .observability import collect, diagnostic_bundle, render_metrics
+from . import plugins as plugin_mod
+from .pipeline import (
+    GUARD_ROLE,
+    MAX_WAIT_SECONDS,
+    Pipeline,
+    Submission,
+    is_public_role,
+)
+from .scheduler import Scheduler
+from .store import (
+    TERMINAL_STATUSES, AlreadyExists, PlatformScope, ScopeViolation, SqliteStore, StoreError,
+    TenantScope,
+)
+
+VERSION = "0.6.0"
+
+#: 요청 본문의 절대 상한(바이트).
+#:
+#: `max_prompt_chars`(기본 200,000자)가 UTF-8 한글이면 최대 600KB 다. 여기에
+#: system 프롬프트와 metadata 여유를 더해 2MB 로 잡는다 — 정상 요청은 절대
+#: 닿지 않고, 메모리를 노린 본문은 파싱 전에 걸린다.
+MAX_BODY_BYTES = 2 * 1024 * 1024
+
+#: 멱등성 키 헤더와 그 상한.
+#:
+#: 길이를 재는 이유: 키는 유니크 인덱스에 들어가고 잡 행에 붙어 산다. 소비자가
+#: 프롬프트 전체를 키로 넣으면 그 인덱스가 통째로 커진다.
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+MAX_IDEMPOTENCY_KEY_CHARS = 200
+
+#: 상태 조회는 제출과 다른 한도로 잰다. 대기 중인 소비자가 정상적으로 폴링하는 것을
+#: 제출 한도로 막으면 안 되고, 그렇다고 무제한이면 큐가 길어질 때 컨트롤 플레인이
+#: **클러스터 포화의 증상으로** 죽는다.
+POLL_LIMIT_PER_MIN = 600
+
+#: 계약·세션 엔드포인트의 분당 상한.
+#:
+#: 이 응답들은 **매번 생성된다**(역할은 런타임에 바뀌고, 허용 역할은 토큰마다
+#: 다르다 — 정적 파일이면 그 둘이 어긋난다). 생성 비용이 있는데 상한이 없으면
+#: 인증된 토큰 하나로 컨트롤 플레인 CPU 를 태울 수 있다. 폴링보다 훨씬 낮게
+#: 잡는다 — 계약은 배포 때 한 번 읽는 것이지 루프에서 읽는 것이 아니다.
+CONTRACT_LIMIT_PER_MIN = 60
+
+#: 메트릭 스크레이프 전용 토큰(환경 변수). 없으면 플랫폼 관리자 토큰만 통한다.
+#:
+#: 이것이 없으면 Prometheus 설정 파일에 **플랫폼 관리자 토큰을 평문으로** 두게
+#: 된다 — 스크레이프에 필요한 권한은 집계 숫자 읽기뿐인데 클러스터 전체를
+#: 지울 수 있는 자격증명을 거기 놓는 셈이다. 메트릭에는 테넌트 이름이 없으므로
+#: (그 자체가 별도로 강제된다) 이 토큰이 여는 범위는 운영 집계에 그친다.
+ENV_METRICS_TOKEN = "LCC_METRICS_TOKEN"
+
+# **저장소 배치와 설치본 배치가 다르다** — `bundled()` 이 그 차이를 흡수한다.
+CLIENT_DIR = bundled("clients")
+STATIC_DIR = bundled("static")
+
+
+# ── 조립 ────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class AppContext:
+    """앱이 들고 있는 것 전부. 라우트 핸들러는 `request.app.state.ctx` 로 받는다."""
+
+    config: Config
+    store: SqliteStore
+    cluster: Cluster
+    guard: Guard
+    pipeline: Pipeline
+    translator: Translator
+    vault: KeyVault
+    limiter: RateLimiter
+    accountant: CostAccountant
+    evaluator: Evaluator
+    registrar: ModelRegistrar
+    notifier: Notifier
+    scheduler: Scheduler | None = None
+    version: str = VERSION
+    #: 화면 자산의 캐시 키 — `버전-내용해시`. 같은 버전을 다시 올려도 자산이 바뀌면 키가 바뀐다.
+    asset_version: str = ""
+    #: 에어갭이면 클라우드 티어를 자동 비활성화하고 그 사실을 표시한다.
+    #: **설정에 남아 있는데 조용히 실패하는 것이 최악이다.**
+    airgap: bool = False
+    now: Callable[[], float] = time.time
+    static_dir: Path = STATIC_DIR
+    client_dir: Path = CLIENT_DIR
+    #: 플러그인 설치본이 사는 곳. `config/` 는 읽기 전용 마운트라 쓸 수 없다.
+    data_dir: Path = Path("data")
+    #: 번들 서명을 검증할 공개 키들. **번들 안의 키로 번들을 검증하지 않는다.**
+    plugin_trust_dir: Path = Path("keys/plugin-trust")
+    #: 플러그인의 서비스가 사는 테넌트. 1단계는 플랫폼 전용이다.
+    plugin_tenant: str = PLATFORM_TENANT
+
+    def limits_for_principal(self, tenant: Any, service: Any) -> dict[str, Any]:
+        limits = limits_for(tenant, service)
+        return {
+            "rate_limit_tenant_per_min": limits.tenant,
+            "rate_limit_service_per_min": limits.service,
+            "rate_limit_end_user_per_min": limits.end_user,
+            "status_poll_per_min": POLL_LIMIT_PER_MIN,
+            "budget_usd_per_month_tenant": tenant["budget_usd_per_month"],
+            "budget_usd_per_month_service": service["budget_usd_per_month"],
+            "require_end_user": bool(service["require_end_user"]),
+        }
+
+
+def build_app(
+    *,
+    config: Config,
+    store: SqliteStore,
+    cluster: Cluster | None = None,
+    guard: Guard | None = None,
+    scheduler: Scheduler | None = None,
+    pipeline: Pipeline | None = None,
+    translator: Translator | None = None,
+    vault: KeyVault | None = None,
+    evaluator: Evaluator | None = None,
+    registrar: ModelRegistrar | None = None,
+    accountant: CostAccountant | None = None,
+    notifier: Notifier | None = None,
+    airgap: bool = False,
+    version: str = VERSION,
+    now: Callable[[], float] = time.time,
+    static_dir: Path | None = None,
+    client_dir: Path | None = None,
+    data_dir: Path | None = None,
+    plugin_trust_dir: Path | None = None,
+    start_scheduler: bool = False,
+) -> Starlette:
+    """앱을 조립한다. 부품을 안 주면 기본값으로 만든다.
+
+    **부품을 전부 주입 가능하게 두는 것이 데모 프로파일의 근거다** — 목 프로바이더를
+    끼우면 GPU 없는 노트북 한 대로 클러스터 제품 전체를 시연할 수 있다.
+    """
+    translator = translator or Translator.from_dir(bundled("locales"))
+    vault = vault or KeyVault(None)
+    accountant = accountant or CostAccountant(config.pricing, store, now=now)
+    notifier = notifier or Notifier(
+        channels_from_env(), translator=translator, now=now
+    )
+    # 노드 헬스 전이가 알림기로 간다. 주입된 클러스터는 자기 알림기를 이미 갖고 있다.
+    cluster = cluster or Cluster(
+        config, store, accountant=accountant, now=now, notifier=notifier, airgap=airgap
+    )
+    guard = guard or Guard(config)
+    # 저장된 유예 상태를 가드에 반영한다. 안 하면 재시작할 때마다 유예가 풀려
+    # 도입 둘째 날 아침에 프로덕션이 선다.
+    guard.set_grace_mode(bool(store.platform_setting(GRACE_KEY, False)))
+    evaluator = evaluator or Evaluator(config, store, guard, now=now)
+    registrar = registrar or ModelRegistrar(
+        config, cluster, store, now=now, notify=notifier.as_callable()
+    )
+    pipeline = pipeline or Pipeline(
+        config, store, cluster, guard,
+        vault=vault, accountant=accountant, evaluator=evaluator, now=now,
+    )
+
+    # 2단 분류기를 여기서 꽂는다. 배선이 원형이라(가드 → 분류기 → 클러스터 → 파이프라인
+    # → 가드) 생성자에서는 못 묶는다. **안 꽂으면 맥락 규칙이 조용히 아무것도 안 한다.**
+    # 이미 꽂혀 있으면(테스트가 자기 분류기를 넣은 경우) 건드리지 않는다.
+    if not guard.has_classifier and GUARD_ROLE in config.roles:
+        guard.set_classifier(pipeline.make_classifier())
+
+    ctx = AppContext(
+        config=config, store=store, cluster=cluster, guard=guard, pipeline=pipeline,
+        translator=translator, vault=vault, limiter=RateLimiter(store, now=now),
+        accountant=accountant, evaluator=evaluator, registrar=registrar,
+        notifier=notifier, scheduler=scheduler, version=version, airgap=airgap, now=now,
+        static_dir=static_dir or STATIC_DIR, client_dir=client_dir or CLIENT_DIR,
+        asset_version=asset_version(static_dir or STATIC_DIR, version),
+        data_dir=Path(data_dir) if data_dir else Path("data"),
+        plugin_trust_dir=(
+            Path(plugin_trust_dir) if plugin_trust_dir
+            else (Path(data_dir) if data_dir else Path("data")).parent / "keys" / "plugin-trust"
+        ),
+    )
+
+    # 스케줄러 수명주기. Starlette 이 `add_event_handler` 를 뺐으므로 lifespan 을 쓴다.
+    # **배경 루프가 안 뜨면 큐가 영원히 안 줄어든다** — 조용히 깨지는 종류의 실패다.
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        if start_scheduler and scheduler is not None:
+            await scheduler.start()
+        try:
+            yield
+        finally:
+            if start_scheduler and scheduler is not None:
+                await scheduler.stop()
+
+    routes = _routes(ctx)
+    app = Starlette(
+        routes=routes,
+        lifespan=lifespan if start_scheduler and scheduler is not None else None,
+        exception_handlers={
+            ApiError: _api_error_handler,
+            ScopeViolation: _scope_violation_handler,
+            StoreError: _store_error_handler,
+            ConfigError: _config_error_handler,
+            404: _not_found_handler,
+            405: _method_handler,
+            500: _internal_handler,
+        },
+    )
+    app.state.ctx = ctx
+    return app
+
+
+# ── 오류 ────────────────────────────────────────────────────────────────────
+
+
+def _render(request: Request, error: ApiError) -> JSONResponse:
+    """오류를 낸다. **기계용 코드와 사람용 메시지를 둘 다 싣는다.**
+
+    분기는 코드로, 표시는 메시지로. 로케일을 바꿔도 `code` 와 `retryable` 은 안 바뀐다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    locale = _locale(request, getattr(request.state, "tenant_locale", None), ctx)
+    body = ctx.translator.render_error(error, locale)
+    return JSONResponse(body, status_code=error.status, headers={"Content-Language": locale})
+
+
+async def _api_error_handler(request: Request, exc: Exception) -> Response:
+    return _render(request, exc)  # type: ignore[arg-type]
+
+
+async def _scope_violation_handler(request: Request, exc: Exception) -> Response:
+    # 스코프 위반은 **버그이지 사용자 오류가 아니다.** 사유를 밖으로 흘리지 않는다.
+    return _render(request, ApiError("internal", status=500))
+
+
+async def _store_error_handler(request: Request, exc: Exception) -> Response:
+    return _render(request, ApiError("internal", status=500))
+
+
+async def _config_error_handler(request: Request, exc: Exception) -> Response:
+    return _render(request, ApiError("invalid_field", status=400, params={"field": str(exc)}))
+
+
+async def _not_found_handler(request: Request, exc: Exception) -> Response:
+    return _render(request, ApiError("not_found", status=404))
+
+
+async def _method_handler(request: Request, exc: Exception) -> Response:
+    return _render(request, ApiError("method_not_allowed", status=405))
+
+
+async def _internal_handler(request: Request, exc: Exception) -> Response:
+    return _render(request, ApiError("internal", status=500))
+
+
+# ── 요청 보조 ────────────────────────────────────────────────────────────────
+
+
+def _locale(request: Request, tenant_locale: str | None, ctx: AppContext) -> str:
+    """Accept-Language → 테넌트 기본값 → 플랫폼 기본값.
+
+    다중 테넌트라 **테넌트마다 기본 로케일이 다를 수 있다.**
+    """
+    return negotiate_locale(
+        ctx.translator.available,
+        accept_language=request.headers.get("accept-language"),
+        tenant_default=tenant_locale,
+        platform_default=ctx.translator.default,
+    )
+
+
+def _principal(request: Request) -> Principal:
+    ctx: AppContext = request.app.state.ctx
+    principal = authenticate(
+        ctx.store, bearer_from_header(request.headers.get("authorization")), now=ctx.now
+    )
+    tenant = ctx.store.get_tenant(principal.tenant_id)
+    # 이후 오류 응답이 이 테넌트의 로케일로 렌더되도록 남긴다.
+    request.state.tenant_locale = tenant["locale"] if tenant else None
+    request.state.tenant = tenant
+    return principal
+
+
+def _contract_limit(request: Request, label: str) -> None:
+    """계약·세션 응답의 분당 상한. **매번 생성되는 응답이라 공짜가 아니다.**"""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    ctx.limiter.check_named(
+        f"contract:{principal.tenant_id}:{principal.service_id}",
+        CONTRACT_LIMIT_PER_MIN,
+        scope_label="contract",
+    )
+
+
+async def _body(request: Request) -> dict[str, Any]:
+    """요청 본문을 dict 로. **크기 상한이 여기 걸린다.**
+
+    `max_prompt_chars` 는 `prompt` 필드에만 적용되고, 그마저도 본문을 전량
+    메모리에 읽은 **뒤에** 검사한다. 그래서 거대한 `metadata` 나 알 수 없는
+    필드로 메모리를 소진시킬 수 있었다 — 인증된 토큰 하나면 충분하다.
+    상한을 파싱 앞에 두면 JSON 디코딩 비용도 안 낸다.
+    """
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
+        raise ApiError(
+            "payload_too_large", status=413,
+            params={"size": length, "limit": str(MAX_BODY_BYTES)},
+        )
+
+    # **스트림을 상한까지만 읽는다.** `content-length` 가 없는(청크 전송) 요청을
+    # `request.body()` 로 전량 읽은 뒤에 재면, 검사 자체가 메모리 소진 경로가
+    # 된다(QA M21 잔여) — 상한을 넘는 순간 끊고 나머지는 읽지 않는다.
+    # 읽은 조각은 `request._body` 에 되돌려 놓아 뒤의 `request.json()` 류가
+    # 스트림을 다시 소비하려다 죽지 않게 한다(Starlette 의 `body()` 캐시 자리다).
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > MAX_BODY_BYTES:
+            raise ApiError(
+                "payload_too_large", status=413,
+                params={"size": f">{MAX_BODY_BYTES}", "limit": str(MAX_BODY_BYTES)},
+            )
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    request._body = raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        raise ApiError("invalid_json", status=400)
+    if not isinstance(parsed, dict):
+        raise ApiError("invalid_json", status=400)
+    return parsed
+
+
+def _int(
+    value: Any, field: str, *, default: int = 0,
+    minimum: int | None = None, maximum: int | None = None,
+) -> int:
+    """요청에서 온 정수. **`int()` 를 직접 부르지 않는다.**
+
+    `int("abc")` 의 `ValueError` 가 그대로 올라가면 400 이어야 할 것이 500 이 된다.
+    소비자는 "서버가 고장났다" 로 읽고 재시도하며, 실제로는 자기 요청이 틀린 것이다.
+    오류 계약(§5.4)이 `retryable` 로 분기하라고 못박아 둔 만큼 이 구분이 중요하다.
+    """
+    if value is None or value == "":
+        parsed = default
+    else:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            raise ApiError("invalid_field", status=400, params={"field": field})
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _float(
+    value: Any, field: str, *, default: float = 0.0,
+    minimum: float | None = None, maximum: float | None = None,
+) -> float:
+    """요청에서 온 실수. `_int` 와 같은 이유다."""
+    if value is None or value == "":
+        parsed = default
+    else:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            raise ApiError("invalid_field", status=400, params={"field": field})
+        if parsed != parsed or parsed in (float("inf"), float("-inf")):
+            # NaN·Infinity 는 JSON 으로 다시 나갈 수 없고 비교도 이상하게 돈다.
+            raise ApiError("invalid_field", status=400, params={"field": field})
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _confirm(request: Request, body: Mapping[str, Any], expected: str) -> None:
+    """되돌릴 수 없는 작업의 확인값.
+
+    본문과 쿼리 **양쪽**에서 받는다. DELETE 에 본문을 싣는 것은 프록시·CLI·클라이언트
+    라이브러리가 제대로 지원하지 않는 경우가 많고, 파기 API 가 흔한 도구로 호출되지
+    않으면 설치처는 결국 DB 를 직접 지운다 — 그 순간 확인도 감사도 사라진다.
+    """
+    given = body.get("confirm") or request.query_params.get("confirm")
+    if given != expected:
+        raise ApiError("confirmation_required", status=400)
+
+
+def _need(body: Mapping[str, Any], field_name: str) -> Any:
+    if field_name not in body or body[field_name] in (None, ""):
+        raise ApiError("missing_field", status=400, params={"field": field_name})
+    return body[field_name]
+
+
+def _ok(request: Request, payload: Any, status: int = 200) -> JSONResponse:
+    """성공 응답. **`Content-Language` 를 실제로 붙인다.**
+
+    예전에는 `request.state.response_locale` 을 읽었는데 그것을 세우는 곳이 없어서
+    헤더가 한 번도 안 나갔다. 오류 응답만 로케일을 협상하고 성공 응답은 안 하면,
+    소비자는 사람이 읽는 문자열이 어느 언어인지 알 방법이 없다 — 다국어를
+    넣으면서 계약의 절반만 지킨 셈이다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    locale = _locale(request, getattr(request.state, "tenant_locale", None), ctx)
+    return JSONResponse(
+        payload, status_code=status, headers={"Content-Language": locale}
+    )
+
+
+def _submission_body(submission: Submission) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "job_id": submission.job_id,
+        "status": submission.status,
+        "role": submission.role,
+        "attempts": submission.attempts,
+        "guard_actions": dict(submission.guard_actions),
+    }
+    for key in ("response", "error", "error_code", "model", "node", "tier"):
+        value = getattr(submission, key)
+        if value is not None:
+            body[key] = value
+    if submission.pending:
+        body["queue_position"] = submission.queue_position
+        body["retry_after"] = submission.retry_after
+        if submission.wait_reason:
+            body["wait_reason"] = submission.wait_reason
+    if submission.metadata:
+        body["metadata"] = dict(submission.metadata)
+    return body
+
+
+def _submission_response(request: Request, submission: Submission) -> JSONResponse:
+    response = _ok(request, _submission_body(submission))
+    if submission.pending and submission.retry_after is not None:
+        # 표준 헤더로도 실어 보낸다 — 본문을 안 읽는 클라이언트도 지키게.
+        response.headers["Retry-After"] = str(int(submission.retry_after))
+    return response
+
+
+def _base_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
+
+
+# ── 소비자 ──────────────────────────────────────────────────────────────────
+
+
+async def healthz(request: Request) -> Response:
+    """인증 없이 응답한다. 컨테이너 헬스체크와 로드밸런서가 쓴다.
+
+    **DB 를 만지지 않는다** — DB 가 느릴 때 헬스체크까지 느려지면 오케스트레이터가
+    멀쩡한 컨테이너를 죽인다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    return JSONResponse({"ok": True, "version": ctx.version, "api": meta_mod.API_VERSION})
+
+
+def _idempotency_key(request: Request) -> str | None:
+    """`Idempotency-Key` 헤더. 없으면 `None`.
+
+    **모양만 본다.** 값의 의미는 소비자가 정하고, 서버는 (테넌트, 서비스) 안에서
+    같은 값이면 같은 작업으로 본다. 빈 문자열은 헤더를 안 보낸 것과 같게 다룬다 —
+    그렇게 안 하면 빈 키를 보낸 소비자 전원이 같은 잡 하나를 공유한다.
+    """
+    raw = (request.headers.get(IDEMPOTENCY_HEADER) or "").strip()
+    if not raw:
+        return None
+    if len(raw) > MAX_IDEMPOTENCY_KEY_CHARS:
+        raise ApiError(
+            "invalid_field", status=400,
+            params={"field": "Idempotency-Key", "limit": str(MAX_IDEMPOTENCY_KEY_CHARS)},
+        )
+    return raw
+
+
+async def generate(request: Request) -> Response:
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    body = await _body(request)
+
+    submission = await ctx.pipeline.submit(
+        principal,
+        role=str(_need(body, "role")),
+        prompt=str(_need(body, "prompt")),
+        system=body.get("system"),
+        end_user=body.get("end_user"),
+        priority=_int(body.get("priority"), "priority", minimum=-100, maximum=100),
+        metadata=body.get("metadata") or {},
+        # 통합 `wait` 도 요청 값이다 — 여기서 400 으로 걸러야 파이프라인 안에서
+        # `float("조금")` 이 500 으로 터지지 않는다.
+        wait=(
+            None if body.get("wait") is None
+            else _float(body.get("wait"), "wait", minimum=0.0, maximum=MAX_WAIT_SECONDS)
+        ),
+        idempotency_key=_idempotency_key(request),
+    )
+    return _submission_response(request, submission)
+
+
+async def chat(request: Request) -> Response:
+    """대화 요청. 본문이 `prompt` 가 아니라 `messages` 인 것 말고는 `generate` 와 같은 계약이다."""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    body = await _body(request)
+
+    submission = await ctx.pipeline.chat(
+        principal,
+        role=str(_need(body, "role")),
+        messages=_need(body, "messages"),
+        system=body.get("system"),
+        end_user=body.get("end_user"),
+        priority=_int(body.get("priority"), "priority", minimum=-100, maximum=100),
+        metadata=body.get("metadata") or {},
+        wait=(
+            None if body.get("wait") is None
+            else _float(body.get("wait"), "wait", minimum=0.0, maximum=MAX_WAIT_SECONDS)
+        ),
+        idempotency_key=_idempotency_key(request),
+    )
+    return _submission_response(request, submission)
+
+
+async def embed(request: Request) -> Response:
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    body = await _body(request)
+
+    raw = _need(body, "input")
+    # **dict 를 주면 조용히 키 목록이 된다.** `list({"a": 1})` == `["a"]` 이라
+    # 소비자는 자기가 보낸 값과 무관한 임베딩을 받고도 200 을 본다.
+    # 받을 모양을 명시적으로 정하고 나머지는 400 이다.
+    if isinstance(raw, str):
+        inputs = [raw]
+    elif isinstance(raw, list) and all(isinstance(t, str) for t in raw):
+        inputs = list(raw)
+    else:
+        raise ApiError("invalid_field", status=400, params={"field": "input"})
+
+    result = await ctx.pipeline.embed(
+        principal,
+        role=str(_need(body, "role")),
+        inputs=inputs,
+        end_user=body.get("end_user"),
+    )
+    return _ok(request, result)
+
+
+async def jobs_list(request: Request) -> Response:
+    """내 작업 목록. **범위는 사람이다** — (테넌트, 서비스, 엔드유저 해시).
+
+    계정 세션은 아이디가 곧 end_user 라 자기 것만 보인다. 서비스 토큰은 `?end_user=` 를
+    요구한다 — 토큰 하나로 서비스 전체의 이력을 여는 것은 지금까지 없던 노출이고, 공유
+    토큰으로 남의 이력을 보게 된다. 마스킹본과 가드 판정만 나간다 — 원문은 테넌트 관리자의
+    단건 API + 감사다. `route`·`cost_usd`·`has_raw` 는 관리자 표면의 것이라 여기 없다
+    (소비자 계약은 라우팅을 모른다).
+    """
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    ctx.limiter.check_named(
+        f"poll:{principal.tenant_id}:{principal.service_id}",
+        POLL_LIMIT_PER_MIN,
+        scope_label="status_poll",
+    )
+    params = request.query_params
+    account = account_session(ctx.store, principal)
+    person = account or params.get("end_user")
+    if not person:
+        raise ApiError("end_user_required", status=400)
+    tenant = request.state.tenant
+    end_user_hash = hash_end_user(person, tenant["end_user_salt"])
+    rows = ctx.store.list_jobs(
+        principal.scope(), service_id=principal.service_id, end_user_hash=end_user_hash,
+        limit=_int(params.get("limit"), "limit", default=50, minimum=1, maximum=100),
+    )
+    actions = ctx.store.filter_actions_for_jobs(principal.scope(), [j.id for j in rows])
+    return _ok(request, {
+        "scope": "account" if account else "token",
+        "jobs": [
+            {
+                "job_id": j.id,
+                "status": j.status if j.status in TERMINAL_STATUSES else "pending",
+                "role": j.role, "kind": j.kind, "model": j.model, "tier": j.tier,
+                "attempts": j.attempts,
+                "prompt_masked": j.prompt_masked, "response": j.response,
+                "error_code": j.error_code,
+                "guard_actions": actions.get(j.id, {}),
+                "created_at": j.created_at, "finished_at": j.finished_at,
+            }
+            for j in rows
+        ],
+    })
+
+
+async def job_get(request: Request) -> Response:
+    """작업 조회. **폴링 방어가 여기 걸린다.**"""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    ctx.limiter.check_named(
+        f"poll:{principal.tenant_id}:{principal.service_id}",
+        POLL_LIMIT_PER_MIN,
+        scope_label="status_poll",
+    )
+    wait = request.query_params.get("wait")
+    submission = await ctx.pipeline.wait_for(
+        principal.scope(),
+        request.path_params["job_id"],
+        seconds=_float(wait, "wait", minimum=0.0, maximum=MAX_WAIT_SECONDS),
+    )
+    return _submission_response(request, submission)
+
+
+async def job_cancel(request: Request) -> Response:
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    submission = ctx.pipeline.cancel(
+        principal.scope(), request.path_params["job_id"], actor=principal.service_id
+    )
+    return _ok(request, _submission_body(submission))
+
+
+async def roles(request: Request) -> Response:
+    """이 토큰이 쓸 수 있는 역할.
+
+    **여기 보이는 것이 곧 쓸 수 있는 전부여야 한다** — 목록에 있는데 못 쓰거나 목록에
+    없는데 쓰이면 계약이 거짓말이 된다. 그래서 `meta.visible_roles()` 하나만 쓴다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    service = ctx.store.get_service(principal.scope(), principal.service_id)
+    if service is None:
+        raise ApiError("unauthorized", status=401)
+
+    names = meta_mod.visible_roles(ctx.config, service["allow_roles_json"])
+    return _ok(request, {
+        "roles": [meta_mod.role_contract(ctx.config, n) for n in names],
+        "limits": ctx.limits_for_principal(request.state.tenant, service),
+    })
+
+
+async def status(request: Request) -> Response:
+    """클러스터 상태 요약. 소비자가 "왜 느린가" 를 스스로 답할 수 있게."""
+    ctx: AppContext = request.app.state.ctx
+    _principal(request)   # 인증만 한다 — 클러스터 상태는 테넌트에 무관하다
+    lanes = ctx.scheduler.snapshot() if ctx.scheduler else {}
+    nodes = ctx.cluster.snapshot()
+    return _ok(request, {
+        # 레인 통계에는 `scan_truncated` 가 들어 있다. 절단 사실을 숨기지 않는다 —
+        # 조용히 자르면 "전부 검토했다" 로 읽힌다.
+        "lanes": lanes,
+        "nodes": {
+            "total": len(nodes),
+            "healthy": sum(1 for n in nodes if n["status"] == "healthy"),
+            "draining": sum(1 for n in nodes if n["status"] == "draining"),
+        },
+        # **수만 준다.** 원래는 `역할 → 노드` 매핑을 그대로 돌려줬는데, 그러면
+        # `_guard_classify` 같은 내부 역할 이름과 클러스터 토폴로지가 서비스
+        # 토큰에 노출된다 — meta·openapi 가 공들여 숨긴 것을 이 엔드포인트가 흘린다.
+        # 소비자가 "왜 느린가" 를 답하는 데 필요한 것은 **그런 역할이 몇 개인가**
+        # 이지 그것이 무엇이고 어느 기계에 있는지가 아니다.
+        "single_homed_roles": len(ctx.cluster.single_homed_roles()),
+        "airgap": ctx.airgap,
+    })
+
+
+# ── 계약 자기 서빙 ───────────────────────────────────────────────────────────
+
+
+def _service_or_401(ctx: AppContext, principal: Principal) -> Any:
+    service = ctx.store.get_service(principal.scope(), principal.service_id)
+    if service is None:
+        raise ApiError("unauthorized", status=401)
+    return service
+
+
+def _classifier_ready(ctx: AppContext) -> tuple[bool, str]:
+    if not ctx.guard.has_classifier:
+        return False, "not_wired"
+    if not any(rule.is_llm for rule in ctx.config.guard_rules):
+        # 맥락 규칙이 없으면 분류를 안 부른다. 그건 미비가 아니라 구성이다.
+        return True, "no_context_rules"
+    return ctx.evaluator.classifier_ready(GUARD_ROLE)
+
+
+async def session(request: Request) -> Response:
+    """이 토큰이 누구이고 UI 가 무엇을 그릴 수 있는가.
+
+    관제 UI 는 렌더 전에 **역할과 문자열 카탈로그**를 알아야 한다. 두 번에 나눠
+    받으면 첫 화면이 영어로 떴다가 한국어로 바뀌는 깜빡임이 생기고, 역할을 모른 채
+    그리면 권한 없는 메뉴를 띄웠다 지우게 된다.
+
+    문자열은 협상된 로케일 하나만 보낸다 — 전체 카탈로그를 보내면 쓰지도 않을
+    번역이 매 요청마다 따라다닌다.
+    """
+    _contract_limit(request, "session")
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    tenant = request.state.tenant
+    locale = _locale(request, tenant["locale"] if tenant else None, ctx)
+
+    service = ctx.store.get_service(principal.scope(), principal.service_id)
+    # 한 번만 계산한다 — 두 번 부르면 DB 조회도 두 번이고, 그 사이에 값이
+    # 달라지면 화면이 "준비됨 + 준비 안 된 사유" 라는 모순된 조합을 받는다.
+    classifier_ready, classifier_reason = _classifier_ready(ctx)
+    return _ok(request, {
+        "tenant": {
+            "id": principal.tenant_id,
+            "name": tenant["name"] if tenant else principal.tenant_id,
+            "locale": tenant["locale"] if tenant else ctx.translator.default,
+        },
+        "service": {"id": principal.service_id, "name": service["name"] if service else ""},
+        "role": principal.role,
+        "is_tenant_admin": principal.is_tenant_admin,
+        "is_platform_admin": principal.is_platform_admin,
+        "locale": locale,
+        "available_locales": list(ctx.translator.available),
+        "strings": ctx.translator.catalog(locale),
+        "version": ctx.version,
+        "airgap": ctx.airgap,
+        # 안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.
+        "guard_locale_pack": guard_pack_for(tenant["locale"]) if tenant else None,
+        "raw_prompt_storage": ctx.vault.enabled,
+        # 계정 세션이면 그 아이디. 화면이 "누구로 들어왔나" 와 비밀번호 변경을 그린다.
+        "account": account_session(ctx.store, principal),
+        # 계정의 역할(user·tenant_admin·platform_admin). 토큰 역할과 다르다 — `user` 는 `service`
+        # 토큰으로 내려오므로 화면이 "누구인가" 를 알려면 이 값이 따로 있어야 한다.
+        "account_role": (
+            row["role"] if (row := account_row(ctx.store, principal)) is not None else None
+        ),
+        # **배선만 되고 인증이 안 된 분류기는 안 붙은 것과 결과가 같다.**
+        # "붙었는가" 를 답하면 화면이 거짓말을 한다.
+        "guard_classifier_ready": classifier_ready,
+        "guard_classifier_reason": classifier_reason,
+        # 라우팅도 같은 함정이다 — 분류기가 미인증이면 켜 놓은 라우팅이 조용히
+        # 전건 기본 모델로 간다. 관리자 화면이 그것을 보여줘야 한다(QA R-HIGH).
+        "routing_ready": {
+            name: ctx.evaluator.classifier_ready(role.routing.classifier)[0]
+            for name, role in ctx.config.roles.items()
+            if role.routing is not None
+        },
+        # **유예를 조용히 두면 그게 더 나쁘다.** 차단 규칙이 마스킹으로 낮춰진 채
+        # 도는 것을 모르면 관리자는 필터가 막고 있다고 믿는다.
+        "guard_grace_mode": ctx.guard.grace_mode,
+    })
+
+
+async def meta_endpoint(request: Request) -> Response:
+    _contract_limit(request, "meta")
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    service = _service_or_401(ctx, principal)
+    tenant = request.state.tenant
+
+    return _ok(request, meta_mod.meta_document(
+        ctx.config,
+        allow_roles=service["allow_roles_json"],
+        tenant_locale=tenant["locale"],
+        locales=ctx.translator.available,
+        base_url=_base_url(request),
+        routes=request.app.routes,
+        version=ctx.version,
+        schema_version=ctx.store.schema_version,
+        limits=ctx.limits_for_principal(tenant, service),
+        guard_locale_pack=guard_pack_for(tenant["locale"]),
+        airgap=ctx.airgap,
+    ))
+
+
+async def integration(request: Request) -> Response:
+    _contract_limit(request, "integration")
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    service = _service_or_401(ctx, principal)
+    tenant = request.state.tenant
+    locale = _locale(request, tenant["locale"], ctx)
+
+    text = meta_mod.integration_guide(
+        ctx.config,
+        allow_roles=service["allow_roles_json"],
+        base_url=_base_url(request),
+        routes=request.app.routes,
+        limits=ctx.limits_for_principal(tenant, service),
+        translator=ctx.translator,
+        locale=locale,
+    )
+    return PlainTextResponse(
+        text, media_type="text/markdown; charset=utf-8",
+        headers={"Content-Language": locale},
+    )
+
+
+def _openapi_for(request: Request) -> dict[str, Any]:
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    service = _service_or_401(ctx, principal)
+    return meta_mod.openapi_document(
+        ctx.config,
+        allow_roles=service["allow_roles_json"],
+        base_url=_base_url(request),
+        version=ctx.version,
+    )
+
+
+async def openapi_json(request: Request) -> Response:
+    _contract_limit(request, "openapi")
+    return _ok(request, _openapi_for(request))
+
+
+async def openapi_yaml(request: Request) -> Response:
+    _contract_limit(request, "openapi")
+    import yaml
+
+    return PlainTextResponse(
+        yaml.safe_dump(_openapi_for(request), allow_unicode=True, sort_keys=False),
+        media_type="application/yaml; charset=utf-8",
+    )
+
+
+async def client_index(request: Request) -> Response:
+    """번들된 클라이언트·목 서버 목록.
+
+    **설치처 개발자가 노드도 토큰도 없이 통합 코드를 완성할 수 있어야 한다.**
+    붙이기 어려우면 우회로를 만들고, 우회로는 가드도 비용도 감사도 지나지 않는다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    files = sorted(p.name for p in ctx.client_dir.glob("*") if p.is_file()) if ctx.client_dir.is_dir() else []
+    return _ok(request, {
+        "files": [
+            {"name": name, "url": f"{_base_url(request)}/v1/client/{name}"} for name in files
+        ],
+    })
+
+
+async def client_file(request: Request) -> Response:
+    _contract_limit(request, "client")
+    ctx: AppContext = request.app.state.ctx
+    name = request.path_params["name"]
+    target = (ctx.client_dir / name).resolve()
+    # 경로 탈출 방지 — 파일 이름을 그대로 붙이면 `../../keys/master.key` 가 열린다.
+    if ctx.client_dir.resolve() not in target.parents or not target.is_file():
+        raise ApiError("not_found", status=404)
+    return PlainTextResponse(target.read_text(encoding="utf-8"), media_type="text/plain; charset=utf-8")
+
+
+# ── 테넌트 관리 ──────────────────────────────────────────────────────────────
+
+
+def _tenant_admin(request: Request) -> tuple[AppContext, Principal, TenantScope]:
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    require_tenant_admin(principal)
+    return ctx, principal, principal.scope()
+
+
+def _service_view(row: Any) -> dict[str, Any]:
+    """서비스 행의 응답 모양 — 목록·생성 직후·갱신 직후가 같은 모양이어야 콘솔이 한 렌더러를 쓴다."""
+    return {
+        "id": row["id"], "name": row["name"], "status": row["status"],
+        "allow_roles": json.loads(row["allow_roles_json"]),
+        "rate_limit_per_min": row["rate_limit_per_min"],
+        "budget_usd_per_month": row["budget_usd_per_month"],
+        "require_end_user": bool(row["require_end_user"]),
+        "end_user_rate_limit": row["end_user_rate_limit"],
+        "created_at": row["created_at"],
+    }
+
+
+def _validate_allow_roles(ctx: AppContext, allow: Any) -> list[str]:
+    """`allow_roles` 는 문자열 목록이고 `*` 또는 실재하는 **공개** 역할 이름만 담는다.
+
+    모르는 역할과 내부 역할이 같은 404 인 것은 의도다 — 내부 역할의 존재를 흘리지 않는다.
+    내부 역할을 소비자 토큰에 붙일 수 있으면 분류 경로가 열린다.
+    """
+    if not isinstance(allow, list) or not all(isinstance(r, str) for r in allow):
+        raise ApiError("invalid_field", status=400, params={"field": "allow_roles"})
+    unknown = [r for r in allow if r != "*" and r not in ctx.config.roles]
+    if unknown:
+        raise ApiError("unknown_role", status=404, params={"role": ", ".join(unknown)})
+    hidden = [r for r in allow if r != "*" and not is_public_role(r)]
+    if hidden:
+        raise ApiError("unknown_role", status=404, params={"role": ", ".join(hidden)})
+    return allow
+
+
+async def tenant_services(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    if request.method == "GET":
+        # 역할 카탈로그를 같이 준다 — 콘솔의 allow_roles 폼이 고를 이름이다. `/v1/roles` 는 호출
+        # 토큰 자기 서비스 기준이라 플랫폼 `console` 서비스(allow_roles=[])로는 비어 있다.
+        return _ok(request, {
+            "services": [_service_view(row) for row in ctx.store.list_services(scope)],
+            "roles": [
+                {"name": name, "kind": ctx.config.roles[name].kind}
+                for name in meta_mod.visible_roles(ctx.config, ["*"])
+            ],
+        })
+
+    body = await _body(request)
+    allow = _validate_allow_roles(ctx, list(body.get("allow_roles") or ["*"]))
+
+    service_id = str(_need(body, "id"))
+    if ctx.store.get_service(scope, service_id) is not None:
+        # PK 충돌이 500 으로 나가면 소비자는 "서버가 고장났다" 로 읽고 재시도한다.
+        raise ApiError("already_exists", status=409, params={"id": service_id})
+    try:
+        ctx.store.create_service(
+            scope, service_id, str(body.get("name") or service_id),
+            allow_roles=allow,
+            rate_limit_per_min=body.get("rate_limit_per_min"),
+            budget_usd_per_month=body.get("budget_usd_per_month"),
+            require_end_user=bool(body.get("require_end_user", False)),
+            end_user_rate_limit=body.get("end_user_rate_limit"),
+        )
+    except AlreadyExists:
+        # 위 사전 조회는 다중 워커에서 진다 — 두 요청이 함께 조회를 통과하면
+        # 늦은 INSERT 가 여기로 온다. DB 의 판정도 같은 409 다(QA M18).
+        raise ApiError("already_exists", status=409, params={"id": service_id})
+    ctx.store.audit(
+        principal.token_id, "create_service", tenant_id=scope.tenant_id,
+        target=service_id, detail={"allow_roles": allow},
+    )
+    return _ok(request, {"id": service_id}, status=201)
+
+
+#: PUT /v1/admin/services/{id} 가 받는 필드. `status` 는 없다 — 그 스위치는 플러그인 토글의 것이다.
+_SERVICE_EDITABLE = (
+    "name", "allow_roles", "rate_limit_per_min", "end_user_rate_limit",
+    "budget_usd_per_month", "require_end_user",
+)
+
+
+async def tenant_service_update(request: Request) -> Response:
+    """서비스 정책 갱신. **적용은 다음 요청부터다** — 캐시가 없어서 무효화할 것도 없다.
+
+    없는 키는 그대로 두고 `null` 은 한도를 해제한다. 숫자는 잘라내지 않고 거절한다(`_int` 는
+    최소값으로 잘라 주므로 그 뒤에 한 번 더 본다). 플러그인이 만든 서비스는 매니페스트가
+    정본이라 여기서 고칠 수 없다 — 고치면 다음 설치·갱신에서 어긋난다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    service_id = request.path_params["service_id"]
+    row = ctx.store.get_service(scope, service_id)
+    if row is None:
+        raise ApiError("not_found", status=404)
+    owner = ctx.store.plugin_id_for_service(scope, service_id)
+    if owner is not None:
+        raise ApiError("plugin_managed", status=409, params={"id": service_id, "plugin": owner})
+
+    body = await _body(request)
+    changes: dict[str, Any] = {}
+    if "name" in body:
+        name = body["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ApiError("invalid_field", status=400, params={"field": "name"})
+        changes["name"] = name.strip()
+    if "allow_roles" in body:
+        changes["allow_roles"] = _validate_allow_roles(ctx, body["allow_roles"])
+    for field_name in ("rate_limit_per_min", "end_user_rate_limit"):
+        if field_name in body:
+            if body[field_name] is None:
+                changes[field_name] = None
+            else:
+                raw_limit = body[field_name]
+                if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit < 1:
+                    # `_int` 는 최소값으로 잘라 준다 — 0 이나 음수를 1 로 바꿔 저장하면 "한도 없음" 을
+                    # 뜻한 요청이 "분당 1회" 가 된다. 자르지 않고 거절한다.
+                    raise ApiError("invalid_field", status=400, params={"field": field_name})
+                changes[field_name] = _int(raw_limit, field_name, minimum=1)
+    if "budget_usd_per_month" in body:
+        raw_budget = body["budget_usd_per_month"]
+        if raw_budget is None:
+            changes["budget_usd_per_month"] = None
+        else:
+            if isinstance(raw_budget, bool) or not isinstance(raw_budget, (int, float)) or raw_budget < 0:
+                # 문자열·불·음수는 거절한다 — `_float` 는 음수를 0 으로 잘라 "예산 없음" 을 "예산 0" 으로 바꾼다.
+                raise ApiError("invalid_field", status=400, params={"field": "budget_usd_per_month"})
+            changes["budget_usd_per_month"] = _float(raw_budget, "budget_usd_per_month", minimum=0.0)
+    if "require_end_user" in body:
+        if not isinstance(body["require_end_user"], bool):
+            raise ApiError("invalid_field", status=400, params={"field": "require_end_user"})
+        changes["require_end_user"] = body["require_end_user"]
+    if not changes:
+        raise ApiError("missing_field", status=400, params={"field": "fields"})
+
+    ctx.store.update_service(scope, service_id, **changes)
+    ctx.store.audit(
+        principal.token_id, "update_service", tenant_id=scope.tenant_id, target=service_id,
+        detail={"fields": sorted(changes), **({"allow_roles": changes["allow_roles"]} if "allow_roles" in changes else {})},
+    )
+    return _ok(request, _service_view(ctx.store.get_service(scope, service_id)))
+
+
+async def tenant_tokens(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    if request.method == "GET":
+        # **원값도 해시도 나가지 않는다.** 접두사만으로 어느 토큰인지 식별한다.
+        return _ok(request, {"tokens": [
+            {
+                "id": row["id"], "service_id": row["service_id"], "prefix": row["prefix"],
+                "role": row["role"], "created_at": row["created_at"],
+                "expires_at": row["expires_at"], "last_used_at": row["last_used_at"],
+                "revoked_at": row["revoked_at"], "note": row["note"],
+            }
+            for row in ctx.store.list_tokens(scope)
+        ]})
+
+    body = await _body(request)
+    service_id = str(_need(body, "service_id"))
+    if ctx.store.get_service(scope, service_id) is None:
+        raise ApiError("not_found", status=404)
+
+    role = str(body.get("role") or ROLE_SERVICE)
+    # 테넌트 관리자가 플랫폼 권한을 스스로 발급할 수 있으면 RBAC 가 사라진다.
+    # **회전 경로도 같은 헬퍼를 지난다** — 규칙이 한 곳에만 있어야 한다.
+    require_can_issue(principal.role, role)
+
+    token_id, raw = issue_token(
+        ctx.store, scope, service_id, role=role,
+        expires_at=body.get("expires_at"), note=body.get("note"),
+        actor=principal.token_id,
+    )
+    return _ok(request, {
+        "id": token_id,
+        "token": raw,
+        "note": "이 값은 지금 한 번만 보입니다. 다시 볼 수 없습니다.",
+    }, status=201)
+
+
+async def tenant_token_rotate(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    body = await _body(request)
+    new_id, raw = rotate_token(
+        ctx.store, scope, request.path_params["token_id"],
+        actor_role=principal.role,
+        actor=principal.token_id,
+        grace_seconds=_float(body.get("grace_seconds"), "grace_seconds", minimum=0.0),
+        now=ctx.now,
+    )
+    return _ok(request, {
+        "id": new_id, "token": raw,
+        "note": "이 값은 지금 한 번만 보입니다. 다시 볼 수 없습니다.",
+    })
+
+
+async def tenant_token_revoke(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    if not ctx.store.revoke_token(scope, request.path_params["token_id"]):
+        raise ApiError("not_found", status=404)
+    ctx.store.audit(
+        principal.token_id, "revoke_token", tenant_id=scope.tenant_id,
+        target=request.path_params["token_id"],
+    )
+    return _ok(request, {"revoked": True})
+
+
+async def tenant_guard_rules(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    tenant = request.state.tenant
+    pack = guard_pack_for(tenant["locale"])
+
+    if request.method == "GET":
+        effective = ctx.guard.rules_for(
+            [pack] if pack else [], ctx.pipeline.tenant_guard_rules(scope)
+        )
+        return _ok(request, {
+            "locale_pack": pack,
+            # **항상 켜지는 팩도 보여준다.** "켜진 팩" 을 로케일 팩 하나로만 답하면
+            # 인젝션 팩처럼 로케일과 무관하게 도는 것이 화면에서 사라지고, 관리자는
+            # 자기가 무엇을 켜 두고 있는지 절반만 안다.
+            "always_on_packs": sorted(ctx.config.always_on_packs),
+            "tenant_rules": ctx.store.list_tenant_guard_rules(scope),
+            # 실제로 적용되는 값. 베이스라인과 병합된 결과다.
+            "effective": [
+                {
+                    "id": r.id, "kind": r.kind, "label": r.label,
+                    "locale_pack": r.locale_pack,
+                    "action": {b: r.action_for_boundary(b) for b in (INTERNAL, EXTERNAL)},
+                }
+                for r in effective
+            ],
+        })
+
+    body = await _body(request)
+    rule = {
+        "id": str(_need(body, "id")),
+        "kind": str(body.get("kind") or "pattern"),
+        "action": _need(body, "action"),
+        "label": body.get("label") or "",
+        "pattern": body.get("pattern"),
+        "checksum": body.get("checksum"),
+        "keep_tail": _int(body.get("keep_tail"), "keep_tail", minimum=0, maximum=MAX_KEEP_TAIL),
+        "description": body.get("description"),
+        "locale_pack": str(body.get("locale_pack") or "tenant"),
+    }
+    if rule["kind"] == "pattern" and not rule["pattern"]:
+        raise ApiError("missing_field", status=400, params={"field": "pattern"})
+    ctx.guard.validate_rule(rule)
+
+    # **승격 게이트를 여기서 실제로 검사한다.**
+    #
+    # promote 엔드포인트는 판정만 하고 적용은 이 PUT 이 한다. 그 독스트링은
+    # "그쪽이 게이트를 다시 검사한다" 고 적어 놨는데 **검사하지 않았다** —
+    # 그래서 측정 없이 새 규칙을 바로 `block` 으로 저장할 수 있었고,
+    # 게이트는 화면에 숫자를 보여주는 장식이 됐다.
+    #
+    # 판정 엔드포인트가 있는데 강제가 없으면 그것은 게이트가 아니라 안내문이다.
+    for boundary in (INTERNAL, EXTERNAL):
+        target = (
+            rule["action"] if isinstance(rule["action"], str)
+            else rule["action"].get(boundary, "audit")
+        )
+        verdict = ctx.evaluator.can_promote(scope, rule["id"], target)
+        if not verdict.allowed:
+            raise ApiError(
+                "promotion_blocked", status=409,
+                params={
+                    "rule": rule["id"], "reason": verdict.reason,
+                    "rate": f"{verdict.rate:.3f}", "reviewed": str(verdict.reviewed),
+                    "limit": f"{verdict.limit:.3f}",
+                },
+            )
+
+    ctx.store.set_tenant_guard_rule(scope, rule, updated_by=principal.token_id)
+    ctx.store.audit(
+        principal.token_id, "set_guard_rule", tenant_id=scope.tenant_id,
+        target=rule["id"], detail={"action": rule["action"], "kind": rule["kind"]},
+    )
+    return _ok(request, {"id": rule["id"]}, status=201)
+
+
+async def tenant_guard_rule_delete(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    rule_id = request.path_params["rule_id"]
+    if not ctx.store.clear_tenant_guard_rule(scope, rule_id):
+        raise ApiError("not_found", status=404)
+    ctx.store.audit(
+        principal.token_id, "clear_guard_rule", tenant_id=scope.tenant_id, target=rule_id
+    )
+    return _ok(request, {"deleted": True})
+
+
+async def tenant_guard_events(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    params = request.query_params
+    rows = ctx.store.list_filter_events(
+        scope,
+        action=params.get("action"),
+        unreviewed_only=params.get("unreviewed") == "1",
+        limit=_int(params.get("limit"), "limit", default=100, minimum=1, maximum=500),
+    )
+    return _ok(request, {"events": [
+        # **매칭된 값은 애초에 저장하지 않는다.** 오프셋과 횟수만 나간다.
+        {
+            "id": row["id"], "ts": row["ts"], "rule_id": row["rule_id"],
+            "stage": row["stage"], "action": row["action"], "boundary": row["boundary"],
+            "match_count": row["match_count"], "job_id": row["job_id"],
+            "service_id": row["service_id"], "reviewed": bool(row["reviewed"]),
+            "verdict": row["verdict"],
+        }
+        for row in rows
+    ]})
+
+
+async def tenant_guard_review(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    body = await _body(request)
+    verdict = str(_need(body, "verdict"))
+    if verdict not in ("true_positive", "false_positive"):
+        raise ApiError("invalid_field", status=400, params={"field": "verdict"})
+    event_id = _int(request.path_params["event_id"], "event_id", minimum=1)
+    if not ctx.evaluator.review(scope, event_id, verdict):
+        raise ApiError("not_found", status=404)
+    return _ok(request, {"reviewed": True})
+
+
+async def tenant_guard_promote(request: Request) -> Response:
+    """`audit` → `block` 승격 가능 여부.
+
+    판정만 하고 적용은 하지 않는다 — 실제 적용은 규칙 저장(PUT)이고, 그쪽이 이
+    게이트를 다시 검사한다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    verdict = ctx.evaluator.can_promote(
+        scope,
+        request.path_params["rule_id"],
+        request.query_params.get("to", "block"),
+    )
+    return _ok(request, {
+        "allowed": verdict.allowed, "reason": verdict.reason,
+        "false_positive_rate": verdict.rate, "reviewed": verdict.reviewed,
+        "limit": verdict.limit,
+    })
+
+
+async def tenant_settings(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    tenant = request.state.tenant
+
+    if request.method == "GET":
+        return _ok(request, {
+            "id": tenant["id"], "name": tenant["name"], "locale": tenant["locale"],
+            "status": tenant["status"],
+            "budget_usd_per_month": tenant["budget_usd_per_month"],
+            "rate_limit_per_min": tenant["rate_limit_per_min"],
+            # 요청값과 실제 적용값을 함께 낸다. 테넌트는 **짧게만** 정할 수 있으므로
+            # 플랫폼 상한보다 긴 값은 잘린다 — 조용히 자르면 관리자는 30일로
+            # 설정했다고 믿는 채로 7일 뒤 원문이 사라지는 것을 보게 된다.
+            "raw_prompt_retention_days": ctx.store.effective_raw_retention_days(
+                scope.tenant_id, ctx.config.guard_settings.raw_prompt_retention_days
+            ),
+            "raw_prompt_retention_days_requested": ctx.store.tenant_setting(
+                scope, ctx.store.RAW_RETENTION_KEY
+            ),
+            "raw_prompt_retention_days_platform_max": (
+                ctx.config.guard_settings.raw_prompt_retention_days
+            ),
+            # 원문 보관은 키가 있을 때만 가능하다. **평문 폴백은 없다.**
+            "raw_prompt_storage": ctx.vault.enabled,
+            "guard_locale_pack": guard_pack_for(tenant["locale"]),
+            "available_locales": list(ctx.translator.available),
+        })
+
+    body = await _body(request)
+    if "locale" in body:
+        if body["locale"] not in ctx.translator.available:
+            raise ApiError("invalid_field", status=400, params={"field": "locale"})
+        ctx.store.set_tenant_locale(scope, str(body["locale"]))
+    if "raw_prompt_retention_days" in body:
+        # 여기서는 **자르지 않고 거절한다.** 음수 보관 기간은 오타이지 의도가
+        # 아니고, 조용히 0 으로 자르면 관리자는 설정했다고 믿는 채로 원문이
+        # 즉시 사라지는 것을 보게 된다.
+        days = _int(body["raw_prompt_retention_days"], "raw_prompt_retention_days")
+        if days < 0:
+            raise ApiError("invalid_field", status=400, params={"field": "raw_prompt_retention_days"})
+        ctx.store.set_tenant_setting(scope, ctx.store.RAW_RETENTION_KEY, days)
+    ctx.store.audit(
+        principal.token_id, "update_tenant_settings", tenant_id=scope.tenant_id,
+        detail={k: body[k] for k in ("locale", "raw_prompt_retention_days") if k in body},
+    )
+    return _ok(request, {"updated": True})
+
+
+async def tenant_overrides(request: Request) -> Response:
+    """역할 오버라이드.
+
+    오버라이드 수 > 0 이면 **실행 중 설정이 배포본과 다르다는 뜻**이므로 그대로 노출한다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    if request.method == "GET":
+        return _ok(request, {"overrides": ctx.store.get_role_overrides(scope)})
+
+    body = await _body(request)
+    role = str(_need(body, "role"))
+    if role not in ctx.config.roles or not is_public_role(role):
+        raise ApiError("unknown_role", status=404, params={"role": role})
+
+    if request.method == "DELETE":
+        ctx.store.clear_role_override(scope, role)
+        ctx.store.audit(
+            principal.token_id, "clear_role_override", tenant_id=scope.tenant_id, target=role
+        )
+        return _ok(request, {"cleared": True})
+
+    fields = dict(_need(body, "fields"))
+    errors = validate_role_fields(fields)
+    if errors:
+        # `kind` 와 `system` 은 여기서 걸린다 — 전자는 동기 경로로 새어나가고,
+        # 후자는 "프롬프트는 호출자 소유" 계약과 충돌한다.
+        raise ApiError("invalid_field", status=400, params={"field": ", ".join(sorted(errors))})
+    ctx.store.set_role_override(
+        scope, role, fields, note=body.get("note"), updated_by=principal.token_id
+    )
+    ctx.store.audit(
+        principal.token_id, "set_role_override", tenant_id=scope.tenant_id,
+        target=role, detail={"fields": sorted(fields)},
+    )
+    return _ok(request, {"role": role, "fields": fields}, status=201)
+
+
+async def tenant_jobs(request: Request) -> Response:
+    """작업 목록. **마스킹본만 나간다.** 원문은 단건 API + 감사다."""
+    ctx, principal, scope = _tenant_admin(request)
+    params = request.query_params
+    rows = ctx.store.list_jobs(
+        scope, status=params.get("status"),
+        end_user_hash=params.get("end_user_hash"),
+        limit=_int(params.get("limit"), "limit", default=50, minimum=1, maximum=200),
+    )
+    return _ok(request, {"jobs": [
+        {
+            "id": j.id, "service_id": j.service_id, "end_user_hash": j.end_user_hash,
+            "role": j.role, "kind": j.kind, "lane": j.lane, "status": j.status, "node": j.node,
+            "model": j.model, "tier": j.tier, "attempts": j.attempts,
+            # **"왜 이 모델로 갔는가" 에 답한다.** 관리자 표면에만 나간다 —
+            # 소비자 계약(`/v1/generate`·`/v1/meta`)은 라우팅을 모른다(I5).
+            "route": j.route,
+            "prompt_masked": j.prompt_masked, "response": j.response,
+            "prompt_hash": j.prompt_hash, "system_hash": j.system_hash,
+            "has_raw": j.prompt_cipher is not None,
+            "allowed_boundaries": list(j.allowed_boundaries),
+            "wait_reason": j.wait_reason, "error_code": j.error_code,
+            "cost_usd": j.cost_usd, "input_tokens": j.input_tokens,
+            "output_tokens": j.output_tokens,
+            "created_at": j.created_at, "finished_at": j.finished_at,
+        }
+        for j in rows
+    ]})
+
+
+async def tenant_job_review(request: Request) -> Response:
+    """`needs_review` 잡을 사람이 종결시킨다.
+
+    크래시 복구는 과금 노드에서 돌던 잡을 자동 재큐하지 않고 `needs_review` 로
+    남긴다 — 이중 실행을 **막지는 못하고 드러내기만** 하기 때문이다(B7).
+    그런데 드러내 놓고 **치울 방법을 안 주면** 그 잡들은 영원히 쌓이고, 관제
+    화면의 그 숫자는 아무도 안 보는 숫자가 된다.
+
+    판정은 사람이 한다. 이중 청구가 실제로 났는지는 프로바이더 청구서를 봐야
+    알 수 있고, 그건 이 시스템이 모르는 정보다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    job_id = request.path_params["job_id"]
+    body = await _body(request)
+    verdict = str(body.get("verdict") or "").strip()
+    if verdict not in ("ok", "failed"):
+        raise ApiError("invalid_field", status=400, params={"field": "verdict"})
+
+    if not ctx.store.update_job(
+        scope, job_id, expect_status="needs_review",
+        status=verdict, error_code=None if verdict == "ok" else "double_execution_confirmed",
+        finished_at=ctx.now(),
+    ):
+        job = ctx.store.get_job(scope, job_id)
+        if job is None:
+            raise ApiError("job_not_found", status=404)
+        # 검토 대상이 아닌 잡을 종결시키려 한 것이다.
+        raise ApiError("invalid_field", status=409, params={"field": "status"})
+
+    ctx.store.audit(
+        principal.token_id, "resolve_needs_review", tenant_id=scope.tenant_id,
+        target=job_id, detail={"verdict": verdict},
+    )
+    return _ok(request, {"job_id": job_id, "status": verdict})
+
+
+async def tenant_job_raw(request: Request) -> Response:
+    """원문 단건 복호화 — 프롬프트와 **응답**.
+
+    **열람 자체가 감사에 남는다.** 원문을 볼 수 있는 경로가 있다는 것과 아무도 모르게
+    볼 수 있다는 것은 전혀 다른 이야기다.
+
+    둘을 한 엔드포인트에 둔 이유: 권한과 감사 사건이 같고, 프롬프트만 보고 응답을
+    못 보면 디버깅이 성립하지 않는다. 대신 **무엇을 열었는지 감사에 적는다** —
+    "원문을 봤다" 만 남으면 어느 필드였는지 나중에 아무도 모른다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    job_id = request.path_params["job_id"]
+    job = ctx.store.get_job(scope, job_id)
+    if job is None:
+        raise ApiError("job_not_found", status=404)
+
+    tenant = request.state.tenant
+    opened: dict[str, str] = {}
+    destroyed = False
+
+    for field, cipher, nonce, aad in (
+        ("prompt", job.prompt_cipher, job.prompt_nonce,
+         prompt_aad(scope.tenant_id, job_id)),
+        ("response", job.response_cipher, job.response_nonce,
+         response_aad(scope.tenant_id, job_id)),
+    ):
+        if not cipher or not nonce or not ctx.vault.enabled:
+            continue
+        try:
+            opened[field] = ctx.vault.open(
+                tenant["dek_wrapped"], Sealed(nonce=nonce, ciphertext=cipher), aad=aad
+            )
+        except KeyDestroyed:
+            # DEK 가 폐기됐다 — crypto-shredding 이후에는 백업의 암호문도 못 연다.
+            destroyed = True
+        except CryptoError:
+            # 이 행의 암호문이 아니거나 손상됐다. 암호문은 `job_id` 와 **필드**에
+            # 묶여 있으므로 다른 잡의 것도, 같은 잡의 다른 필드의 것도 여기서
+            # 걸린다. 500 으로 흘리면 소비자는 서버 고장으로 읽고, 관리자는 그것이
+            # 이식 시도인지 모른다.
+            ctx.store.audit(
+                principal.token_id, "raw_prompt_undecryptable",
+                tenant_id=scope.tenant_id, target=job_id, outcome="error",
+                detail={"field": field},
+            )
+
+    if not opened:
+        # 한 필드도 못 열었다. 폐기든 부재든 소비자에게는 같은 404 다 —
+        # 어느 쪽인지 알려 주면 그것도 정보다.
+        _ = destroyed
+        raise ApiError("raw_prompt_unavailable", status=404)
+
+    ctx.store.audit(
+        principal.token_id, "read_raw_prompt", tenant_id=scope.tenant_id, target=job_id,
+        detail={
+            "role": job.role, "service_id": job.service_id,
+            # **무엇을 열었는지.** 프롬프트와 응답은 다른 사건이다.
+            "fields": sorted(opened),
+        },
+    )
+    return _ok(request, {"job_id": job_id, **opened})
+
+
+async def tenant_usage(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    params = request.query_params
+    since = _float(params.get("since"), "since", default=ctx.now() - 30 * 86400, minimum=0.0)
+    axis = params.get("by", "service_id")
+    if axis not in ctx.store.USAGE_AXES:
+        raise ApiError("invalid_field", status=400, params={"field": "by"})
+
+    budget = ctx.accountant.budget_status(
+        scope, limit=request.state.tenant["budget_usd_per_month"]
+    )
+    return _ok(request, {
+        "since": since,
+        "by": axis,
+        "rows": ctx.store.usage_summary(scope, since=since, group_by=axis),
+        "spend_usd": ctx.store.spend_since(scope, since),
+        # **토큰 처리율은 계기지 한도가 아니다.** 무료 경로는 달러가 0 이라
+        # 200KB 프롬프트 1건과 1KB 1건이 같은 1건이고, 그 차이가 예산에도
+        # 레이트리밋에도 안 잡힌다. 상한을 걸기 전에 분포부터 본다.
+        "token_rate": ctx.store.token_rate(scope),
+        "budget": {
+            "limit": budget.limit, "spent": budget.spent, "reserved": budget.reserved,
+            "committed": budget.committed,
+            # 한도가 없으면 `remaining` 은 무한대다. JSON 에 `Infinity` 를 실으면
+            # 엄격한 파서가 응답 자체를 거부하므로 `null` 로 내보낸다.
+            "remaining": None if budget.limit is None else budget.remaining,
+            "burn_rate": budget.burn_rate,
+            # 임계는 `thresholds.yaml` 한 곳에서 읽는다 — 문서와 코드가 갈리지 않게.
+            "warn_at": ctx.config.thresholds.cost_budget_burn_warn,
+        },
+    })
+
+
+async def tenant_audit(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    rows = ctx.store.list_audit(
+        scope,
+        limit=_int(request.query_params.get("limit"), "limit", default=100, minimum=1, maximum=500),
+    )
+    return _ok(request, {"audit": [dict(row) for row in rows]})
+
+
+async def tenant_export(request: Request) -> Response:
+    """내보내기 — **마스킹본 기준.** 암호문은 나가지 않는다."""
+    ctx, principal, scope = _tenant_admin(request)
+    payload = ctx.store.export_tenant(scope)
+    ctx.store.audit(
+        principal.token_id, "export_tenant", tenant_id=scope.tenant_id,
+        detail={k: len(v) if isinstance(v, list) else 1 for k, v in payload.items()},
+    )
+    return _ok(request, payload)
+
+
+async def tenant_purge_end_user(request: Request) -> Response:
+    """엔드유저 파기.
+
+    되돌릴 수 없으므로 확인값을 요구한다. **감사에는 언제·누가·무엇을만 남기고
+    지워진 내용은 남기지 않는다** — 감사가 새 유출 경로가 되면 안 된다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    end_user_hash = request.path_params["end_user_hash"]
+    _confirm(request, await _body(request), end_user_hash)
+
+    # 감사는 스토어가 남긴다 — 두 곳에서 남기면 같은 사건이 두 줄이 되고,
+    # 파기 건수를 세는 규정 대응에서 그 중복이 곧 오답이 된다.
+    counts = ctx.store.purge_end_user(scope, end_user_hash, actor=principal.token_id)
+    return _ok(request, {"purged": counts})
+
+
+# ── 플랫폼 관리 ──────────────────────────────────────────────────────────────
+
+
+def _platform_admin(request: Request) -> tuple[AppContext, Principal]:
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    require_platform_admin(principal)
+    return ctx, principal
+
+
+async def platform_tenants(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    scope = PlatformScope(principal.token_id, request.query_params.get("reason", "platform console"))
+
+    if request.method == "GET":
+        return _ok(request, {"tenants": [
+            {
+                "id": row["id"], "name": row["name"], "locale": row["locale"],
+                "status": row["status"],
+                "budget_usd_per_month": row["budget_usd_per_month"],
+                "rate_limit_per_min": row["rate_limit_per_min"],
+                "has_dek": row["dek_wrapped"] is not None,
+                "created_at": row["created_at"],
+            }
+            for row in ctx.store.list_tenants(scope)
+        ]})
+
+    body = await _body(request)
+    tenant_id = str(_need(body, "id"))
+    locale = str(body.get("locale") or ctx.translator.default)
+    if locale not in ctx.translator.available:
+        raise ApiError("invalid_field", status=400, params={"field": "locale"})
+
+    if ctx.store.get_tenant(tenant_id) is not None:
+        raise ApiError("already_exists", status=409, params={"id": tenant_id})
+    try:
+        ctx.store.create_tenant(
+            tenant_id, str(body.get("name") or tenant_id), locale=locale,
+            end_user_salt=new_salt(), dek_wrapped=ctx.vault.create_dek(),
+            budget_usd_per_month=body.get("budget_usd_per_month"),
+            rate_limit_per_min=body.get("rate_limit_per_min"),
+        )
+    except AlreadyExists:
+        # 사전 조회를 함께 통과한 두 요청 중 늦은 쪽이다(QA M18).
+        raise ApiError("already_exists", status=409, params={"id": tenant_id})
+    ctx.store.audit(
+        principal.token_id, "create_tenant", tenant_id=tenant_id,
+        detail={"locale": locale, "guard_locale_pack": guard_pack_for(locale)},
+    )
+    return _ok(request, {
+        "id": tenant_id,
+        "locale": locale,
+        # 팩을 안 켜면 그 나라 PII 는 안 잡힌다. 만들 때부터 무엇이 켜졌는지 알려준다.
+        "guard_locale_pack": guard_pack_for(locale),
+        "raw_prompt_storage": ctx.vault.enabled,
+    }, status=201)
+
+
+async def platform_tenant_purge(request: Request) -> Response:
+    """테넌트 파기 + DEK 폐기.
+
+    **DEK 폐기가 가장 강한 삭제다** — 백업에 암호문이 남아 있어도 복호화가 불가능하다
+    (crypto-shredding). 7일 뒤 암호문을 지워도 30일 전 백업을 복원하면 되살아나는
+    문제를 구조적으로 푸는 유일한 수단이다.
+    """
+    ctx, principal = _platform_admin(request)
+    tenant_id = request.path_params["tenant_id"]
+
+    # **예약 테넌트는 파기할 수 없다.**
+    #
+    # 플랫폼 콘솔의 토큰과 플랫폼 설정(`guard_grace_mode` 포함)이 이 테넌트에
+    # 매달려 있다. 확인값만 맞으면 그것을 지울 수 있었고, 지우고 나면 되돌릴
+    # 관리 접근 자체가 사라진다 — 확인 절차가 있어도 **되돌릴 수 없는 자기 잠금**은
+    # 사람이 실수할 수 있는 자리에 두면 안 된다.
+    if tenant_id == ctx.store.PLATFORM_SETTINGS_TENANT:
+        raise ApiError("invalid_field", status=400, params={"field": "tenant_id"})
+
+    body = await _body(request)
+    _confirm(request, body, tenant_id)
+
+    reason = str(
+        body.get("reason") or request.query_params.get("reason") or "tenant purge requested"
+    )
+    scope = PlatformScope(principal.token_id, reason)
+    counts = ctx.store.purge_tenant(scope, tenant_id)
+    return _ok(request, {"purged": counts, "dek_destroyed": True})
+
+
+async def platform_nodes(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        return _ok(request, {"nodes": ctx.cluster.snapshot(), "airgap": ctx.airgap})
+
+    body = await _body(request)
+    state, reachable = await ctx.cluster.register_node(
+        body, actor=principal.token_id, airgap=ctx.airgap
+    )
+    # 등록 즉시 프로브한다 — 설치 후에 조용히 안 붙는 것이 제품에서 가장 나쁜 경험이다.
+    # `reachable` 과 `status` 는 다른 질문에 답한다. 갓 등록한 노드는 잘 붙어도
+    # `unknown` 이다(헬스는 연속 2회 성공을 요구한다). 등록 화면이 봐야 할 것은 앞쪽이다.
+    return _ok(request, {
+        "name": state.name,
+        "reachable": reachable,
+        "status": state.status,
+        "data_boundary": state.node.data_boundary,
+        "models": sorted(state.models),
+        "error": state.last_error,
+    }, status=201)
+
+
+async def platform_node_drain(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    node = request.path_params["node"]
+    body = await _body(request)
+    if body.get("undrain"):
+        ctx.cluster.undrain(node)
+        action = "undrain"
+    else:
+        # 즉시 차단이 아니다 — 신규만 막고 실행 중인 잡은 끝낸다.
+        ctx.cluster.drain(node, force=bool(body.get("force")))
+        action = "drain"
+    ctx.store.audit(principal.token_id, f"{action}_node", target=node)
+    return _ok(request, {"node": node, "action": action})
+
+
+async def platform_node_delete(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    node = request.path_params["node"]
+    # 실행 중인 잡이 있으면 클러스터가 409 로 거절한다 — 먼저 드레이닝한다.
+    ctx.cluster.remove_node(node, actor=principal.token_id)
+    ctx.store.audit(principal.token_id, "delete_node", target=node)
+    return _ok(request, {"node": node, "deleted": True})
+
+
+async def platform_models(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        # **탐지가 먼저다.** `detect_missing()` 은 없는 모델에 대해 설치 요청을
+        # 만드는데, 아래 집계를 먼저 읽으면 그 요청들이 이번 응답에 안 잡힌다 —
+        # 첫 조회는 "승인 대기 0", 새로고침하면 "승인 대기 1" 이 된다. 화면을
+        # 한 번 더 눌러야 진실이 나오는 관제 화면은 관제가 아니다.
+        missing = ctx.registrar.detect_missing()
+        return _ok(request, {
+            # 재고(설치된 것)와 요청(설치하려는 것)은 **다른 것이다.** 한 표에
+            # 섞으면 요청의 상태·진행률 칸이 비고 승인 버튼에 도달할 수 없다.
+            "inventory": ctx.registrar.snapshot(),
+            "install_requests": ctx.registrar.open_requests(),
+            "pending": ctx.registrar.pending_count(),
+            "missing": [{"node": r.node, "model": r.model} for r in missing],
+        })
+
+    body = await _body(request)
+    req = ctx.registrar.request_install(
+        node=str(_need(body, "node")), model=str(_need(body, "model")),
+        requested_by=principal.token_id,
+    )
+    return _ok(request, {"id": req.id, "status": req.status}, status=201)
+
+
+async def platform_model_approve(request: Request) -> Response:
+    """설치 승인·거부.
+
+    **플랫폼 관리자 권한인 이유**: 승인은 그 노드 디스크에 수 GB 를 내려받는 상태
+    변경이고, 노드는 테넌트 공유 자원이다.
+    """
+    ctx, principal = _platform_admin(request)
+    request_id = request.path_params["request_id"]
+    body = await _body(request)
+
+    if body.get("reject"):
+        req = ctx.registrar.reject(
+            request_id, actor=principal.token_id, reason=str(body.get("reason") or "")
+        )
+    else:
+        req = ctx.registrar.approve(request_id, actor=principal.token_id)
+    return _ok(request, {"id": req.id, "status": req.status, "progress": req.progress})
+
+
+async def platform_model_retarget(request: Request) -> Response:
+    """대기 중인 설치 요청의 노드를 바꾼다. 승인은 따로, 사람이 그대로 한다.
+
+    탐지가 제안한 노드를 관리자가 다른 디스크로 옮기는 경로다. 옮길 수 있는
+    노드는 서버가 `eligible_nodes` 로 함께 내려 주므로, 화면은 그 목록만 그린다.
+    """
+    ctx, principal = _platform_admin(request)
+    request_id = request.path_params["request_id"]
+    body = await _body(request)
+    req = ctx.registrar.retarget(
+        request_id, str(_need(body, "node")), actor=principal.token_id
+    )
+    return _ok(request, {"id": req.id, "node": req.node, "status": req.status})
+
+
+async def platform_model_delete(request: Request) -> Response:
+    """모델 삭제. **`force` 는 없다** — 다섯 차단 사유 중 하나라도 걸리면 거부한다."""
+    ctx, principal = _platform_admin(request)
+    node = request.path_params["node"]
+    model = request.path_params["model"]
+    blockers = ctx.registrar.deletion_blockers(node, model)
+    if blockers:
+        raise ApiError(
+            "model_in_use", status=409,
+            params={"model": model, "reason": ", ".join(blockers)},
+        )
+    await ctx.registrar.delete(node, model, actor=principal.token_id)
+    return _ok(request, {"deleted": True, "node": node, "model": model})
+
+
+async def platform_catalog(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    entries = ctx.registrar.catalog_search(request.query_params.get("q", ""))
+    return _ok(request, {"catalog": [
+        {
+            "name": e.name, "provider": e.provider, "est_size_gb": e.est_size_gb,
+            "purpose": e.purpose, "note": e.note,
+        }
+        for e in entries
+    ]})
+
+
+async def platform_overview(request: Request) -> Response:
+    """전역 관제. **테넌트를 가로지르므로 그 사실이 감사에 남는다.**"""
+    ctx, principal = _platform_admin(request)
+    reason = request.query_params.get("reason", "platform console")
+    scope = PlatformScope(principal.token_id, reason)
+    since = _float(
+        request.query_params.get("since"), "since",
+        default=ctx.now() - 30 * 86400, minimum=0.0,
+    )
+
+    lanes = ctx.scheduler.snapshot() if ctx.scheduler else {}
+    return _ok(request, {
+        "version": ctx.version,
+        "schema_version": ctx.store.schema_version,
+        "airgap": ctx.airgap,
+        "raw_prompt_storage": ctx.vault.enabled,
+        "tenants": [
+            {"id": row["id"], "name": row["name"], "status": row["status"]}
+            for row in ctx.store.list_tenants(scope)
+        ],
+        "usage_by_tenant": [dict(row) for row in ctx.store.usage_across_tenants(scope, since=since)],
+        "nodes": ctx.cluster.snapshot(),
+        "lanes": lanes,
+        # 1급 카드 둘 — 자동 복제를 안 하므로 사람이 판단할 재료를 준다.
+        "single_homed_roles": ctx.cluster.single_homed_roles(),
+        "waiting_by_reason": ctx.store.queued_wait_reasons(),
+        "model_requests_pending": ctx.registrar.pending_count(),
+        "thresholds": ctx.config.thresholds.__dict__,
+    })
+
+
+async def platform_grace_mode(request: Request) -> Response:
+    """가드 유예 모드 해제·재설정.
+
+    도입 첫날 프로덕션을 세우지 않으려고 켜 둔 것이므로, **끄는 것이 정상 상태다.**
+    끄는 순간부터 베이스라인의 `block` 이 실제로 차단한다.
+    """
+    ctx, principal = _platform_admin(request)
+    body = await _body(request)
+    enabled = bool(body.get("enabled", False))
+
+    ctx.guard.set_grace_mode(enabled)
+    ctx.store.set_platform_setting(GRACE_KEY, enabled)
+    ctx.store.audit(
+        principal.token_id, "set_guard_grace_mode", detail={"enabled": enabled}
+    )
+    return _ok(request, {"grace_mode": enabled})
+
+
+async def platform_guard_baseline(request: Request) -> Response:
+    """베이스라인 규칙과 **켜진 로케일 팩**.
+
+    안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다. 그래서
+    어떤 팩이 어느 테넌트에서 켜져 있는지를 상시 노출한다.
+    """
+    ctx, principal = _platform_admin(request)
+    scope = PlatformScope(principal.token_id, "guard baseline review")
+    packs: dict[str, list[str]] = {}
+    for row in ctx.store.list_tenants(scope):
+        pack = guard_pack_for(row["locale"]) or "(없음)"
+        packs.setdefault(pack, []).append(row["id"])
+
+    all_packs = sorted({r.locale_pack for r in ctx.config.guard_rules})
+    return _ok(request, {
+        "baseline": [
+            {
+                "id": r.id, "kind": r.kind, "label": r.label, "locale_pack": r.locale_pack,
+                "checksum": r.checksum,
+                "action": {b: r.action_for_boundary(b) for b in (INTERNAL, EXTERNAL)},
+            }
+            for r in ctx.config.guard_rules
+        ],
+        "locale_packs": all_packs,
+        "packs_in_use": packs,
+        "packs_unused": [p for p in all_packs if p != "common" and p not in packs],
+        "settings": ctx.config.guard_settings.__dict__,
+        "grace_mode": ctx.guard.grace_mode,
+    })
+
+
+async def platform_evals(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        return _ok(request, {
+            "runs": [dict(row) for row in ctx.store.list_eval_runs(limit=50)],
+        })
+    results = ctx.evaluator.evaluate_rules(record=True)
+    return _ok(request, {"results": [r.as_metrics() for r in results]})
+
+
+#: 캐시 키에 들어가는 화면 자산. index.html 은 매번 재검증하므로 여기 없다.
+_ASSETS = ("app.js", "style.css", "client/client.js", "client/client.css")
+
+
+def asset_version(static_dir: Path, version: str) -> str:
+    """화면 자산의 캐시 키 — `0.2.0-1a2b3c4d`.
+
+    버전만 쓰면 **같은 버전을 다시 올렸을 때** 브라우저가 옛 `app.js` 를 새 API 에 대고
+    돌린다 — 0.1.0 을 하루에 세 번 재배포하면서 실제로 의심하게 됐다. 내용 해시를 붙이면
+    자산이 바뀔 때만 키가 바뀌고, 안 바뀌면 캐시가 그대로 맞다.
+    """
+    digest = hashlib.sha256()
+    for name in _ASSETS:
+        path = static_dir / name
+        digest.update(name.encode("utf-8"))
+        digest.update(path.read_bytes() if path.is_file() else b"")
+    return f"{version}-{digest.hexdigest()[:8]}"
+
+
+class VersionedStaticFiles(StaticFiles):
+    """캐시 키(`?v=`)가 붙은 자산은 오래 캐시하고, 안 붙은 요청은 매번 재검증하게 한다.
+
+    키가 내용 해시를 품으므로 "붙은 것은 불변" 이 성립한다. 붙지 않은 요청(누군가 손으로
+    친 `/ui/app.js`)까지 오래 캐시하면 업그레이드 뒤 그 탭만 옛 화면을 본다.
+    """
+
+    def file_response(self, full_path, stat_result, scope, status_code: int = 200) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        versioned = b"v=" in scope.get("query_string", b"")
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if versioned else "no-cache"
+        )
+        return response
+
+
+def _serve_index(request: Request, directory: Path) -> Response:
+    """정적 화면의 첫 페이지. 관제 UI 와 클라이언트 페이지가 같은 규칙으로 뜬다.
+
+    인증은 없다 — 페이지 자체가 로그인 폼이다. 슬래시 없이 오면 308 로 붙여 준다: 자산 참조가
+    상대 경로라 `/ui` 로 서빙되면 `/style.css` 를 찾는다(프록시 접두사 아래서도 뜨게 하려고
+    상대 경로를 택했고, 그 대가가 이 리다이렉트다). `__VERSION__` 은 자산 캐시 키로 바뀌고
+    인덱스 자체는 매번 재검증이다 — 업그레이드 뒤 강제 새로고침이 필요 없다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    if not request.url.path.endswith("/"):
+        query = f"?{request.url.query}" if request.url.query else ""
+        return RedirectResponse(url=f"{request.url.path}/{query}", status_code=308)
+    path = directory / "index.html"
+    if not path.is_file():
+        raise ApiError("not_found", status=404)
+    key = ctx.asset_version or asset_version(ctx.static_dir, ctx.version)
+    html = path.read_text(encoding="utf-8").replace("__VERSION__", key)
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+
+async def ui_index(request: Request) -> Response:
+    """관제 UI 첫 화면."""
+    ctx: AppContext = request.app.state.ctx
+    return _serve_index(request, ctx.static_dir)
+
+
+async def client_page(request: Request) -> Response:
+    """클라이언트 페이지 첫 화면 — 사람이 LLM 을 쓰는 면. 관제 UI 와 같은 서빙 규칙이다."""
+    ctx: AppContext = request.app.state.ctx
+    return _serve_index(request, ctx.static_dir / "client")
+
+
+async def metrics(request: Request) -> Response:
+    """Prometheus/OpenMetrics.
+
+    설치처는 이미 자기 모니터링을 갖고 있다. 대시보드를 하나 더 주는 것보다
+    **그들이 쓰는 것에 물리는 쪽**이 낫다.
+
+    **테넌트 이름은 라벨에 없다.** 메트릭은 설치처 전체가 보는 대시보드로
+    흘러가고, 거기에 테넌트별 소비량이 뜨면 그것도 정보 유출이다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    scrape_token = os.environ.get(ENV_METRICS_TOKEN)
+    presented = bearer_from_header(request.headers.get("authorization"))
+    if not (scrape_token and presented and hmac.compare_digest(scrape_token, presented)):
+        # 전용 토큰이 없거나 안 맞으면 예전대로 플랫폼 관리자를 요구한다.
+        _platform_admin(request)
+
+    body = render_metrics(collect(
+        store=ctx.store, cluster=ctx.cluster, scheduler=ctx.scheduler,
+        registrar=ctx.registrar, notifier=ctx.notifier, vault=ctx.vault,
+        version=ctx.version, airgap=ctx.airgap, thresholds=ctx.config.thresholds,
+        roles=ctx.config.roles,
+    ))
+    return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+async def platform_plugins(request: Request) -> Response:
+    """플러그인 목록과 설치.
+
+    **업로드가 raw body 인 이유**는 의존성이다. 멀티파트를 받으려면
+    `python-multipart` 가 필요하고 그건 6번째 의존성이다 — 이 제품이 5개를 지키는
+    것은 설치처의 보안 검토 표면을 좁게 유지하기 위해서다.
+    """
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        return _ok(request, {
+            "plugins": plugin_mod.snapshot(ctx.store, data_dir=ctx.data_dir),
+            "trust_dir": str(ctx.plugin_trust_dir),
+            "trusted_keys": len(plugin_mod.load_trusted_keys(ctx.plugin_trust_dir)),
+        })
+
+    bundle = await request.body()
+    try:
+        result = plugin_mod.install(
+            ctx.store, bundle, actor=principal.token_id, data_dir=ctx.data_dir,
+            trust_dir=ctx.plugin_trust_dir, tenant_id=ctx.plugin_tenant,
+            host_version=ctx.version, now=ctx.now,
+            # 이벤트 구독의 역할 필터를 실제 역할 목록에 대고 본다 — 오타는 설치에서 거른다.
+            known_roles=ctx.config.roles,
+        )
+    except plugin_mod.PluginError as exc:
+        # 거부 사유는 사람이 읽고 고칠 수 있어야 한다 — 코드만 던지면 못 고친다.
+        raise ApiError("plugin_rejected", status=400, params={"reason": str(exc)}) from exc
+
+    # 설치는 켜는 것이 아니다. 토큰 원값은 **이 응답이 마지막이다.**
+    return _ok(request, {
+        "id": result.plugin_id,
+        "version": result.version,
+        "service_id": result.service_id,
+        "signature": result.signature_state,
+        "upgraded": result.upgraded,
+        "active": False,
+        "token": result.token,
+    }, status=201)
+
+
+async def platform_plugin_activate(request: Request) -> Response:
+    """플러그인을 켜고 끈다.
+
+    **실체는 그 플러그인이 쓰는 `services.status` 다.** 별도 플래그를 두지 않으므로
+    여기서 상태가 갈릴 수 없고, 강제는 `pipeline` 의 제출 경로 한 곳에서만 일어난다.
+    """
+    ctx, principal = _platform_admin(request)
+    plugin_id = request.path_params["plugin_id"]
+    body = await _body(request)
+    active = bool(body.get("active", True))
+    if not plugin_mod.set_active(ctx.store, plugin_id, active, actor=principal.token_id):
+        raise ApiError("not_found", status=404)
+    return _ok(request, {"id": plugin_id, "active": active})
+
+
+async def platform_plugin_delete(request: Request) -> Response:
+    """플러그인을 지운다. **서비스 행은 남긴다** — 사용량·감사가 이름을 잃지 않게."""
+    ctx, principal = _platform_admin(request)
+    plugin_id = request.path_params["plugin_id"]
+    if not plugin_mod.uninstall(
+        ctx.store, plugin_id, actor=principal.token_id, data_dir=ctx.data_dir
+    ):
+        raise ApiError("not_found", status=404)
+    return _ok(request, {"id": plugin_id, "removed": True})
+
+
+async def platform_plugin_inspect(request: Request) -> Response:
+    """번들 사전 검사 — 설치와 **같은 함수**(`plugins.inspect_bundle`)로 검증만 한다.
+
+    별도 라우트인 이유: 설치 라우트의 `?dry_run` 플래그였다면 쿼리를 빠뜨리는 순간
+    진짜 설치가 되고, 그 응답에 한 번 실리는 토큰을 잃는다. 검사와 설치는 URL 부터
+    다른 것이 안전하다. DB 도 디스크도 건드리지 않는다.
+    """
+    ctx, _principal_unused = _platform_admin(request)
+    bundle = await request.body()
+    try:
+        inspected = plugin_mod.inspect_bundle(
+            bundle, trust_dir=ctx.plugin_trust_dir, host_version=ctx.version,
+            known_roles=ctx.config.roles,
+        )
+    except plugin_mod.PluginError as exc:
+        # 설치와 같은 코드·같은 문장 — 사전 검사가 설치와 다른 말을 하면 거짓말이다.
+        raise ApiError("plugin_rejected", status=400, params={"reason": str(exc)}) from exc
+    manifest = inspected.manifest
+    trigger_kind = "schedule" if manifest.schedule else ("event" if manifest.event else None)
+    return _ok(request, {
+        "ok": True,
+        "id": manifest.plugin_id,
+        "version": manifest.version,
+        "name": manifest.name,
+        "signature": inspected.signature_state,
+        "requires_host": manifest.requires_host,
+        "trigger": {
+            "kind": trigger_kind,
+            "schedule": manifest.schedule,
+            "timezone": manifest.schedule_tz if manifest.schedule else None,
+            "event": manifest.event,
+            "roles": list(manifest.event_roles),
+        },
+        "service": manifest.service_fields(),
+        "files": len(inspected.payload),
+        "sha256": inspected.bundle_sha256,
+        "upgraded": ctx.store.get_plugin(manifest.plugin_id) is not None,
+    })
+
+
+async def platform_plugin_rotate_token(request: Request) -> Response:
+    """플러그인 토큰 회전 — 살아 있는 토큰이 없으면 발급한다.
+
+    재설치도 제거도 토큰을 다시 주지 않으므로 이것이 **유일한 재발급 경로**다.
+    새 토큰은 이 응답이 마지막이다. `grace_seconds`(기본 0) 동안 옛 토큰이 더 산다 —
+    운영자가 플러그인 설정을 고치고 재시작하는 창이다.
+    """
+    ctx, principal = _platform_admin(request)
+    plugin_id = request.path_params["plugin_id"]
+    body = await _body(request)
+    grace = _float(body.get("grace_seconds"), "grace_seconds", minimum=0.0)
+    rotated = plugin_mod.rotate_plugin_token(
+        ctx.store, plugin_id, actor=principal.token_id, actor_role=principal.role,
+        grace_seconds=grace, now=ctx.now,
+    )
+    if rotated is None:
+        raise ApiError("not_found", status=404)
+    return _ok(request, {
+        "id": plugin_id,
+        "token_id": rotated.token_id,
+        "token": rotated.token,
+        "grace_seconds": rotated.grace_seconds,
+        "old_token_id": rotated.old_token_id,
+        "old_token_expires_at": rotated.old_token_expires_at,
+        "reissued": rotated.reissued,
+        "note": "이 값은 지금 한 번만 보입니다. 다시 볼 수 없습니다.",
+    })
+
+
+async def plugin_tick(request: Request) -> Response:
+    """플러그인이 "지금 내 차례인가" 를 묻는다. **플러그인 자신의 토큰으로.**
+
+    컨트롤 플레인이 플러그인을 부르러 나가지 않는 이유는 `plugins.claim_tick` 에
+    적어 두었다 — 요약하면 `external` 은 "우리가 안 띄운다" 는 뜻이었고, zip 이
+    들고 온 주소로 서버가 연결을 거는 것은 그 전제와 반대 방향이다.
+
+    **`active_service` 를 지나는 것이 핵심이다.** 플러그인을 끄면 이 경로도 401 이
+    된다 — 제출 경로와 **같은 함수**를 지나므로 두 곳이 갈릴 수 없다. 자기 cron 을
+    쓰는 플러그인은 관제 화면에서 꺼도 계속 때린다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    active_service(ctx.store, principal)
+
+    plugin_id = ctx.store.plugin_id_for_service(principal.scope(), principal.service_id)
+    if plugin_id is None:
+        # 플러그인이 아닌 서비스에게 "예정 없음" 이라고 답하면 거짓말이 된다.
+        raise ApiError("not_found", status=404)
+
+    tick = plugin_mod.claim_tick(ctx.store, plugin_id, now=ctx.now)
+    return _ok(request, {
+        "id": plugin_id,
+        "due": tick.due,
+        "scheduled_for": tick.scheduled_for,
+        "next_run_at": tick.next_run_at,
+    })
+
+
+async def plugin_events(request: Request) -> Response:
+    """플러그인이 "내가 못 본 종결이 있나" 를 묻는다. **플러그인 자신의 토큰으로.**
+
+    본문은 `{"ack": <직전에 받은 cursor>, "limit": <최대 건수>}` 이고 둘 다 선택이다.
+    ack 없이 다시 물으면 같은 배치를 다시 받는다(at-least-once). `limit: 0` 은 ack 만
+    하고 아무것도 받지 않는다. 판단과 근거는
+    `plugins.pull_events` 에 있다 — 여기는 신원과 인자만 다룬다.
+
+    `active_service` 를 지난다 — 끄면 이 경로도 401 이다(`plugin_tick` 과 같다).
+    플러그인 id 를 본문에서 받지 않는다 — 토큰에서 유도하므로 남의 이벤트를 가져갈
+    인자가 존재하지 않는다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    active_service(ctx.store, principal)
+
+    plugin_id = ctx.store.plugin_id_for_service(principal.scope(), principal.service_id)
+    if plugin_id is None:
+        raise ApiError("not_found", status=404)
+
+    body = await _body(request)
+    ack = body.get("ack")
+    if ack is not None and (isinstance(ack, bool) or not isinstance(ack, int) or ack < 0):
+        raise ApiError("invalid_field", status=400, params={"field": "ack"})
+    limit = body.get("limit", 50)
+    # `limit: 0` 은 "ack 만" 이다 — SDK 가 처리를 끝낸 배치를 확정할 때 한 건을 더 받지 않게.
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ApiError("invalid_field", status=400, params={"field": "limit"})
+
+    # 노드의 경계는 스케줄러가 디스패치 때 본 것과 같은 출처(클러스터)에서 읽는다 —
+    # 훅이 "모델이 본 프롬프트" 를 고르는 기준이 디스패치와 어긋나면 안 된다.
+    boundaries = {
+        name: state.node.data_boundary for name, state in ctx.cluster.nodes.items()
+    }
+    pull = plugin_mod.pull_events(
+        ctx.store, plugin_id, ack=ack, limit=limit, now=ctx.now(), boundaries=boundaries,
+    )
+    if pull is None:
+        # 구독을 선언하지 않은 플러그인에게 빈 목록을 주면 "아직 없다" 로 읽는다.
+        raise ApiError("plugin_no_event_trigger", status=409)
+    return _ok(request, {
+        "id": plugin_id,
+        "events": pull.events,
+        "cursor": pull.cursor,
+        "pending": pull.pending,
+    })
+
+
+async def platform_diagnostics(request: Request) -> Response:
+    """진단 번들.
+
+    **설치처가 이 파일을 그대로 지원 채널로 보낸다는 전제로 만든다.** 그래서
+    비밀은 길이만 남기고, 프롬프트·응답 본문과 테넌트 이름은 아예 담지 않는다.
+    """
+    import os
+
+    ctx, principal = _platform_admin(request)
+    bundle = diagnostic_bundle(
+        store=ctx.store, cluster=ctx.cluster, config=ctx.config,
+        scheduler=ctx.scheduler, registrar=ctx.registrar, notifier=ctx.notifier,
+        vault=ctx.vault, env=os.environ, version=ctx.version, airgap=ctx.airgap,
+        now=ctx.now,
+    )
+    ctx.store.audit(principal.token_id, "diagnostic_bundle")
+    return _ok(request, bundle)
+
+
+async def platform_notifications(request: Request) -> Response:
+    """알림 채널 현황과 최근 발송.
+
+    **채널이 하나도 없으면 그 사실이 보여야 한다** — 관제 센터가 알림 없이는
+    관제를 못 하는데, 안 붙은 것을 모르는 것이 가장 흔한 실패다.
+    """
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        snapshot = ctx.notifier.snapshot()
+        snapshot["configured"] = bool(snapshot["channels"])
+        return _ok(request, snapshot)
+
+    # 테스트 발송 — 채널이 실제로 닿는지는 보내 봐야 안다.
+    #
+    # **반환값을 버리면 안 된다.** 5분 중복 억제에 걸린 두 번째 테스트는 아무
+    # 데도 안 나가는데 무조건 `sent: true` 를 돌려주고 있었다. 관리자는 채널이
+    # 붙었다고 믿고 넘어가며, 그 착각이 정확히 알림이 막으려던 상황을 만든다.
+    sent = ctx.notifier.send("node_recovered", node="(테스트)")
+    ctx.store.audit(principal.token_id, "test_notification", detail={"sent": sent})
+    return _ok(request, {
+        "sent": sent,
+        # 안 나갔으면 왜 안 나갔는지를 말한다 — "false" 만 주면 채널 오류인지
+        # 중복 억제인지 구분할 수 없다.
+        "reason": None if sent else ("no_channels" if not ctx.notifier.channel_names
+                                     else "suppressed_duplicate"),
+        "channels": list(ctx.notifier.channel_names),
+    })
+
+
+# ── 계정 ────────────────────────────────────────────────────────────────────
+#
+# 계정은 토큰을 대신하지 않는다 — 토큰을 발급하는 사람용 앞문이다(`auth` 의 계정 절).
+# 그래서 여기 라우트는 신원과 인자만 다루고, 판단(잠금·타이밍·감사)은 전부 `auth` 에 있다.
+
+
+async def login(request: Request) -> Response:
+    """아이디·비밀번호 → 세션 토큰. **인증 없이 부르는 유일한 쓰기 경로다.**
+
+    응답의 토큰은 만료가 있는 관리자 토큰이고, 관제 UI 는 그것을 지금까지의 토큰과
+    똑같이 쓴다. 실패 이유는 가르지 않는다 — 가르면 계정 목록을 알아내는 방법이 된다.
+    """
+    ctx: AppContext = request.app.state.ctx
+    body = await _body(request)
+    token_id, raw, expires_at, account = account_login(
+        ctx.store, _need(body, "username"), _need(body, "password"), now=ctx.now,
+    )
+    return _ok(request, {
+        "token": raw,
+        "token_id": token_id,
+        "expires_at": expires_at,
+        "username": account["username"],
+        "role": account["role"],
+        "tenant": account["tenant_id"],
+    })
+
+
+async def logout(request: Request) -> Response:
+    """세션 토큰 폐기. 서비스 토큰은 대상이 아니다 — 그건 토큰 폐기 API 의 일이다."""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    if not account_logout(ctx.store, principal):
+        raise ApiError("account_session_required", status=403)
+    return _ok(request, {"logged_out": True})
+
+
+async def session_password(request: Request) -> Response:
+    """자기 비밀번호 변경. 지금 세션만 남기고 나머지는 끊는다."""
+    ctx: AppContext = request.app.state.ctx
+    principal = _principal(request)
+    body = await _body(request)
+    revoked = change_password(
+        ctx.store, principal, _need(body, "current_password"), _need(body, "new_password"),
+    )
+    return _ok(request, {"changed": True, "sessions_revoked": revoked})
+
+
+async def platform_accounts(request: Request) -> Response:
+    """계정 목록·생성. **해시는 목록에 없다** — 스토어가 애초에 안 내준다."""
+    ctx, principal = _platform_admin(request)
+    if request.method == "GET":
+        return _ok(request, {"accounts": [dict(row) for row in ctx.store.list_accounts()]})
+
+    body = await _body(request)
+    role = str(body.get("role") or ROLE_TENANT_ADMIN)
+    tenant_id = str(body.get("tenant_id") or (PLATFORM_TENANT if role == ROLE_PLATFORM_ADMIN else ""))
+    if not tenant_id:
+        raise ApiError("missing_field", status=400, params={"field": "tenant_id"})
+    # 세션 토큰이 걸릴 서비스. 플랫폼은 bootstrap 이 만든 console, 테넌트는 관행상 <테넌트>-app.
+    service_id = str(
+        body.get("service_id")
+        or ("console" if tenant_id == PLATFORM_TENANT else f"{tenant_id}-app")
+    )
+    name = create_account(
+        ctx.store, _need(body, "username"), _need(body, "password"),
+        role=role, tenant_id=tenant_id, service_id=service_id, actor=principal.token_id,
+    )
+    return _ok(request, {
+        "username": name, "role": role, "tenant_id": tenant_id, "service_id": service_id,
+    }, status=201)
+
+
+async def platform_account_password(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    body = await _body(request)
+    revoked = reset_password(
+        ctx.store, request.path_params["username"], _need(body, "password"),
+        actor=principal.token_id,
+    )
+    return _ok(request, {"reset": True, "sessions_revoked": revoked})
+
+
+async def platform_account_disable(request: Request) -> Response:
+    ctx, principal = _platform_admin(request)
+    body = await _body(request)
+    disabled = bool(body.get("disabled", True))
+    revoked = set_account_enabled(
+        ctx.store, request.path_params["username"], not disabled, actor=principal.token_id,
+    )
+    return _ok(request, {
+        "username": normalize_username(request.path_params["username"]),
+        "disabled": disabled,
+        "sessions_revoked": revoked,
+    })
+
+
+def _tenant_user(ctx: AppContext, scope: TenantScope, username: str) -> Any:
+    """자기 테넌트의 `user` 계정 행. 없거나 남의 것이거나 관리자 계정이면 404 — 존재를 흘리지 않는다."""
+    row = ctx.store.get_account(normalize_username(username))
+    if row is None or row["tenant_id"] != scope.tenant_id or row["role"] != ROLE_USER:
+        raise ApiError("not_found", status=404)
+    return row
+
+
+async def tenant_accounts(request: Request) -> Response:
+    """자기 테넌트의 사용자 계정 목록·생성. 역할은 `user` 로 고정이다.
+
+    테넌트 관리자가 관리자 계정을 만들 수 있으면 권한이 옆으로 번진다 — 관리자 계정은
+    플랫폼 소관(`/v1/platform/accounts`)이고 여기 목록에도 나오지 않는다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    if request.method == "GET":
+        rows = ctx.store.list_accounts(tenant_id=scope.tenant_id, role=ROLE_USER)
+        return _ok(request, {"accounts": [dict(row) for row in rows]})
+
+    body = await _body(request)
+    # 서비스는 추측하지 않는다 — 허용 역할·한도·예산이 거기 걸린다. 남의 테넌트 서비스는
+    # `create_account` 가 테넌트 스코프로 찾으므로 404 다.
+    service_id = str(_need(body, "service_id"))
+    name = create_account(
+        ctx.store, _need(body, "username"), _need(body, "password"),
+        role=ROLE_USER, tenant_id=scope.tenant_id, service_id=service_id,
+        actor=principal.token_id,
+    )
+    return _ok(request, {
+        "username": name, "role": ROLE_USER, "tenant_id": scope.tenant_id, "service_id": service_id,
+    }, status=201)
+
+
+async def tenant_account_password(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    row = _tenant_user(ctx, scope, request.path_params["username"])
+    body = await _body(request)
+    revoked = reset_password(
+        ctx.store, row["username"], _need(body, "password"), actor=principal.token_id,
+    )
+    return _ok(request, {"reset": True, "sessions_revoked": revoked})
+
+
+async def tenant_account_disable(request: Request) -> Response:
+    ctx, principal, scope = _tenant_admin(request)
+    row = _tenant_user(ctx, scope, request.path_params["username"])
+    body = await _body(request)
+    disabled = bool(body.get("disabled", True))
+    revoked = set_account_enabled(
+        ctx.store, row["username"], not disabled, actor=principal.token_id,
+    )
+    return _ok(request, {
+        "username": row["username"], "disabled": disabled, "sessions_revoked": revoked,
+    })
+
+
+# ── 라우트 ──────────────────────────────────────────────────────────────────
+
+
+def _routes(ctx: AppContext) -> list[Any]:
+    """라우트 정의.
+
+    `name=` 이 곧 `meta.ROUTE_SUMMARIES` 의 열쇠다. 새 라우트를 추가하고 요약을
+    안 달면 `test_meta.py` 가 실패한다 — **손으로 관리하는 표는 반드시 어긋나므로**
+    어긋난 것을 사람이 아니라 테스트가 발견하게 만든다.
+    """
+    v = f"/{meta_mod.API_VERSION}"
+    routes: list[Any] = [
+        Route("/healthz", healthz, name="healthz"),
+        # 계정 — 사람의 앞문. 로그인만 인증 없이 열려 있다.
+        Route(f"{v}/login", login, methods=["POST"], name="login"),
+        Route(f"{v}/logout", logout, methods=["POST"], name="logout"),
+        Route(f"{v}/session/password", session_password, methods=["POST"], name="session_password"),
+        # 계약 자기 서빙
+        Route(f"{v}/session", session, name="session"),
+        Route(f"{v}/meta", meta_endpoint, name="meta"),
+        Route(f"{v}/integration", integration, name="integration"),
+        Route(f"{v}/openapi.json", openapi_json, name="openapi_json"),
+        Route(f"{v}/openapi.yaml", openapi_yaml, name="openapi_yaml"),
+        Route(f"{v}/client", client_index, name="client_index"),
+        Route(f"{v}/client/{{name}}", client_file, name="client_file"),
+        # 소비자
+        Route(f"{v}/generate", generate, methods=["POST"], name="generate"),
+        Route(f"{v}/chat", chat, methods=["POST"], name="chat"),
+        Route(f"{v}/embed", embed, methods=["POST"], name="embed"),
+        Route(f"{v}/jobs", jobs_list, name="jobs_list"),
+        Route(f"{v}/jobs/{{job_id}}", job_get, name="job_get"),
+        Route(f"{v}/jobs/{{job_id}}", job_cancel, methods=["DELETE"], name="job_cancel"),
+        Route(f"{v}/roles", roles, name="roles"),
+        Route(f"{v}/status", status, name="status"),
+        # 테넌트 관리
+        Route(f"{v}/admin/services", tenant_services, methods=["GET", "POST"], name="tenant_services"),
+        Route(f"{v}/admin/services/{{service_id}}", tenant_service_update, methods=["PUT"],
+              name="tenant_service_update"),
+        Route(f"{v}/admin/tokens", tenant_tokens, methods=["GET", "POST"], name="tenant_tokens"),
+        Route(f"{v}/admin/tokens/{{token_id}}/rotate", tenant_token_rotate,
+              methods=["POST"], name="tenant_token_rotate"),
+        Route(f"{v}/admin/tokens/{{token_id}}", tenant_token_revoke,
+              methods=["DELETE"], name="tenant_token_revoke"),
+        Route(f"{v}/admin/guard/rules", tenant_guard_rules,
+              methods=["GET", "PUT"], name="tenant_guard_rules"),
+        Route(f"{v}/admin/guard/rules/{{rule_id}}", tenant_guard_rule_delete,
+              methods=["DELETE"], name="tenant_guard_rule_delete"),
+        Route(f"{v}/admin/guard/events", tenant_guard_events, name="tenant_guard_events"),
+        Route(f"{v}/admin/guard/events/{{event_id}}/review", tenant_guard_review,
+              methods=["POST"], name="tenant_guard_review"),
+        Route(f"{v}/admin/guard/rules/{{rule_id}}/promotion", tenant_guard_promote,
+              name="tenant_guard_promote"),
+        Route(f"{v}/admin/settings", tenant_settings, methods=["GET", "PUT"], name="tenant_settings"),
+        Route(f"{v}/admin/overrides", tenant_overrides,
+              methods=["GET", "PUT", "DELETE"], name="tenant_overrides"),
+        Route(f"{v}/admin/jobs", tenant_jobs, name="tenant_jobs"),
+        Route(f"{v}/admin/jobs/{{job_id}}/raw", tenant_job_raw, name="tenant_job_raw"),
+        Route(f"{v}/admin/jobs/{{job_id}}/review", tenant_job_review,
+              methods=["POST"], name="tenant_job_review"),
+        Route(f"{v}/admin/usage", tenant_usage, name="tenant_usage"),
+        Route(f"{v}/admin/audit", tenant_audit, name="tenant_audit"),
+        Route(f"{v}/admin/accounts", tenant_accounts, methods=["GET", "POST"], name="tenant_accounts"),
+        Route(f"{v}/admin/accounts/{{username}}/password", tenant_account_password,
+              methods=["POST"], name="tenant_account_password"),
+        Route(f"{v}/admin/accounts/{{username}}/disable", tenant_account_disable,
+              methods=["POST"], name="tenant_account_disable"),
+        Route(f"{v}/admin/export", tenant_export, name="tenant_export"),
+        Route(f"{v}/admin/end-users/{{end_user_hash}}", tenant_purge_end_user,
+              methods=["DELETE"], name="tenant_purge_end_user"),
+        # 플랫폼 관리
+        Route(f"{v}/platform/tenants", platform_tenants,
+              methods=["GET", "POST"], name="platform_tenants"),
+        Route(f"{v}/platform/tenants/{{tenant_id}}", platform_tenant_purge,
+              methods=["DELETE"], name="platform_tenant_purge"),
+        Route(f"{v}/platform/nodes", platform_nodes,
+              methods=["GET", "POST"], name="platform_nodes"),
+        Route(f"{v}/platform/nodes/{{node}}/drain", platform_node_drain,
+              methods=["POST"], name="platform_node_drain"),
+        Route(f"{v}/platform/nodes/{{node}}", platform_node_delete,
+              methods=["DELETE"], name="platform_node_delete"),
+        Route(f"{v}/platform/models", platform_models,
+              methods=["GET", "POST"], name="platform_models"),
+        Route(f"{v}/platform/models/{{request_id}}/approve", platform_model_approve,
+              methods=["POST"], name="platform_model_approve"),
+        Route(f"{v}/platform/models/{{request_id}}/retarget", platform_model_retarget,
+              methods=["POST"], name="platform_model_retarget"),
+        Route(f"{v}/platform/nodes/{{node}}/models/{{model:path}}", platform_model_delete,
+              methods=["DELETE"], name="platform_model_delete"),
+        Route(f"{v}/platform/catalog", platform_catalog, name="platform_catalog"),
+        Route(f"{v}/platform/overview", platform_overview, name="platform_overview"),
+        Route(f"{v}/platform/guard/baseline", platform_guard_baseline,
+              name="platform_guard_baseline"),
+        Route(f"{v}/platform/guard/grace-mode", platform_grace_mode,
+              methods=["POST"], name="platform_grace_mode"),
+        Route(f"{v}/platform/evals", platform_evals,
+              methods=["GET", "POST"], name="platform_evals"),
+        Route(f"{v}/platform/accounts", platform_accounts,
+              methods=["GET", "POST"], name="platform_accounts"),
+        Route(f"{v}/platform/accounts/{{username}}/password", platform_account_password,
+              methods=["POST"], name="platform_account_password"),
+        Route(f"{v}/platform/accounts/{{username}}/disable", platform_account_disable,
+              methods=["POST"], name="platform_account_disable"),
+        Route(f"{v}/platform/plugins", platform_plugins,
+              methods=["GET", "POST"], name="platform_plugins"),
+        # 고정 경로는 `{plugin_id}` 앞에 — 뒤에 두면 "inspect" 라는 플러그인을 찾는다.
+        Route(f"{v}/platform/plugins/inspect", platform_plugin_inspect,
+              methods=["POST"], name="platform_plugin_inspect"),
+        Route(f"{v}/platform/plugins/{{plugin_id}}/activate", platform_plugin_activate,
+              methods=["POST"], name="platform_plugin_activate"),
+        Route(f"{v}/platform/plugins/{{plugin_id}}/rotate-token", platform_plugin_rotate_token,
+              methods=["POST"], name="platform_plugin_rotate_token"),
+        Route(f"{v}/platform/plugins/{{plugin_id}}", platform_plugin_delete,
+              methods=["DELETE"], name="platform_plugin_delete"),
+        Route(f"{v}/plugin/tick", plugin_tick, methods=["POST"], name="plugin_tick"),
+        Route(f"{v}/plugin/events", plugin_events, methods=["POST"], name="plugin_events"),
+        Route(f"{v}/platform/diagnostics", platform_diagnostics, name="platform_diagnostics"),
+        Route(f"{v}/platform/notifications", platform_notifications,
+              methods=["GET", "POST"], name="platform_notifications"),
+        Route("/metrics", metrics, name="metrics"),
+    ]
+    if ctx.static_dir.is_dir():
+        # 관제 UI. 외부 CDN 을 쓰지 않으므로 전부 여기서 나간다.
+        #
+        # `index.html` 만 따로 낸다 — **`app.js` 참조에 버전을 박아야 하기 때문**이다.
+        # 정적으로 내보내면 업그레이드 후에도 브라우저가 캐시한 옛 JS 를 새 API 에
+        # 대고 돌리고, 그 증상은 "일부 화면만 이상하다" 로 나타나서 원인을 찾기 어렵다.
+        routes.append(Route("/ui", ui_index, name="ui_index"))
+        routes.append(Route("/ui/", ui_index, name="ui_index_slash"))
+        routes.append(Mount(
+            "/ui", VersionedStaticFiles(directory=ctx.static_dir, html=True), name="ui",
+        ))
+    # 클라이언트 페이지 — 사람이 LLM 을 쓰는 면. 관제 UI 와 같은 서빙·캐시 규칙, 다른 디렉터리.
+    client_dir = ctx.static_dir / "client"
+    if client_dir.is_dir():
+        routes.append(Route("/client", client_page, name="client_page"))
+        routes.append(Route("/client/", client_page, name="client_page_slash"))
+        routes.append(Mount(
+            "/client", VersionedStaticFiles(directory=client_dir, html=True), name="client_static",
+        ))
+    return routes

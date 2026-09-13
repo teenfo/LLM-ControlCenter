@@ -1,0 +1,247 @@
+/* 클라이언트 페이지 스타일. 외부 폰트·CDN 없음.
+ *
+ * 디자인 토큰(:root · 다크 두 블록)은 static/style.css 에서 **바이트 그대로** 복사했다 —
+ * 두 면이 같은 색을 써야 하고, test_client_page 가 두 사본이 같은지 본다. 컴포넌트는
+ * 이 화면에 필요한 것만 다시 적었다(관제 CSS 를 통째로 링크하지 않는다 — 수명이 다르다). */
+
+:root {
+  --bg: #f3f4f6; --surface: #ffffff; --surface2: #f7f8fa; --border: #e4e7eb;
+  --text: #15181e; --muted: #6b7280;
+  --accent: oklch(52% 0.16 255); --accent-fg: #ffffff; --accent-soft: oklch(94% 0.03 255);
+  --ok: oklch(52% 0.15 155); --ok-soft: oklch(94% 0.05 155);
+  --warn: oklch(58% 0.15 70); --warn-soft: oklch(95% 0.06 80);
+  --danger: oklch(54% 0.19 25); --danger-soft: oklch(95% 0.04 25);
+  --info: oklch(52% 0.12 230); --info-soft: oklch(94% 0.03 230);
+  --rail: #111318; --rail-fg: #a3a9b5;
+  --code: #eef0f3; --shadow: 0 1px 2px rgba(16, 20, 28, .06);
+  --lane-batch: oklch(70% 0.1 200);
+  --sans: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1014; --surface: #161920; --surface2: #1b1f27; --border: #262b34;
+    --text: #e6e8ed; --muted: #8a919e;
+    --accent: oklch(74% 0.12 255); --accent-fg: #0e1014; --accent-soft: oklch(30% 0.06 255);
+    --ok: oklch(74% 0.14 155); --ok-soft: oklch(28% 0.06 155);
+    --warn: oklch(78% 0.14 75); --warn-soft: oklch(30% 0.06 80);
+    --danger: oklch(72% 0.16 25); --danger-soft: oklch(30% 0.07 25);
+    --info: oklch(74% 0.1 230); --info-soft: oklch(30% 0.05 230);
+    --rail: #090b0e; --rail-fg: #8a919e;
+    --code: #0f1216; --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1014; --surface: #161920; --surface2: #1b1f27; --border: #262b34;
+  --text: #e6e8ed; --muted: #8a919e;
+  --accent: oklch(74% 0.12 255); --accent-fg: #0e1014; --accent-soft: oklch(30% 0.06 255);
+  --ok: oklch(74% 0.14 155); --ok-soft: oklch(28% 0.06 155);
+  --warn: oklch(78% 0.14 75); --warn-soft: oklch(30% 0.06 80);
+  --danger: oklch(72% 0.16 25); --danger-soft: oklch(30% 0.07 25);
+  --info: oklch(74% 0.1 230); --info-soft: oklch(30% 0.05 230);
+  --rail: #090b0e; --rail-fg: #8a919e;
+  --code: #0f1216; --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 { margin: 0; font-weight: 600; }
+h1 { font-size: 20px; }
+h2 { font-size: 14px; }
+p { margin: 0; }
+a { color: var(--accent); text-decoration: none; }
+code, .mono { font-family: var(--mono); font-size: 12.5px; }
+.muted { color: var(--muted); }
+.hint { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
+.error { color: var(--danger); font-size: 13px; }
+
+/* `hidden` 을 어떤 규칙도 못 이기게 한다 — 관제 UI 와 같은 사고를 막는다. */
+[hidden] { display: none !important; }
+
+@keyframes fadeUp { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+/* ── 컨트롤 ─────────────────────────────────────────────────────────────── */
+input, select, textarea {
+  width: 100%; font: inherit; font-size: 14px; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+textarea { resize: vertical; line-height: 1.55; }
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+button {
+  min-height: 34px; padding: 0 12px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
+  color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap;
+}
+button:hover { border-color: var(--accent); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .55; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
+button.primary:hover { filter: brightness(1.05); }
+button.sm { min-height: 28px; padding: 0 10px; font-size: 12px; border-radius: 7px; }
+button.link { min-height: 0; padding: 4px 0; background: none; border: none; color: var(--accent); text-decoration: underline; }
+button.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+button.ghost:hover { color: var(--text); border-color: var(--border); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip { min-height: 30px; padding: 0 12px; border-radius: 999px; font-size: 12.5px; }
+.chip .n { opacity: .6; margin-left: 4px; }
+.chip.active { background: var(--text); color: var(--bg); border-color: var(--text); }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; line-height: 1.5; white-space: nowrap;
+  background: var(--surface2); color: var(--muted); border: 1px solid var(--border);
+}
+.pill.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.pill.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.pill.danger { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
+.pill.info { background: var(--info-soft); color: var(--info); border-color: transparent; }
+.pill.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+.dot.pulse { animation: pulse 1.6s infinite; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row.between { justify-content: space-between; }
+
+/* ── 접속 ────────────────────────────────────────────────────────────────── */
+#login { display: grid; place-items: center; min-height: 100vh; padding: 16px; }
+#login form {
+  width: min(420px, 100%); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; padding: 28px; box-shadow: var(--shadow); animation: fadeUp .25s ease;
+}
+#login .mark { width: 40px; height: 40px; border-radius: 12px; background: var(--accent); color: #fff; display: grid; place-items: center; margin-bottom: 14px; }
+#login h1 { font-size: 18px; }
+#login .lede { color: var(--muted); font-size: 13px; margin: 6px 0 14px; }
+#login label { margin-top: 10px; }
+#login .actions { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+#login-error { margin: 12px 0 0; }
+
+/* ── 셸: 상단바 + 탭 + 본문 ───────────────────────────────────────────────── */
+#shell { min-height: 100vh; display: flex; flex-direction: column; }
+header.top {
+  position: sticky; top: 0; z-index: 10; height: 56px; display: flex; align-items: center; gap: 10px;
+  padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+}
+header.top .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; white-space: nowrap; }
+header.top .brand .mark { width: 28px; height: 28px; border-radius: 8px; background: var(--accent); color: #fff; display: grid; place-items: center; }
+#tabs { display: flex; gap: 2px; margin-left: 12px; }
+.tab { min-height: 34px; padding: 0 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); }
+.tab:hover { color: var(--text); }
+.tab.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+header.top .identity { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#theme { width: 34px; padding: 0; font-size: 15px; }
+
+#view { width: min(860px, 100%); margin: 0 auto; padding: 20px 16px 40px; display: flex; flex-direction: column; gap: 14px; animation: fadeUp .25s ease; }
+
+/* ── 카드 ──────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow); overflow: hidden; display: flex; flex-direction: column;
+}
+.card.bad { border-color: var(--danger); }
+.card-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.card-head .aside { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.card-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.empty { padding: 22px 16px; color: var(--muted); font-size: 13px; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; font-size: 13px; }
+dt { color: var(--muted); font-size: 12px; }
+dd { margin: 0; word-break: break-all; }
+
+/* 역할 선택 */
+.role-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+.role-card {
+  min-height: 0; height: auto; padding: 12px 14px; text-align: left; flex-direction: column; align-items: flex-start; gap: 6px;
+  background: var(--surface2); border-radius: 10px; white-space: normal;
+}
+.role-card.active { border-color: var(--accent); background: var(--accent-soft); }
+.role-card .name { font-family: var(--mono); font-weight: 600; font-size: 14px; }
+.role-card .meta { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.role-card .note { font-size: 11.5px; color: var(--muted); }
+
+/* 작성 */
+.composer .counter { font-variant-numeric: tabular-nums; }
+.composer .counter.over { color: var(--danger); font-weight: 600; }
+.dropzone {
+  display: flex; align-items: center; justify-content: center; gap: 8px; padding: 12px; margin: 0;
+  border: 1px dashed var(--border); border-radius: 10px; color: var(--muted); font-size: 12.5px; cursor: pointer;
+}
+.dropzone.over { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.dropzone input { display: none; }
+details.advanced summary, details.meta summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+details.advanced textarea { margin-top: 8px; }
+pre.response {
+  margin: 0; padding: 12px 14px; border-radius: 8px; background: var(--code); border: 1px solid var(--border);
+  font-family: var(--sans); font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+}
+.card.pending .card-body { flex-direction: row; align-items: center; gap: 10px; font-size: 13px; }
+.guard-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.guard-chips .label { font-size: 12px; color: var(--muted); margin-right: 4px; }
+.result .message { font-size: 14px; }
+
+/* 대화 */
+.chat-log { display: flex; flex-direction: column; gap: 10px; padding: 16px; max-height: 60vh; overflow: auto; }
+.bubble { max-width: 85%; padding: 10px 14px; border-radius: 14px; font-size: 14px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.bubble.user { align-self: flex-end; background: var(--accent); color: var(--accent-fg); border-bottom-right-radius: 4px; }
+.bubble.assistant { align-self: flex-start; background: var(--surface2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+.bubble.error { align-self: flex-start; border: 1px solid var(--danger); background: var(--danger-soft); }
+.bubble.pending { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+.bubble .guard-chips { margin-top: 8px; }
+.chat .trimmed { padding: 0 16px 8px; }
+.chat-input { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); align-items: flex-end; }
+.chat-input textarea { flex: 1; }
+
+/* 기록 */
+.list { display: flex; flex-direction: column; }
+.history-row {
+  min-height: 0; height: auto; width: 100%; text-align: left; border: 0; border-radius: 0; border-bottom: 1px solid var(--border);
+  padding: 12px 16px; gap: 12px; align-items: flex-start; white-space: normal; background: transparent;
+}
+.history-row:last-child { border-bottom: 0; }
+.history-row:hover, .history-row.active { background: var(--surface2); border-color: var(--border); }
+.history-row .body { flex: 1; min-width: 0; }
+.history-row .title { font-weight: 500; font-size: 13px; }
+.history-row .detail { font-size: 12px; color: var(--muted); font-family: var(--mono); word-break: break-word; }
+.history-row .time { font-size: 12px; color: var(--muted); white-space: nowrap; }
+form.stack { display: flex; flex-direction: column; gap: 12px; }
+form.stack button { align-self: flex-start; }
+
+/* 토스트 · 오류 */
+#toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 30;
+  padding: 10px 16px; border-radius: 10px; background: var(--text); color: var(--bg);
+  font-size: 13px; font-weight: 500; box-shadow: 0 6px 20px rgba(0, 0, 0, .2); animation: fadeUp .2s ease;
+}
+#error {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 30; margin: 0;
+  padding: 10px 16px; border-radius: 10px; border: 1px solid var(--danger); background: var(--danger-soft);
+  color: var(--text); font-size: 13px; box-shadow: 0 6px 20px rgba(0, 0, 0, .2); max-width: min(720px, 90%);
+}
+
+/* ── 좁은 화면: 탭이 하단 바로 내려간다 ───────────────────────────────────── */
+@media (max-width: 720px) {
+  header.top { padding: 0 12px; gap: 6px; }
+  header.top .identity { display: none; }
+  #tabs {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; margin: 0; padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    background: var(--surface); border-top: 1px solid var(--border); justify-content: space-around;
+  }
+  .tab { flex: 1; min-height: 40px; }
+  #view { padding-bottom: 84px; }
+  .bubble { max-width: 94%; }
+  #toast, #error { bottom: 76px; }
+}
+
+/* 기록 상세의 대화 — 마스킹본 JSON 을 턴으로 보여 준다 */
+.chat-log.static { max-height: 46vh; overflow: auto; padding: 12px; }
+.bubble .who { font-size: 11px; line-height: 1.3; opacity: .72; margin-bottom: 3px; }

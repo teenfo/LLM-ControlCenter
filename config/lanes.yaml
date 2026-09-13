@@ -1,0 +1,16 @@
+# 레인 = 실행 슬롯 그룹. 레퍼런스 시스템은 동시성이 각 1로 고정이었다(§15-7).
+# 여기서는 설정값이며, 클러스터 전체에 걸린 상한이다(노드별 상한은 nodes.yaml 의 max_concurrent).
+#
+# guard 레인이 따로 있는 이유: 분류 잡이 대형 batch 잡 뒤에 줄 서면 필터 한 번에 수 분이 걸린다.
+
+interactive:
+  max_concurrent: 3
+  starvation_seconds: 300      # 이만큼 기다린 잡은 모델 친화·부하보다 우선한다
+
+batch:
+  max_concurrent: 2
+  starvation_seconds: 600
+
+guard:
+  max_concurrent: 4            # 작은 모델, 빠름. 절대 뒤에 세우지 않는다
+  starvation_seconds: 60

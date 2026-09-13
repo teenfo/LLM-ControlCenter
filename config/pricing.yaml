@@ -1,0 +1,25 @@
+# 프로바이더·모델별 100만 토큰당 단가(USD).
+#
+# 실제 가격은 바뀐다. 그래서 문서에 박지 않고 설정값으로 둔다 —
+# 손으로 관리하는 표는 반드시 어긋나고, 어긋난 단가는 예산 집행을 조용히 망가뜨린다.
+# 설치 시 각 프로바이더의 공식 가격표로 채운다.
+#
+# 로컬 노드는 단가 0 이지만 같은 코드 경로를 탄다. 분기하지 않는다.
+
+ollama:
+  "*": {input_per_mtok: 0.0, output_per_mtok: 0.0}
+
+mock:
+  "demo-cloud": {input_per_mtok: 1.0, output_per_mtok: 5.0}   # 데모용 가상 단가
+  "*": {input_per_mtok: 0.0, output_per_mtok: 0.0}
+
+anthropic:
+  # 설치 시 공식 가격표로 교체할 것. 아래는 자리표시자다.
+  "*": {input_per_mtok: 0.0, output_per_mtok: 0.0}
+
+# 예산 초과 시 그 서비스의 metered 티어만 막힌다.
+# placement 에 내부 티어가 있으면 계속 돈다 — "예산이 떨어지면 무료 경로로 자동 강등"이 의도한 동작이다.
+defaults:
+  # 예약 단계에서 상한 비용을 계산할 때 쓰는 출력 토큰 가정치.
+  # 실제 사용량으로 완료 시 정산된다.
+  assumed_max_output_tokens: 2048
