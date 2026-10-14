@@ -169,7 +169,11 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "tenant_export": ("내보내기 — 작업·사용량·감사·설정(마스킹본 기준).", "tenant_admin", False),
     "tenant_purge_end_user": ("엔드유저 파기. 그 엔드유저의 데이터만 지운다.", "tenant_admin", False),
     # 플랫폼 관리
-    "platform_tenants": ("테넌트 목록·생성.", "platform_admin", False),
+    "platform_tenants": (
+        "테넌트 목록·생성. 생성은 기본 서비스 `<id>-app` 과 테넌트 관리자 토큰을 함께 만든다 — "
+        "토큰은 **그 응답에 한 번만** 실린다(부트스트랩의 첫 테넌트와 같은 모양). 그 뒤 서비스·계정·토큰은 그 테넌트 관리자의 몫이다.",
+        "platform_admin", False,
+    ),
     "platform_tenant_purge": ("테넌트 파기 + DEK 폐기(crypto-shredding). 되돌릴 수 없다.", "platform_admin", False),
     "platform_nodes": ("노드 목록·등록. 등록 즉시 프로브한다.", "platform_admin", False),
     "platform_node_drain": ("노드 드레이닝·복귀. 즉시 차단이 아니라 신규만 막는다.", "platform_admin", False),

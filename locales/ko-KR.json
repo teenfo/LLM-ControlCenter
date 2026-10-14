@@ -275,6 +275,8 @@
   "ui.base_url": "주소 (base_url)",
   "ui.boundary": "데이터 경계",
   "ui.tenant_id": "테넌트 ID",
+  "ui.tenant_created": "테넌트 {id} 를 만들었습니다 — 테넌트 관리자 토큰",
+  "ui.tenant_token_hint": "기본 서비스 {service} 가 함께 만들어졌습니다. 이 토큰을 그 조직의 관리자에게 넘기거나, 설정 → 관리자 계정에서 tenant_admin 계정을 만들어 주세요. 그다음(서비스·사용자 계정·토큰)은 그 관리자의 몫입니다.",
   "ui.name": "이름",
   "ui.locale": "로케일",
   "ui.kind": "종류",

@@ -694,3 +694,12 @@ def test_the_plugin_panel_can_rotate_a_token():
     rotate = source[source.index("async function rotatePluginToken"):source.index("function triggerCell")]
     assert "/rotate-token'" in rotate and "grace_seconds: 3600" in rotate
     assert "openDrawer(" in rotate and "'ui.plugin_token_rotated'" in rotate and "'ui.plugin_token_once'" in rotate
+
+
+def test_the_tenant_drawer_shows_the_admin_token_once():
+    """테넌트를 만든 응답의 관리자 토큰은 그 드로어가 마지막이다 — 안 보여 주면 새 테넌트는 아무도 못 들어간다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    form = source[source.index("function createTenantForm"):source.index("async function purgeTenant")]
+    assert "created.tenant_admin_token" in form and "created.service_id" in form
+    assert "openDrawer(" in form and "'ui.tenant_created'" in form and "'ui.tenant_token_hint'" in form
+    assert "class: 'reveal'" in form, "토큰은 1회 표시 스타일로"

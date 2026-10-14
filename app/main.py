@@ -101,7 +101,7 @@ from .store import (
     TenantScope,
 )
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -1607,9 +1607,21 @@ async def platform_tenants(request: Request) -> Response:
     except AlreadyExists:
         # 사전 조회를 함께 통과한 두 요청 중 늦은 쪽이다(QA M18).
         raise ApiError("already_exists", status=409, params={"id": tenant_id})
+
+    # **첫 서비스와 관리자 토큰을 함께 만든다** — 부트스트랩이 첫 테넌트에 하는 것과 같은 모양이다.
+    # 테넌트 관리 면(`/v1/admin/*`)은 호출자 자신의 테넌트에만 작동하고 계정 생성은 서비스가 있어야
+    # 통과하므로, 이것이 없으면 콘솔에서 만든 테넌트는 **아무도 못 들어가는 테넌트**였다.
+    # 토큰 원값은 이 응답이 마지막이다(목록에는 해시·id 뿐) — 콘솔은 드로어에 한 번 보여 준다.
+    scope = TenantScope(tenant_id)
+    service_id = f"{tenant_id}-app"
+    ctx.store.create_service(scope, service_id, service_id)
+    _, admin_token = issue_token(
+        ctx.store, scope, service_id, role=ROLE_TENANT_ADMIN,
+        note="tenant onboarding", actor=principal.token_id,
+    )
     ctx.store.audit(
         principal.token_id, "create_tenant", tenant_id=tenant_id,
-        detail={"locale": locale, "guard_locale_pack": guard_pack_for(locale)},
+        detail={"locale": locale, "guard_locale_pack": guard_pack_for(locale), "service_id": service_id},
     )
     return _ok(request, {
         "id": tenant_id,
@@ -1617,6 +1629,8 @@ async def platform_tenants(request: Request) -> Response:
         # 팩을 안 켜면 그 나라 PII 는 안 잡힌다. 만들 때부터 무엇이 켜졌는지 알려준다.
         "guard_locale_pack": guard_pack_for(locale),
         "raw_prompt_storage": ctx.vault.enabled,
+        "service_id": service_id,
+        "tenant_admin_token": admin_token,
     }, status=201)
 
 

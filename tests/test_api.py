@@ -1803,3 +1803,65 @@ def test_service_list_carries_the_public_role_catalog(client, acme):
     assert "summarize" in names and "talk" in names and "vec" in names
     assert not any(n.startswith("_") for n in names)
     assert {"name": "talk", "kind": "chat"} in body["roles"]
+
+
+# ── 테넌트 온보딩 (feature-spec DATA-9) ─────────────────────────────────────
+
+
+def _create_tenant(client, acme, tenant_id="newco", **extra):
+    return client.post(
+        "/v1/platform/tenants", json={"id": tenant_id, "name": "NewCo", "locale": "ko-KR", **extra},
+        headers=auth(acme["platform_admin"]),
+    )
+
+
+def test_a_new_tenant_starts_with_a_default_service_and_a_one_time_admin_token(harness, client, acme):
+    """콘솔에서 만든 테넌트에 첫 서비스를 만들 제품 경로가 없었다 — 테넌트 관리 면은 호출자 자신의 테넌트에만
+    작동하고, 계정 생성은 서비스가 있어야 통과한다. 부트스트랩의 첫 테넌트처럼 서비스와 관리자 토큰을 함께 만든다."""
+    response = _create_tenant(client, acme)
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["service_id"] == "newco-app"
+    token = body["tenant_admin_token"]
+    assert token.startswith("lcc_")
+
+    session = client.get("/v1/session", headers=auth(token)).json()
+    assert (session["role"], session["tenant"]["id"], session["service"]["id"]) == ("tenant_admin", "newco", "newco-app")
+    services = client.get("/v1/admin/services", headers=auth(token)).json()["services"]
+    assert [s["id"] for s in services] == ["newco-app"]
+    # 테넌트 관리자다 — 플랫폼 면은 안 열린다.
+    assert client.get("/v1/platform/tenants", headers=auth(token)).status_code == 403
+    # 원값은 이 응답이 마지막이다 — 목록에는 해시·id 뿐.
+    tokens = client.get("/v1/admin/tokens", headers=auth(token)).json()["tokens"]
+    assert [row["role"] for row in tokens] == ["tenant_admin"]
+    assert token not in json.dumps(tokens)
+    rows = [row for row in harness.store.list_audit(TenantScope("newco"), limit=20) if row["action"] == "create_tenant"]
+    assert rows, "테넌트 생성이 감사에 남아야 한다"
+    detail = rows[0]["detail_json"]
+    detail = json.loads(detail) if isinstance(detail, str) else dict(detail or {})
+    assert detail.get("service_id") == "newco-app"
+
+
+def test_a_new_tenant_admin_can_onboard_users_without_the_platform(client, acme):
+    """그 뒤의 일은 그 조직의 몫이다 — 받은 토큰 하나로 서비스 토큰과 사용자 계정을 만들고, 사용자는 /client/ 로 들어간다."""
+    token = _create_tenant(client, acme).json()["tenant_admin_token"]
+
+    issued = client.post(
+        "/v1/admin/tokens", json={"service_id": "newco-app", "role": "service", "note": "앱"}, headers=auth(token),
+    )
+    assert issued.status_code in (200, 201), issued.text
+    roles = client.get("/v1/roles", headers=auth(issued.json()["token"]))
+    assert roles.status_code == 200 and roles.json()["roles"]
+
+    account = client.post(
+        "/v1/admin/accounts",
+        json={"username": "newbie", "password": "correct horse battery", "service_id": "newco-app"},
+        headers=auth(token),
+    )
+    assert account.status_code == 201, account.text
+    login = client.post("/v1/login", json={"username": "newbie", "password": "correct horse battery"})
+    assert login.status_code == 200, login.text
+    me = client.get("/v1/session", headers=auth(login.json()["token"])).json()
+    assert (me["tenant"]["id"], me["service"]["id"], me["role"]) == ("newco", "newco-app", "service")
+    jobs = client.get("/v1/jobs", headers=auth(login.json()["token"]))
+    assert jobs.status_code == 200 and jobs.json()["scope"] == "account"

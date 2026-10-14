@@ -275,6 +275,8 @@
   "ui.base_url": "Base URL",
   "ui.boundary": "Data boundary",
   "ui.tenant_id": "Tenant ID",
+  "ui.tenant_created": "Tenant {id} created — tenant admin token",
+  "ui.tenant_token_hint": "The default service {service} was created with it. Hand this token to that organisation's admin, or create a tenant_admin account under Settings → Admin accounts. Services, user accounts and tokens are theirs from here on.",
   "ui.name": "Name",
   "ui.locale": "Locale",
   "ui.kind": "Kind",

@@ -479,6 +479,26 @@ def test_creating_a_tenant_admin_account_needs_a_tenant(client, acme):
     assert error_code(response) == "missing_field"
 
 
+def test_platform_can_create_a_tenant_admin_account_for_a_new_tenant(client, acme):
+    """테넌트를 만들면 기본 서비스 `<id>-app` 이 있으므로 tenant_admin 계정이 바로 걸린다 — 전에는 서비스가 없어 404 였다."""
+    created = client.post(
+        "/v1/platform/tenants", json={"id": "newco", "name": "NewCo"}, headers=auth(acme["platform_admin"]),
+    )
+    assert created.status_code == 201 and created.json()["service_id"] == "newco-app"
+    response = client.post(
+        "/v1/platform/accounts",
+        json={"username": "newco-ops", "password": PASSWORD, "role": ROLE_TENANT_ADMIN, "tenant_id": "newco"},
+        headers=auth(acme["platform_admin"]),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["service_id"] == "newco-app"
+
+    token = login_via_api(client, "newco-ops").json()["token"]
+    services = client.get("/v1/admin/services", headers=auth(token)).json()["services"]
+    assert [s["id"] for s in services] == ["newco-app"]
+    assert client.get("/v1/platform/tenants", headers=auth(token)).status_code == 403
+
+
 def test_account_actions_leave_an_audit_trail(client, acme, harness):
     create_via_api(client, acme)
     token = login_via_api(client).json()["token"]

@@ -872,8 +872,13 @@ function createTenantForm() {
         });
         // 만들 때부터 어떤 로케일 팩이 켜졌는지 말해 준다.
         toast(t('ui.locale_packs_on') + ': ' + (created.guard_locale_pack || t('ui.none')));
-        closeDrawer();
-        refresh();
+        // 테넌트 관리자 토큰은 이 응답이 마지막이다 — 부트스트랩 배너와 같은 규칙으로 한 번만 보여 준다.
+        // 기본 서비스도 함께 만들어졌다는 것을 같은 자리에서 말한다(그래야 다음 걸음이 보인다).
+        openDrawer(t('ui.tenant_created', { id: created.id }), [
+          el('p', { class: 'hint', text: t('ui.tenant_token_hint', { service: created.service_id }) }),
+          el('pre', { class: 'reveal', text: created.tenant_admin_token }),
+          el('p', { class: 'hint', text: t('ui.token_hint') }),
+        ], [el('button', { type: 'button', class: 'right primary', text: t('ui.close'), onclick: () => { closeDrawer(); refresh(); } })]);
       } catch (err) { showError(err); }
     },
   }, [

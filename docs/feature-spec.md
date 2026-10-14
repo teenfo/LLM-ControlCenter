@@ -977,6 +977,24 @@
 
 ---
 
+
+### DATA-9  테넌트 온보딩 — 첫 서비스와 관리자 토큰은 만들 때 함께
+정의   `POST /v1/platform/tenants` 는 테넌트 행만 만들지 않는다. 기본 서비스 `<id>-app` 과 테넌트 관리자 토큰을 함께 만들고,
+       토큰은 **그 응답에 한 번만** 싣는다 — 부트스트랩이 첫 테넌트에 하는 것과 같은 모양이다.
+표면   `POST /v1/platform/tenants` (응답 `service_id` · `tenant_admin_token`) · 관제 UI 테넌트 탭 「테넌트 추가」 드로어(토큰 1회 표시) ·
+       `POST /v1/platform/accounts` (`role: tenant_admin` · `tenant_id` — 기본 서비스에 걸린다) · `python -m app account create --tenant`
+구현   app/main.py:platform_tenants · static/app.js:createTenantForm · 선례 app/bootstrap.py:bootstrap
+계약   테넌트 관리 면(`/v1/admin/*`)은 호출자 자신의 테넌트에만 작동한다 — 그래서 첫 서비스는 플랫폼이 만들어 줘야 한다
+       계정 생성은 서비스가 있어야 통과한다 — 이것이 없을 때 콘솔에서 만든 테넌트는 **아무도 못 들어가는 테넌트**였다(0.6.0 까지)
+       토큰 원값은 응답 뒤 어디에도 다시 나오지 않는다(목록은 해시·id 뿐) · 그 토큰으로 플랫폼 면은 403 이다
+       그 뒤의 일(서비스 정책·추가 서비스·사용자 계정·서비스 토큰)은 그 테넌트 관리자가 자기 토큰이나 계정으로 한다
+       감사 `create_tenant` 의 detail 에 `service_id` 가 남는다
+고정   test_api.py::test_a_new_tenant_starts_with_a_default_service_and_a_one_time_admin_token
+       test_api.py::test_a_new_tenant_admin_can_onboard_users_without_the_platform
+       test_accounts.py::test_platform_can_create_a_tenant_admin_account_for_a_new_tenant
+       test_ui.py::test_the_tenant_drawer_shows_the_admin_token_once
+상태   구현됨
+
 ## 9. 계약 자기 서빙
 
 주 모듈: `meta.py`
@@ -1637,7 +1655,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 
 | 라우트 이름 | 경로 | 기능 |
 |---|---|---|
-| `platform_tenants` | `GET/POST /v1/platform/tenants` | DATA-1 |
+| `platform_tenants` | `GET/POST /v1/platform/tenants` | DATA-1 DATA-9 |
 | `platform_tenant_purge` | `DELETE /v1/platform/tenants/{id}` | DATA-4 CRYPTO-3 |
 | `platform_accounts` | `GET/POST /v1/platform/accounts` | AUTH-9 |
 | `platform_account_password` | `POST /v1/platform/accounts/{username}/password` | AUTH-9 |
