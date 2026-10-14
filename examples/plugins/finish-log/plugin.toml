@@ -1,0 +1,26 @@
+# finish-log — event 트리거 예제. 모델 경계를 지난 잡의 종결을 JSONL 로 남긴다.
+# 규칙은 `python clients/lccp.py check examples/plugins/finish-log` 가 호스트와 같은 코드로 판정한다.
+
+[plugin]
+id = "example.finish-log"
+name = "종결 기록"
+version = "0.1.0"
+requires_host = ">=0.6,<0.7"
+description = "job.finished 를 받아 JSONL 로 남긴다 — 기본은 메타데이터만, 본문은 --with-text 로만"
+
+[service]
+# 이 플러그인은 LLM 을 부르지 않는다. 그래도 allow_roles 는 비울 수 없으므로(호스트 규칙) 한 역할을
+# 적고 **예산을 0 으로** 둔다 — 이 토큰으로는 유료 호출이 안 된다(최소 권한).
+allow_roles = ["summarize"]
+rate_limit_per_min = 1
+budget_usd_per_month = 0
+
+[run]
+# external — 컨트롤 플레인이 프로세스를 띄우지 않는다. systemd 템플릿은 ../systemd/ 에 있다.
+kind = "external"
+
+[trigger]
+kind = "event"
+event = "job.finished"
+# 비우면 모든 역할의 종결을 받는다. 자기 서비스가 만든 잡은 오지 않는다(재귀 방지).
+roles = []
