@@ -140,7 +140,7 @@
   "ui.preview_blocked": "Blocked",
   "ui.preview_not_sent": "Nothing is sent to this boundary.",
   "ui.preview_clean": "No rule matched — the prompt goes out as is.",
-  "ui.grace_mode_on": "Grace mode — block was lowered to masking",
+  "ui.grace_mode_on": "Grace mode — block grades are judged as masking",
   "ui.trend_24h": "Requests — last 24 hours",
   "ui.trend_requests": "Requests",
   "ui.trend_tokens": "Tokens",

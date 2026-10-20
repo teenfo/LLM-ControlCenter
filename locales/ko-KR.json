@@ -140,7 +140,7 @@
   "ui.preview_blocked": "차단",
   "ui.preview_not_sent": "이 경계로는 아무것도 전송되지 않습니다.",
   "ui.preview_clean": "걸린 규칙이 없습니다 — 그대로 나갑니다.",
-  "ui.grace_mode_on": "유예 모드 — 차단이 마스킹으로 낮춰진 결과입니다",
+  "ui.grace_mode_on": "유예 모드 — 차단 등급은 마스킹으로 낮춰 판정합니다",
   "ui.trend_24h": "요청 추이 — 최근 24시간",
   "ui.trend_requests": "요청 추이",
   "ui.trend_tokens": "토큰 추이",

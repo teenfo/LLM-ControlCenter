@@ -347,7 +347,7 @@ def scene_admin(show: Show) -> None:
             note(f"  경계 {boundary:<8} {'통과' if v['allowed'] else '차단'}: " + (clip(v["prompt"]) if v["prompt"] else "(전송되지 않음)"))
         note("  걸린 규칙: " + ", ".join(f"{d['rule_id']}({d['actions']['internal']}/{d['actions']['external']})" for d in preview["detections"]))
         if preview.get("grace_mode"):
-            note("  유예 모드가 켜져 있다 — 차단이 마스킹으로 낮춰진 결과다")
+            note("  유예 모드가 켜져 있다 — block 등급 규칙이 있다면 마스킹으로 낮춰 판정한다(베이스라인에는 block 이 없다)")
     except ControlCenterError as exc:
         note(f"미리보기 실패 {exc.status} {exc.code} (0.7.0 이상 호스트가 필요하다)")
 
