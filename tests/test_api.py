@@ -1865,3 +1865,188 @@ def test_a_new_tenant_admin_can_onboard_users_without_the_platform(client, acme)
     assert (me["tenant"]["id"], me["service"]["id"], me["role"]) == ("newco", "newco-app", "service")
     jobs = client.get("/v1/jobs", headers=auth(login.json()["token"]))
     assert jobs.status_code == 200 and jobs.json()["scope"] == "account"
+
+
+# ── 가드 미리보기 (GUARD-14) ─────────────────────────────────────────────
+
+
+def test_the_guard_preview_judges_without_a_job_or_a_detection_record(harness, client, acme):
+    """같은 엔진·같은 규칙으로 **판정만** — 잡도, 노드 호출도, 탐지 기록도 남지 않는다."""
+    from app.guard import STAGE_PATTERN
+
+    prompt = f"고객 hong@example.com 의 카드 {VALID_CARD} 결제를 요약해 줘"
+    response = client.post(
+        "/v1/admin/guard/preview", json={"prompt": prompt}, headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["blocked"] is False and body["allowed_boundaries"] == ["external", "internal"]
+    assert body["grace_mode"] is False and body["locale_pack"] == "ko_KR"
+
+    by_rule = {d["rule_id"]: d for d in body["detections"]}
+    assert set(by_rule) >= {"email", "card"}
+    # 경계마다 다른 등급 — 카드는 안에서는 audit(그대로 나간다), 밖에서는 full(라벨만).
+    assert VALID_CARD in body["boundaries"]["internal"]["prompt"]
+    assert VALID_CARD not in body["boundaries"]["external"]["prompt"]
+    assert "hong@example.com" not in body["boundaries"]["internal"]["prompt"]
+    assert by_rule["card"]["actions"] == {"internal": "audit", "external": "full"}
+    assert by_rule["email"]["stage"] == STAGE_PATTERN and by_rule["email"]["match_count"] == 1
+    # 걸린 자리는 **원문 기준 오프셋**이다 — 화면이 그 자리에 표시를 올린다. 값은 싣지 않는다.
+    start, end = by_rule["email"]["spans"][0]
+    assert prompt[start:end] == "hong@example.com"
+    assert body["classifier"] == {"attempted": False, "failed": False}
+
+    # 부수 효과 없음 — 미리보기는 측정이 아니다.
+    assert harness.store._conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 0
+    assert list(harness.store.list_filter_events(TenantScope("acme"))) == []
+
+
+def test_the_guard_preview_reports_a_block_without_echoing_the_value(harness, client, acme):
+    """차단된 경계의 본문은 응답에 없다 — 어차피 안 나가고, 걸린 값을 되돌려 주면 '값은 남기지 않는다' 가 깨진다."""
+    response = client.post(
+        "/v1/admin/guard/preview", json={"prompt": f"주민번호 {VALID_RRN} 확인"},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["blocked"] is True and data["allowed_boundaries"] == []
+    assert data["blocked_rules"] == ["kr_rrn"]
+    assert data["boundaries"]["internal"]["prompt"] is None
+    assert data["boundaries"]["external"] == {"allowed": False, "prompt": None, "system": None}
+    assert VALID_RRN not in response.text
+    assert list(harness.store.list_filter_events(TenantScope("acme"))) == []
+
+
+def test_the_guard_preview_scans_the_system_field_too(client, acme):
+    """system 을 안 보면 그 필드가 필터를 통째로 우회한다 — 미리보기도 두 필드를 따로 본다."""
+    data = client.post(
+        "/v1/admin/guard/preview",
+        json={"prompt": "요약해 줘", "system": "담당자 메일 hong@example.com"},
+        headers=auth(acme["tenant_admin"]),
+    ).json()
+    email = next(d for d in data["detections"] if d["rule_id"] == "email")
+    assert email["spans"] == [] and len(email["system_spans"]) == 1
+    assert "hong@example.com" not in data["boundaries"]["external"]["system"]
+    assert data["boundaries"]["external"]["prompt"] == "요약해 줘"
+
+
+def test_the_guard_preview_follows_grace_mode(client, acme):
+    """유예 모드가 켜지면 미리보기도 같은 눈으로 본다 — 차단이 마스킹으로 내려앉은 결과를 그대로 보여 준다."""
+    on = client.post(
+        "/v1/platform/guard/grace-mode", json={"enabled": True},
+        headers=auth(acme["platform_admin"]),
+    )
+    assert on.status_code == 200, on.text
+    data = client.post(
+        "/v1/admin/guard/preview", json={"prompt": f"주민번호 {VALID_RRN} 확인"},
+        headers=auth(acme["tenant_admin"]),
+    ).json()
+    assert data["grace_mode"] is True and data["blocked"] is False
+    assert VALID_RRN not in data["boundaries"]["internal"]["prompt"]
+    assert "주민등록번호" in data["boundaries"]["internal"]["prompt"]
+
+
+def test_the_guard_preview_is_an_admin_tool_with_bounded_input(client, acme):
+    forbidden = client.post(
+        "/v1/admin/guard/preview", json={"prompt": "x"}, headers=auth(acme["service"]),
+    )
+    assert forbidden.status_code == 403
+
+    missing = client.post("/v1/admin/guard/preview", json={}, headers=auth(acme["tenant_admin"]))
+    assert (missing.status_code, missing.json()["code"]) == (400, "missing_field")
+
+    wrong_type = client.post(
+        "/v1/admin/guard/preview", json={"prompt": ["x"]}, headers=auth(acme["tenant_admin"]),
+    )
+    assert (wrong_type.status_code, wrong_type.json()["code"]) == (400, "invalid_field")
+
+    too_big = client.post(
+        "/v1/admin/guard/preview", json={"prompt": "a" * 200_001}, headers=auth(acme["tenant_admin"]),
+    )
+    assert (too_big.status_code, too_big.json()["code"]) == (413, "payload_too_large")
+
+
+# ── 사용량 추이 (OPS-10) ─────────────────────────────────────────────────
+
+
+def _usage(harness, ts: float, status: str = "ok", tokens: int = 10) -> None:
+    harness.store.record_usage(
+        TenantScope("acme"), ts=ts, service_id="acme-web", role="summarize", status=status,
+        input_tokens=tokens, output_tokens=tokens, cost_usd=0.001, duration_ms=120,
+    )
+
+
+def test_usage_comes_with_a_dense_time_series_when_asked(harness, client, acme):
+    """`series=hour` 면 묶음마다 한 점 — **빈 시간도 0 으로 온다.** 화면이 사이를 채우지 않게."""
+    now = harness.clock.now
+    _usage(harness, now - 5 * 3600, "ok", 100)
+    _usage(harness, now - 5 * 3600, "failed", 0)
+    _usage(harness, now - 3 * 3600, "ok", 40)
+    _usage(harness, now, "ok", 10)
+
+    plain = client.get("/v1/admin/usage", headers=auth(acme["tenant_admin"])).json()
+    assert plain["series"] is None, "추이는 요청할 때만 — 기본 응답은 그대로다"
+
+    body = client.get(
+        f"/v1/admin/usage?series=hour&since={now - 5 * 3600}", headers=auth(acme["tenant_admin"]),
+    ).json()
+    series = body["series"]
+    assert series["bucket"] == "hour" and series["offset_minutes"] == 0
+    points = series["points"]
+    assert len(points) == 6
+    assert [p["start"] for p in points] == sorted(p["start"] for p in points)
+    assert all(p["start"] % 3600 == 0 for p in points)
+    assert [p["calls"] for p in points] == [2, 0, 1, 0, 0, 1]
+    assert [p["ok"] for p in points] == [1, 0, 1, 0, 0, 1]
+    assert points[0]["input_tokens"] == 100 and points[2]["output_tokens"] == 40
+    assert points[0]["cost_usd"] == pytest.approx(0.002)
+    assert points[1] == {
+        "start": points[1]["start"], "calls": 0, "ok": 0, "input_tokens": 0, "output_tokens": 0,
+        "cost_usd": 0.0, "avg_duration_ms": 0,
+    }
+    # 축 집계와 추이는 같은 창을 본다.
+    assert sum(p["calls"] for p in points) == sum(r["calls"] for r in body["rows"])
+
+    bad = client.get("/v1/admin/usage?series=week", headers=auth(acme["tenant_admin"]))
+    assert (bad.status_code, bad.json()["code"]) == (400, "invalid_field")
+
+
+def test_daily_buckets_follow_the_viewers_midnight_and_the_window_is_bounded(harness, client, acme):
+    """일 묶음은 보는 쪽의 자정으로 끊는다 — UTC 자정이면 서울의 하루가 두 막대에 걸린다.
+    창은 서버가 자른다 — `since=0` 을 주면 시간 묶음은 31일, 그 이상은 점이 폭주한다."""
+    now = harness.clock.now
+    body = client.get(
+        f"/v1/admin/usage?series=day&offset_minutes=540&since={now - 3 * 86400}",
+        headers=auth(acme["tenant_admin"]),
+    ).json()
+    points = body["series"]["points"]
+    assert body["series"]["offset_minutes"] == 540
+    assert all((p["start"] + 540 * 60) % 86400 == 0 for p in points)
+    assert len(points) in (4, 5)
+
+    clamped = client.get(
+        "/v1/admin/usage?series=hour&since=0", headers=auth(acme["tenant_admin"]),
+    ).json()["series"]
+    assert clamped["since"] >= now - 31 * 86400
+    assert len(clamped["points"]) <= 31 * 24 + 1
+
+
+def test_the_overview_carries_the_last_24_hours(harness, client, acme):
+    """개요의 추이는 전 테넌트 합계 24시간 — 경계를 넘는 조회라 감사에 남는다."""
+    now = harness.clock.now
+    _usage(harness, now - 60)
+    body = client.get("/v1/platform/overview", headers=auth(acme["platform_admin"])).json()
+    series = body["usage_series"]
+    assert series["bucket"] == "hour" and len(series["points"]) == 25
+    assert series["points"][-1]["calls"] == 1 and sum(p["calls"] for p in series["points"]) == 1
+    audited = harness.store._conn.execute(
+        "SELECT COUNT(*) AS n FROM admin_audit WHERE action = 'usage_across_tenants'"
+    ).fetchone()["n"]
+    assert audited >= 1
+
+
+def test_the_series_bucket_is_a_whitelist(harness):
+    from app.store import StoreError
+
+    with pytest.raises(StoreError):
+        harness.store.usage_series(TenantScope("acme"), since=0, bucket="minute")

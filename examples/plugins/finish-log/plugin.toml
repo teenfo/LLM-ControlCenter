@@ -5,7 +5,7 @@
 id = "example.finish-log"
 name = "종결 기록"
 version = "0.1.0"
-requires_host = ">=0.6,<0.7"
+requires_host = ">=0.6,<0.8"
 description = "job.finished 를 받아 JSONL 로 남긴다 — 기본은 메타데이터만, 본문은 --with-text 로만"
 
 [service]

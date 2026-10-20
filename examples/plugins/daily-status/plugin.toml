@@ -5,7 +5,7 @@
 id = "example.daily-status"
 name = "아침 상태문"
 version = "0.1.0"
-requires_host = ">=0.6,<0.7"
+requires_host = ">=0.6,<0.8"
 description = "매일 08:00(Asia/Seoul) 클러스터 상태를 summarize 역할로 한 문단 요약한다"
 
 [service]

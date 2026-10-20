@@ -48,7 +48,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 #: 이 도구가 따라가는 호스트 판. `check --host-version` 의 기본값이고 `init` 의 `requires_host` 근거다.
 #: 호스트의 버전 문자열 일치 테스트(`test_every_version_string_agrees`)가 같이 본다.
-HOST_VERSION = "0.6.1"
+HOST_VERSION = "0.7.0"
 
 # ═══ 호스트와 같은 규칙 ═══════════════════════════════════════════════════════
 # 아래 블록은 호스트 저장소의 app/schedule.py 와 app/plugins.py 에서 **그대로** 옮긴 것이다.

@@ -1642,3 +1642,35 @@ def test_the_release_checklist_points_at_things_that_exist():
 
     # README 가 이 문서를 가리켜야 사람이 찾는다.
     assert "docs/release-checklist.md" in (ROOT / "README.md").read_text(encoding="utf-8")
+
+
+# ── 시연 시나리오 (OPS-12) ───────────────────────────────────────────────
+
+
+def test_the_showcase_script_is_standalone_and_documented():
+    """발표 스크립트는 표준 라이브러리 + 번들 SDK 만 쓰고, 대본과 README 가 서로를 가리킨다 — 하나만 고치면 어긋난다."""
+    import ast
+
+    path = ROOT / "examples" / "showcase" / "showcase.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    stdlib = set(sys.stdlib_module_names)
+    assert imported - stdlib == {"client"}, f"표준 라이브러리와 번들 SDK 밖의 의존: {sorted(imported - stdlib - {'client'})}"
+
+    helped = subprocess.run(
+        [sys.executable, str(path), "--help"], capture_output=True, text=True, timeout=60, cwd=str(ROOT),
+    )
+    assert helped.returncode == 0, helped.stderr
+    assert "--seed" in helped.stdout and "--only" in helped.stdout
+
+    script = ROOT / "docs" / "demo-script.md"
+    assert script.is_file()
+    text = script.read_text(encoding="utf-8")
+    assert "showcase.py" in text and "--seed" in text
+    assert "docs/demo-script.md" in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "demo-script.md" in (ROOT / "examples" / "showcase" / "README.md").read_text(encoding="utf-8")

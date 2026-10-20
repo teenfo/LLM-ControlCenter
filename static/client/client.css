@@ -245,3 +245,29 @@ form.stack button { align-self: flex-start; }
 /* 기록 상세의 대화 — 마스킹본 JSON 을 턴으로 보여 준다 */
 .chat-log.static { max-height: 46vh; overflow: auto; padding: 12px; }
 .bubble .who { font-size: 11px; line-height: 1.3; opacity: .72; margin-bottom: 3px; }
+
+/* 서식 있는 답변 — 모델 답변의 마크다운을 노드로 그린다(innerHTML 없음). 사용자 턴은 친 그대로. */
+.response.md-wrap { padding: 12px 14px; border-radius: 8px; background: var(--code); border: 1px solid var(--border); font-size: 14px; line-height: 1.6; }
+.md { white-space: normal; word-break: break-word; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 10px; white-space: pre-wrap; }
+.md h3, .md h4, .md h5, .md h6 { margin: 14px 0 6px; font-weight: 600; line-height: 1.3; }
+.md h3 { font-size: 16px; }
+.md h4 { font-size: 15px; }
+.md h5, .md h6 { font-size: 14px; }
+.md ul, .md ol { margin: 0 0 10px; padding-left: 22px; }
+.md li { margin: 2px 0; white-space: pre-wrap; }
+.md code { font-family: var(--mono); font-size: 12.5px; background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+.md pre.code { margin: 0 0 10px; padding: 10px 12px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; overflow: auto; white-space: pre; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; }
+.md pre.code code { border: 0; padding: 0; background: none; font-size: inherit; }
+.md blockquote { margin: 0 0 10px; padding: 4px 12px; border-left: 3px solid var(--border); color: var(--muted); }
+.md hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
+.md .scroll { overflow: auto; margin: 0 0 10px; }
+.md table { border-collapse: collapse; font-size: 13px; }
+.md th, .md td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }
+.md th { background: var(--surface2); font-weight: 600; }
+.md a { color: var(--accent); }
+.bubble .md { font-size: 14px; }
+.bubble .copy { margin-top: 8px; }
+.offscreen { position: fixed; left: -9999px; top: 0; opacity: 0; }

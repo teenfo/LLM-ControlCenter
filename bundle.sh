@@ -13,7 +13,7 @@
 
 set -eu
 
-VERSION="${LCC_VERSION:-0.6.1}"
+VERSION="${LCC_VERSION:-0.7.0}"
 STAMP=$(date +%Y%m%d)
 OUT="llm-controlcenter-airgap-${VERSION}-${STAMP}.tgz"
 WORK=$(mktemp -d)

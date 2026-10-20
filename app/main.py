@@ -101,7 +101,7 @@ from .store import (
     TenantScope,
 )
 
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -1140,6 +1140,78 @@ async def tenant_token_revoke(request: Request) -> Response:
     return _ok(request, {"revoked": True})
 
 
+#: 미리보기에 넣을 수 있는 최대 글자 수. 역할 `max_prompt_chars` 의 기본값과 같다 —
+#: 미리보기가 실제 요청보다 큰 입력을 받을 이유가 없다.
+PREVIEW_MAX_CHARS = 200_000
+
+
+async def tenant_guard_preview(request: Request) -> Response:
+    """가드 **판정만** 돌린다 — 잡도, 노드 호출도, 탐지 기록도 없다.
+
+    같은 엔진(`Guard.inspect`)을 같은 규칙(로케일 팩 + 테넌트 규칙, 유예 모드 반영)으로
+    부르므로 여기서 본 것이 곧 실제 요청이 겪는 것이다. 응답에는 **전송될 마스킹본과 걸린
+    위치**만 싣는다 — 차단된 경계의 본문은 싣지 않는다(어차피 전송되지 않고, 걸린 값을
+    응답에 되돌려 주면 감사 로그가 지키는 "값은 남기지 않는다" 를 미리보기가 깬다).
+
+    2단(LLM 맥락 분류)은 기본으로 끈다 — 미리보기마다 추론을 한 번 더 돌리면 화면이
+    느려지고, 분류기가 없는 설치처에서는 실패로 센다. `classifier: true` 면 켠다.
+    """
+    ctx, principal, scope = _tenant_admin(request)
+    body = await _body(request)
+    prompt = _need(body, "prompt")
+    if not isinstance(prompt, str):
+        raise ApiError("invalid_field", status=400, params={"field": "prompt"})
+    system = body.get("system")
+    if system is not None and not isinstance(system, str):
+        raise ApiError("invalid_field", status=400, params={"field": "system"})
+    size = len(prompt) + len(system or "")
+    if size > PREVIEW_MAX_CHARS:
+        raise ApiError(
+            "payload_too_large", status=413,
+            params={"size": size, "limit": PREVIEW_MAX_CHARS},
+        )
+
+    tenant = request.state.tenant
+    pack = guard_pack_for(tenant["locale"])
+    verdict = await ctx.guard.inspect(
+        prompt,
+        system=system or None,
+        locales=[pack] if pack else [],
+        tenant_rules=ctx.pipeline.tenant_guard_rules(scope),
+        candidate_boundaries=(INTERNAL, EXTERNAL),
+        allow_classifier=bool(body.get("classifier", False)),
+    )
+    return _ok(request, {
+        "grace_mode": ctx.guard.grace_mode,
+        "locale_pack": pack,
+        "blocked": verdict.blocked,
+        "allowed_boundaries": sorted(verdict.allowed_boundaries),
+        "blocked_rules": list(verdict.blocked_rules),
+        "boundaries": {
+            boundary: {
+                "allowed": boundary in verdict.allowed_boundaries,
+                # 차단된 경계로는 아무것도 안 나간다 — 본문도 응답에 싣지 않는다.
+                "prompt": verdict.prompt_for(boundary) if boundary in verdict.allowed_boundaries else None,
+                "system": verdict.system_for(boundary) if boundary in verdict.allowed_boundaries else None,
+            }
+            for boundary in (INTERNAL, EXTERNAL)
+        },
+        "detections": [
+            {
+                "rule_id": d.rule_id, "label": d.label, "stage": d.stage,
+                "actions": dict(d.actions), "match_count": d.match_count,
+                "spans": [list(span) for span in d.spans],
+                "system_spans": [list(span) for span in d.system_spans],
+            }
+            for d in verdict.detections
+        ],
+        "classifier": {
+            "attempted": verdict.classifier_attempted,
+            "failed": verdict.classifier_failed,
+        },
+    })
+
+
 async def tenant_guard_rules(request: Request) -> Response:
     ctx, principal, scope = _tenant_admin(request)
     tenant = request.state.tenant
@@ -1501,6 +1573,26 @@ async def tenant_usage(request: Request) -> Response:
     if axis not in ctx.store.USAGE_AXES:
         raise ApiError("invalid_field", status=400, params={"field": "by"})
 
+    # 추이는 요청할 때만 — `series=hour|day`. 빈 묶음도 0 으로 채워 주므로 묶음 수가
+    # 폭주하지 않게 창을 자른다(시간 묶음 31일 · 일 묶음 400일). `offset_minutes` 는 보는
+    # 쪽 시간대 — 일 묶음을 UTC 자정으로 끊으면 서울의 하루가 두 막대에 걸친다.
+    series = None
+    bucket = params.get("series")
+    if bucket is not None:
+        if bucket not in ctx.store.SERIES_BUCKETS:
+            raise ApiError("invalid_field", status=400, params={"field": "series"})
+        offset = _int(
+            params.get("offset_minutes"), "offset_minutes", default=0, minimum=-840, maximum=840,
+        )
+        now = ctx.now()
+        floor = now - (31 if bucket == "hour" else 400) * 86400
+        series = {
+            "bucket": bucket, "offset_minutes": offset, "since": max(since, floor),
+            "points": ctx.store.usage_series(
+                scope, since=max(since, floor), bucket=bucket, offset_minutes=offset, until=now,
+            ),
+        }
+
     budget = ctx.accountant.budget_status(
         scope, limit=request.state.tenant["budget_usd_per_month"]
     )
@@ -1508,6 +1600,7 @@ async def tenant_usage(request: Request) -> Response:
         "since": since,
         "by": axis,
         "rows": ctx.store.usage_summary(scope, since=since, group_by=axis),
+        "series": series,
         "spend_usd": ctx.store.spend_since(scope, since),
         # **토큰 처리율은 계기지 한도가 아니다.** 무료 경로는 달러가 0 이라
         # 200KB 프롬프트 1건과 1KB 1건이 같은 1건이고, 그 차이가 예산에도
@@ -1807,6 +1900,7 @@ async def platform_overview(request: Request) -> Response:
     )
 
     lanes = ctx.scheduler.snapshot() if ctx.scheduler else {}
+    day_ago = ctx.now() - 86400
     return _ok(request, {
         "version": ctx.version,
         "schema_version": ctx.store.schema_version,
@@ -1817,6 +1911,12 @@ async def platform_overview(request: Request) -> Response:
             for row in ctx.store.list_tenants(scope)
         ],
         "usage_by_tenant": [dict(row) for row in ctx.store.usage_across_tenants(scope, since=since)],
+        # 추이 한 줄 — 최근 24시간을 시간 묶음으로, 빈 시간도 0 으로. 테넌트를 가로지르는
+        # 조회이므로 `usage_across_tenants` 와 같은 감사 행이 남는다(합쳐진다).
+        "usage_series": {
+            "bucket": "hour", "offset_minutes": 0, "since": day_ago,
+            "points": ctx.store.usage_series(scope, since=day_ago, bucket="hour", until=ctx.now()),
+        },
         "nodes": ctx.cluster.snapshot(),
         "lanes": lanes,
         # 1급 카드 둘 — 자동 복제를 안 하므로 사람이 판단할 재료를 준다.
@@ -2442,6 +2542,8 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["POST"], name="tenant_guard_review"),
         Route(f"{v}/admin/guard/rules/{{rule_id}}/promotion", tenant_guard_promote,
               name="tenant_guard_promote"),
+        Route(f"{v}/admin/guard/preview", tenant_guard_preview,
+              methods=["POST"], name="tenant_guard_preview"),
         Route(f"{v}/admin/settings", tenant_settings, methods=["GET", "PUT"], name="tenant_settings"),
         Route(f"{v}/admin/overrides", tenant_overrides,
               methods=["GET", "PUT", "DELETE"], name="tenant_overrides"),

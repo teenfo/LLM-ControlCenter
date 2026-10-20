@@ -703,3 +703,33 @@ def test_the_tenant_drawer_shows_the_admin_token_once():
     assert "created.tenant_admin_token" in form and "created.service_id" in form
     assert "openDrawer(" in form and "'ui.tenant_created'" in form and "'ui.tenant_token_hint'" in form
     assert "class: 'reveal'" in form, "토큰은 1회 표시 스타일로"
+
+
+# ── 가드 미리보기 · 추이 차트 (0.7.0) ─────────────────────────────────────
+
+
+def test_the_guard_page_offers_a_preview_that_creates_nothing():
+    """미리보기는 같은 엔진으로 판정만 — 화면은 원문의 걸린 자리와 경계별 마스킹본을 보여 주고,
+    차단된 경계의 본문은 받지도 그리지도 않는다. 입력과 결과는 state 에 있어야 자동 갱신이 지우지 않는다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    guard = source[source.index("async function renderGuard"):source.index("async function review")]
+    assert "previewCard()" in guard
+    preview = source[source.index("function previewCard"):source.index("const JOB_FILTERS")]
+    assert "'/v1/admin/guard/preview'" in preview and "method: 'POST'" in preview
+    assert "state.guardPreview" in preview
+    assert "el('mark'" in preview and "'ui.preview_not_sent'" in preview and "'ui.grace_mode_on'" in preview
+    assert "innerHTML" not in preview
+
+
+def test_the_overview_and_usage_pages_draw_a_trend_with_one_axis():
+    """추이는 축 하나·계열 하나(요청 수는 성공 위에 실패를 쌓는다) — 호버마다 읽는 줄 하나, 묶음은 서버가 준 대로."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "createElementNS" in source[source.index("function svgEl"):source.index("function niceCeiling")]
+    chart = source[source.index("function trendChart"):source.index("function laneChip")]
+    assert "class: 'ok'" in chart and "class: 'fail'" in chart and "'ui.legend_failed'" in chart
+    assert "mouseenter" in chart
+    overview = source[source.index("async function renderPlatformOverview"):source.index("async function renderNodes")]
+    assert "trendChart(o.usage_series" in overview
+    usage = source[source.index("const USAGE_WINDOWS"):source.index("async function renderNotifications")]
+    assert "&series=" in usage and "offset_minutes=" in usage and "metric: 'tokens'" in usage
+    assert "getTimezoneOffset" in usage, "일 묶음은 보는 쪽 자정으로 끊는다"

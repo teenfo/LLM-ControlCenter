@@ -259,6 +259,7 @@ LCC_AIRGAP=1 docker compose up -d
 | [docs/topology.md](docs/topology.md) | 서버 구조도 · 데이터 경계 |
 | [docs/capacity.md](docs/capacity.md) | 규모 산정 · 증설 트리거 |
 | [docs/deployment.md](docs/deployment.md) | 배포 프로파일 · 업그레이드 |
+| [docs/demo-script.md](docs/demo-script.md) | **발표 시연 대본** — 전날 점검 · 15분 장면표 · 비상 계획 · 예상 질문. 짝 스크립트는 [examples/showcase/](examples/showcase/) |
 | [docs/release-checklist.md](docs/release-checklist.md) | **1차 배포 체크리스트** — 출하 전 · 설치 당일 · 첫 주 · 되돌리기 · 리허설 기록 |
 | [docs/reference/llm-platform-overview.md](docs/reference/llm-platform-overview.md) | 설계의 출발점이 된 레퍼런스 시스템 |
 

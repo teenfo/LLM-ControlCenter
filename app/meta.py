@@ -137,6 +137,11 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     "tenant_guard_events": ("가드 탐지 이력과 오탐 검토 큐.", "tenant_admin", False),
     "tenant_guard_review": ("오탐 검토 판정. 정답셋 승격의 재료가 된다.", "tenant_admin", False),
     "tenant_guard_promote": ("`audit` → `block` 승격 가능 여부 판정.", "tenant_admin", False),
+    "tenant_guard_preview": (
+        "가드 미리보기 — 잡 없이 판정만. 같은 엔진·같은 규칙으로 돌려 전송될 마스킹본과 걸린 "
+        "위치를 돌려준다. 차단된 경계의 본문은 싣지 않고, 탐지 기록도 남기지 않는다.",
+        "tenant_admin", False,
+    ),
     "tenant_settings": ("테넌트 설정 — 기본 로케일·원문 보관 기간·예산.", "tenant_admin", False),
     "tenant_overrides": ("역할 오버라이드 조회·설정·해제.", "tenant_admin", False),
     "tenant_jobs": ("자기 테넌트의 작업 목록. 마스킹본만 보인다.", "tenant_admin", False),
@@ -164,7 +169,11 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
         "드러내 놓고 치울 방법이 없으면 그 숫자는 아무도 안 보는 숫자가 된다.",
         "tenant_admin", False,
     ),
-    "tenant_usage": ("사용량 집계 — 서비스·엔드유저·역할·노드 축.", "tenant_admin", False),
+    "tenant_usage": (
+        "사용량 집계 — 서비스·엔드유저·역할·노드 축. `series=hour|day` 를 주면 시간 묶음 추이도 "
+        "함께 온다(빈 묶음은 0).",
+        "tenant_admin", False,
+    ),
     "tenant_audit": ("자기 테넌트의 감사 로그.", "tenant_admin", False),
     "tenant_export": ("내보내기 — 작업·사용량·감사·설정(마스킹본 기준).", "tenant_admin", False),
     "tenant_purge_end_user": ("엔드유저 파기. 그 엔드유저의 데이터만 지운다.", "tenant_admin", False),
@@ -189,7 +198,10 @@ ROUTE_SUMMARIES: Mapping[str, tuple[str, str, bool]] = {
     ),
     "platform_model_delete": ("모델 삭제. 차단 사유가 하나라도 있으면 거부된다(`force` 없음).", "platform_admin", False),
     "platform_catalog": ("번들 카탈로그 검색. 외부 레지스트리를 스크레이핑하지 않는다.", "platform_admin", False),
-    "platform_overview": ("전역 관제 — 테넌트별 소비·노드 그리드·단일 호밍 경고.", "platform_admin", False),
+    "platform_overview": (
+        "전역 관제 — 테넌트별 소비·최근 24시간 추이·노드 그리드·단일 호밍 경고.",
+        "platform_admin", False,
+    ),
     "platform_guard_baseline": ("베이스라인 가드 규칙과 로케일 팩 현황.", "platform_admin", False),
     "platform_grace_mode": ("가드 유예 모드 해제·재설정. 끄는 것이 정상 상태다.", "platform_admin", False),
     "platform_evals": ("가드 회귀 평가 실행·이력.", "platform_admin", False),

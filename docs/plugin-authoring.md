@@ -33,7 +33,7 @@ lccp init → 코드 → 목 서버 / 데모 호스트에서 돌려 본다 → l
 id = "acme.daily-digest"         # 역DNS. 점이 하나는 있어야 한다 — 일반 서비스 id 와 섞이지 않게
 name = "일일 요약"
 version = "1.0.0"                # 숫자.숫자[.숫자[.숫자]][-태그]
-requires_host = ">=0.6,<0.7"     # 호스트 판 범위. 비우면 통과. >= > <= < == 만, 쉼표로 여럿
+requires_host = ">=0.6,<0.8"     # 호스트 판 범위. 비우면 통과. >= > <= < == 만, 쉼표로 여럿
 description = "…"
 
 [service]                        # create_service() 의 인자 그대로 — 관리자가 읽는 문장 = DB 값 = 강제되는 것
@@ -215,7 +215,7 @@ systemctl enable --now llmcc-plugin@acme.my-plugin
 - 토큰 회전 절차: 콘솔에서 회전(유예 60분) → 새 토큰을 `.env` 에 → `systemctl restart` → 유예 안에 끝내면 끊김이 없다. 플러그인은
   회전 뒤 옛 토큰으로 401 을 만나도 죽지 않고 기다린다(§6).
 - 예제 둘이 [examples/plugins/](../examples/plugins/) 에 있다 — `finish-log`(event · JSONL · 기본은 메타데이터만) ·
-  `daily-status`(schedule · 아침 상태문 한 문단). 둘 다 이 호스트 판(`>=0.6,<0.7`)에 그대로 설치된다.
+  `daily-status`(schedule · 아침 상태문 한 문단). 둘 다 이 호스트 판(`>=0.6,<0.8`)에 그대로 설치된다.
 
 ## 10. 하지 말 것
 

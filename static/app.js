@@ -29,6 +29,9 @@ const state = {
   platformBlocked: false,
   jobFilter: 'all',
   usageAxis: 'service_id',
+  usageWindow: '30d',
+  // 가드 미리보기의 입력과 결과 — 화면 밖(state)에 두어야 자동 갱신이 지우지 않는다.
+  guardPreview: { text: '', checked: '', result: null },
   header: { nodes: null, pending: 0 },
 };
 
@@ -269,6 +272,102 @@ function bar(ratio, warnAt, thick) {
   return el('div', { class: 'bar' + (thick ? ' thick' : '') }, [
     el('span', { class: tone, style: 'width:' + (pct * 100).toFixed(1) + '%' }),
   ]);
+}
+
+// ── 추이 차트 ─────────────────────────────────────────────────────────────
+
+function svgEl(tag, attrs, text) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (value === null || value === undefined) continue;
+    node.setAttribute(key, String(value));
+  }
+  if (text !== undefined) node.textContent = String(text);
+  return node;
+}
+
+/** 눈금 상한 — 1·2·5 × 10ⁿ 중 최댓값 이상인 첫 값. 막대가 천장에 닿지 않고 눈금이 읽히는 숫자가 된다. */
+function niceCeiling(max) {
+  if (!(max > 0)) return 1;
+  const power = Math.pow(10, Math.floor(Math.log10(max)));
+  for (const unit of [1, 2, 5, 10]) if (unit * power >= max) return unit * power;
+  return 10 * power;
+}
+
+function compact(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 ? 1 : 0) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(n % 1e3 ? 1 : 0) + 'k';
+  return Number.isInteger(n) ? String(n) : n.toFixed(n < 1 ? 3 : 1);
+}
+
+function bucketLabel(start, bucket) {
+  const d = new Date(start * 1000);
+  if (bucket === 'day') return (d.getMonth() + 1) + '/' + d.getDate();
+  return String(d.getHours()).padStart(2, '0') + ':00';
+}
+
+/**
+ * 막대 하나가 한 묶음(시간·일). **축은 하나, 계열도 하나** — 요청 수에서만 실패를 위에 쌓아 두 색이 된다.
+ * 색은 상태 토큰(성공 = accent · 실패 = danger)만, 글자는 본문 토큰만 쓴다. 빈 묶음은 서버가 0 으로 채워
+ * 보내므로 받은 점을 그대로 그린다. 호버는 막대보다 넓은 투명 영역이 받아 읽는 줄 하나에 쓴다.
+ */
+function trendChart(series, opts) {
+  const o = opts || {};
+  const points = (series && series.points) || [];
+  if (!points.length) return emptyState(t('ui.none'));
+  const metric = o.metric || 'calls';
+  const valueOf = (p) => (metric === 'tokens' ? (p.input_tokens || 0) + (p.output_tokens || 0)
+    : (metric === 'cost' ? (p.cost_usd || 0) : (p.calls || 0)));
+  const W = 720, H = 150, L = 40, R = 8, T = 10, B = 22;
+  const innerW = W - L - R, innerH = H - T - B;
+  const top = niceCeiling(Math.max(...points.map(valueOf)));
+  const slot = innerW / points.length;
+  const barW = Math.max(2, Math.min(26, slot * 0.7));
+  const split = metric === 'calls' && points.some((p) => (p.calls || 0) > (p.ok || 0));
+  const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'trend', role: 'img', 'aria-label': o.label || '' });
+  // 눈금은 0 · 절반 · 상한. 상한이 1 이면(빈 창) 절반 눈금은 뜻이 없어 뺀다.
+  for (const frac of (top < 2 && metric !== 'cost' ? [0, 1] : [0, 0.5, 1])) {
+    const y = T + innerH * (1 - frac);
+    svg.appendChild(svgEl('line', { x1: L, x2: W - R, y1: y, y2: y, class: 'grid' }));
+    svg.appendChild(svgEl('text', { x: L - 6, y: y + 4, class: 'tick', 'text-anchor': 'end' }, compact(top * frac)));
+  }
+  const tip = el('div', { class: 'trend-tip' });
+  tip.hidden = true;
+  const every = Math.max(1, Math.ceil(points.length / 8));
+  points.forEach((p, i) => {
+    const x = L + i * slot + (slot - barW) / 2;
+    const total = Math.max(0, innerH * (valueOf(p) / top));
+    const g = svgEl('g', { class: 'bar' });
+    if (split) {
+      const okH = innerH * ((p.ok || 0) / top);
+      const failH = total - okH;
+      if (okH > 0) g.appendChild(svgEl('rect', { x, y: T + innerH - okH, width: barW, height: okH, rx: 2, class: 'ok' }));
+      // 쌓인 두 조각 사이는 바탕색 2px — 경계가 색 차이에만 기대지 않게.
+      if (failH > 0) g.appendChild(svgEl('rect', { x, y: T + innerH - total, width: barW, height: Math.max(0.5, failH - (okH > 0 ? 2 : 0)), rx: 2, class: 'fail' }));
+    } else if (total > 0) {
+      g.appendChild(svgEl('rect', { x, y: T + innerH - total, width: barW, height: total, rx: 2, class: 'ok' }));
+    }
+    // 호버 영역은 묶음 폭·높이 전체 — 얇은 막대와 빈 묶음도 읽을 수 있어야 한다.
+    const hit = svgEl('rect', { x: L + i * slot, y: T, width: slot, height: innerH, class: 'hit' });
+    const failed = (p.calls || 0) - (p.ok || 0);
+    const label = bucketLabel(p.start, series.bucket) + ' · ' + t('ui.calls') + ' ' + (p.calls || 0)
+      + (failed > 0 ? ' (' + t('ui.legend_failed') + ' ' + failed + ')' : '')
+      + ' · ' + t('ui.tokens_used') + ' ' + ((p.input_tokens || 0) + (p.output_tokens || 0))
+      + (p.cost_usd ? ' · ' + money(p.cost_usd) : '')
+      + (p.avg_duration_ms ? ' · ' + p.avg_duration_ms + ' ms' : '');
+    hit.addEventListener('mouseenter', () => { tip.textContent = label; tip.hidden = false; g.classList.add('hover'); });
+    hit.addEventListener('mouseleave', () => { tip.hidden = true; g.classList.remove('hover'); });
+    g.appendChild(hit);
+    svg.appendChild(g);
+    if (i % every === 0) {
+      svg.appendChild(svgEl('text', { x: L + i * slot + slot / 2, y: H - 6, class: 'xlabel', 'text-anchor': 'middle' }, bucketLabel(p.start, series.bucket)));
+    }
+  });
+  const legend = split ? el('div', { class: 'trend-legend' }, [
+    el('span', {}, [el('i', { class: 'ok' }), t('ui.legend_ok')]),
+    el('span', {}, [el('i', { class: 'fail' }), t('ui.legend_failed')]),
+  ]) : null;
+  return el('div', { class: 'trend-wrap' }, [svg, tip, legend]);
 }
 
 function laneChip(name) {
@@ -646,6 +745,10 @@ async function renderPlatformOverview() {
       stat(t('ui.queued'), queued, '', t('ui.running') + ' ' + running),
       stat(t('ui.pending_approval'), pending, pending ? 'warn' : '', t('ui.install_requests')),
     ]),
+
+    // 추이 한 줄 — 전 테넌트 합계, 최근 24시간. 숫자 타일 다음에 "지금 흐름" 을 보여 준다.
+    card(t('ui.trend_24h'), [trendChart(o.usage_series, { metric: 'calls', label: t('ui.trend_24h') })],
+      null, el('span', { text: t('ui.per_hour') })),
 
     el('div', { class: 'grid wide' }, [
       card(t('ui.lane'), [table(
@@ -1115,6 +1218,8 @@ async function renderGuard() {
   const events = (data.events && data.events.events) || [];
 
   return [
+    // **미리보기가 맨 위다** — 규칙 표는 "무엇이 켜져 있나" 이고, 미리보기는 "그래서 이 문장은 어떻게 되나" 다.
+    previewCard(),
     el('div', { class: 'grid split-2' }, [
       // **오탐 검토 큐** — 이게 밀리면 승격 게이트가 영원히 안 열린다.
       card(t('ui.false_positive_queue'), [
@@ -1174,6 +1279,76 @@ async function checkPromotion(ruleId) {
       ]),
     ], [drawerClose()]);
   } catch (err) { showError(err); }
+}
+
+// ── 테넌트: 가드 미리보기 ───────────────────────────────────────────────
+
+/** 잡 없이 판정만 — 같은 엔진·같은 규칙이라 여기서 본 것이 실제 요청이 겪는 것이다. 입력과 결과는 state 에 남긴다. */
+function previewCard() {
+  const pv = state.guardPreview;
+  const input = el('textarea', { id: 'guard-preview-text', rows: 4, placeholder: t('ui.preview_placeholder') });
+  input.value = pv.text || '';
+  input.addEventListener('input', () => { pv.text = input.value; });
+  const run = el('button', { type: 'button', class: 'primary', text: t('ui.preview_run'), onclick: () => runPreview(input.value) });
+  return card(t('ui.guard_preview'), [
+    el('p', { class: 'hint', text: t('ui.preview_help') }),
+    input,
+    el('div', { class: 'row' }, [run, pv.result && pv.result.grace_mode ? pill(t('ui.grace_mode_on'), 'warn') : null]),
+    pv.result ? previewResult(pv.checked, pv.result) : null,
+  ]);
+}
+
+async function runPreview(text) {
+  if (!text.trim()) return;
+  try {
+    const result = await api('/v1/admin/guard/preview', { method: 'POST', body: { prompt: text } });
+    state.guardPreview = { text, checked: text, result };
+    refresh();
+  } catch (err) { showError(err); }
+}
+
+/** 원문 위에 걸린 자리를 표시하고, 경계마다 "나가는 모양" 과 판정을 나란히 — 차단된 경계는 본문이 없다(서버가 안 준다). */
+function previewResult(original, r) {
+  const spans = [];
+  for (const d of r.detections || []) {
+    const blocks = d.actions && (d.actions.internal === 'block' || d.actions.external === 'block');
+    for (const s of d.spans || []) spans.push([s[0], s[1], blocks]);
+  }
+  spans.sort((a, b) => a[0] - b[0]);
+  const marked = el('pre', { class: 'preview' });
+  let cursor = 0;
+  for (const [start, end, blocks] of spans) {
+    if (start < cursor) continue;   // 겹치는 스팬은 앞엣것이 이긴다 — 표시용이라 병합까지는 안 한다
+    if (start > cursor) marked.appendChild(document.createTextNode(original.slice(cursor, start)));
+    marked.appendChild(el('mark', { class: blocks ? 'block' : null, text: original.slice(start, end) }));
+    cursor = end;
+  }
+  if (cursor < original.length) marked.appendChild(document.createTextNode(original.slice(cursor)));
+
+  const boundaryBox = (b) => {
+    const v = (r.boundaries || {})[b] || {};
+    return el('div', { class: 'stack' }, [
+      el('div', { class: 'row' }, [
+        el('strong', { text: t(b === 'internal' ? 'ui.boundary_internal' : 'ui.boundary_external') }),
+        pill(v.allowed ? t('ui.preview_allowed') : t('ui.preview_blocked'), v.allowed ? 'ok' : 'danger'),
+      ]),
+      v.allowed ? el('pre', { class: 'preview', text: v.prompt || '' }) : el('p', { class: 'hint', text: t('ui.preview_not_sent') }),
+    ]);
+  };
+  const detections = r.detections || [];
+  return el('div', { class: 'stack' }, [
+    el('div', { class: 'preview-grid' }, [
+      el('div', { class: 'stack' }, [el('strong', { text: t('ui.preview_original') }), marked]),
+      el('div', { class: 'stack' }, [boundaryBox('internal'), boundaryBox('external')]),
+    ]),
+    detections.length
+      ? table([t('ui.rule'), t('ui.stage'), t('ui.boundary_internal'), t('ui.boundary_external'), { label: t('ui.hits'), num: true }],
+          detections.map((d) => [
+            el('span', { class: 'mono', text: d.rule_id }), d.stage,
+            badge(d.actions.internal, d.actions.internal), badge(d.actions.external, d.actions.external), d.match_count,
+          ]))
+      : emptyState(t('ui.preview_clean'), 'ok'),
+  ]);
 }
 
 // ── 테넌트: 작업 ──────────────────────────────────────────────────────────
@@ -1302,20 +1477,40 @@ async function viewRaw(jobId) {
 
 const USAGE_AXES = ['service_id', 'end_user_hash', 'role', 'model', 'node'];
 
+//: 창과 묶음은 한 쌍이다 — 표도 추이도 같은 `since` 를 본다. 30일은 일 묶음, 그 아래는 시간 묶음.
+const USAGE_WINDOWS = [
+  { id: '24h', label: 'ui.window_24h', seconds: 86400, bucket: 'hour' },
+  { id: '7d', label: 'ui.window_7d', seconds: 7 * 86400, bucket: 'hour' },
+  { id: '30d', label: 'ui.window_30d', seconds: 30 * 86400, bucket: 'day' },
+];
+
 async function renderUsage() {
   const axis = state.usageAxis || 'service_id';
-  const data = await api('/v1/admin/usage?by=' + encodeURIComponent(axis));
+  const win = USAGE_WINDOWS.find((w) => w.id === state.usageWindow) || USAGE_WINDOWS[2];
+  const since = Math.floor(Date.now() / 1000 - win.seconds);
+  // 일 묶음은 보는 쪽의 자정으로 끊는다 — 브라우저의 시간대를 분 단위로 넘긴다.
+  const data = await api('/v1/admin/usage?by=' + encodeURIComponent(axis) + '&since=' + since
+    + '&series=' + win.bucket + '&offset_minutes=' + (-new Date().getTimezoneOffset()));
   renderBanners();
 
   const budget = data.budget || {};
   const burn = budget.burn_rate || 0;
   const rows = data.rows || [];
+  const unit = el('span', { text: t(win.bucket === 'day' ? 'ui.per_day' : 'ui.per_hour') });
 
   return [
     el('div', { class: 'page-head' }, [
-      segment(USAGE_AXES.map((name) => ({ id: name, label: name })), axis,
-        (id) => { state.usageAxis = id; refresh(); }),
+      el('div', { class: 'row' }, [
+        segment(USAGE_AXES.map((name) => ({ id: name, label: name })), axis,
+          (id) => { state.usageAxis = id; refresh(); }),
+        segment(USAGE_WINDOWS.map((w) => ({ id: w.id, label: t(w.label) })), win.id,
+          (id) => { state.usageWindow = id; refresh(); }),
+      ]),
       el('p', { class: 'desc', text: t('ui.desc_usage') }),
+    ]),
+    el('div', { class: 'grid wide' }, [
+      card(t('ui.trend_requests'), [trendChart(data.series, { metric: 'calls', label: t('ui.trend_requests') })], null, unit),
+      card(t('ui.trend_tokens'), [trendChart(data.series, { metric: 'tokens', label: t('ui.trend_tokens') })], null, unit.cloneNode(true)),
     ]),
     el('div', { class: 'grid' }, [
       stat(t('ui.calls'), rows.reduce((sum, r) => sum + r.calls, 0)),

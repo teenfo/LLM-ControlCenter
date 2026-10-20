@@ -379,3 +379,33 @@ pre.reveal { border-color: var(--accent); }
 /* 작업 드로어의 대화 잡 — 턴 단위 */
 .transcript { display: grid; gap: 8px; }
 .transcript .who { font-size: 11px; line-height: 1.3; opacity: .72; margin-bottom: 2px; }
+
+/* 추이 차트 — 한 축, 상태 토큰 두 색(성공 accent · 실패 danger), 글자는 본문 토큰 */
+.trend-wrap { position: relative; }
+svg.trend { width: 100%; height: auto; display: block; }
+svg.trend .grid { stroke: var(--border); stroke-width: 1; }
+svg.trend .tick, svg.trend .xlabel { fill: var(--muted); font: 11px var(--mono); }
+svg.trend rect.ok { fill: var(--accent); }
+svg.trend rect.fail { fill: var(--danger); }
+svg.trend rect.hit { fill: transparent; }
+svg.trend g.bar.hover rect.ok, svg.trend g.bar.hover rect.fail { opacity: .75; }
+.trend-tip {
+  position: absolute; top: 0; right: 0; max-width: 100%; padding: 4px 8px; border-radius: 6px;
+  background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow);
+  font-size: 12px; color: var(--muted); pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.trend-legend { display: flex; gap: 14px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.trend-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.trend-legend i.ok { background: var(--accent); }
+.trend-legend i.fail { background: var(--danger); }
+
+/* 가드 미리보기 — 원문의 걸린 자리와 경계별로 나가는 모양 */
+#guard-preview-text { width: 100%; resize: vertical; font: 13px/1.6 var(--sans); }
+.preview-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 900px) { .preview-grid { grid-template-columns: minmax(0, 1fr); } }
+pre.preview {
+  margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--code); border: 1px solid var(--border);
+  white-space: pre-wrap; word-break: break-word; font: 13px/1.6 var(--sans); min-height: 44px;
+}
+pre.preview mark { background: var(--warn-soft); color: inherit; border-bottom: 2px solid var(--warn); border-radius: 2px; padding: 0 2px; }
+pre.preview mark.block { background: var(--danger-soft); border-bottom-color: var(--danger); }

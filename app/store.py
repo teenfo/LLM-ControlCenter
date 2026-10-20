@@ -1864,6 +1864,68 @@ class SqliteStore:
             for row in rows
         ]
 
+    #: 추이의 묶음 단위(초). 화이트리스트인 이유는 `USAGE_AXES` 와 같다 — 숫자로 SQL 에 들어간다.
+    SERIES_BUCKETS = {"hour": 3600, "day": 86400}
+
+    def usage_series(
+        self,
+        scope: TenantScope | PlatformScope,
+        *,
+        since: float,
+        bucket: str = "hour",
+        offset_minutes: int = 0,
+        until: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """시간 묶음별 추이 — 호출·성공·토큰·비용·평균 지연.
+
+        **빈 묶음도 0 으로 돌려준다.** 비어 있는 시간을 빼고 주면 화면이 막대 사이를
+        채우느라 같은 계산을 다시 하고, 두 계산이 어긋나는 순간 그래프가 거짓말을 한다.
+        `offset_minutes` 는 보는 쪽의 시간대다 — 일 묶음을 UTC 자정으로 끊으면 서울의
+        하루가 두 막대에 걸친다. 플랫폼 범위면 테넌트를 가로지르므로 감사에 남는다.
+        """
+        if bucket not in self.SERIES_BUCKETS:
+            raise StoreError(f"알 수 없는 묶음 단위: {bucket}")
+        width = self.SERIES_BUCKETS[bucket]
+        shift = int(offset_minutes) * 60
+
+        if isinstance(scope, PlatformScope):
+            self.audit(
+                scope.actor, "usage_across_tenants",
+                detail={"reason": scope.reason, "since": since, "series": bucket},
+                coalesce_seconds=AUDIT_COALESCE_SECONDS,
+            )
+            where, params = "ts >= ?", [since]
+        else:
+            where, params = self._scoped_where(scope, "ts >= ?")
+            params.append(since)
+
+        rows = self._conn.execute(
+            "SELECT CAST((ts + ?) / ? AS INTEGER) * ? - ? AS start, COUNT(*) AS calls, "
+            "SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok, "
+            "SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, "
+            "SUM(cost_usd) AS cost_usd, AVG(duration_ms) AS avg_duration_ms "
+            f"FROM usage WHERE {where} GROUP BY start ORDER BY start",
+            [shift, width, width, shift, *params],
+        )
+        by_start = {int(row["start"]): row for row in rows}
+
+        end = self._now() if until is None else until
+        start = int((since + shift) // width) * width - shift
+        points: list[dict[str, Any]] = []
+        while start <= end:
+            row = by_start.get(start)
+            points.append({
+                "start": start,
+                "calls": int(row["calls"]) if row else 0,
+                "ok": int(row["ok"] or 0) if row else 0,
+                "input_tokens": int(row["input_tokens"] or 0) if row else 0,
+                "output_tokens": int(row["output_tokens"] or 0) if row else 0,
+                "cost_usd": round(float(row["cost_usd"] or 0.0), 6) if row else 0.0,
+                "avg_duration_ms": int(row["avg_duration_ms"] or 0) if row else 0,
+            })
+            start += width
+        return points
+
     def token_rate(
         self, scope: TenantScope | None = None, *, window_seconds: float = 300.0
     ) -> dict[str, float]:

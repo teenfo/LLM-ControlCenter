@@ -471,6 +471,24 @@
        `test_routing.py::test_certification_is_not_polluted_by_missing_nodes`
 상태   구현됨
 
+### GUARD-14  가드 미리보기 — 잡 없이 판정만
+정의   관리자가 문장을 넣으면 그 테넌트의 규칙(로케일 팩 + 테넌트 규칙, 유예 모드 반영)으로 **판정만** 돌려 보여 준다.
+       잡도, 노드 호출도, 탐지 기록도 남지 않는다 — "이 문장은 어떻게 되나" 를 규칙 표가 아니라 결과로 답하는 자리다.
+표면   `POST /v1/admin/guard/preview` (`prompt` · `system` · `classifier`) · 관제 UI 규칙·가드 탭 맨 위 「가드 미리보기」 카드
+구현   `app/main.py:tenant_guard_preview` · `app/guard.py:Guard.inspect` (실제 요청과 같은 엔진) · `static/app.js:previewCard` `previewResult`
+계약   실제 요청과 같은 엔진·같은 규칙이다 — 여기서 본 것이 곧 요청이 겪는 것이고, 유예 모드면 차단이 마스킹으로 내려앉은 결과가 그대로 보인다
+       응답은 경계별 **전송될 마스킹본**과 걸린 **위치**(원문 오프셋)뿐이다 — 차단된 경계의 본문은 싣지 않고, 걸린 값은 어디에도 되돌려 주지 않는다
+       부수 효과가 없다 — 잡 행도 `filter_events` 도 늘지 않는다(미리보기는 측정이 아니므로 오탐률 표본이 되면 안 된다)
+       `system` 도 따로 본다 · 2단 분류는 기본 꺼짐(`classifier: true` 로 켠다) · 입력은 200,000자까지(넘으면 413)
+       테넌트 관리자 전용 — 서비스 토큰은 403
+고정   `test_api.py::test_the_guard_preview_judges_without_a_job_or_a_detection_record`
+       `test_api.py::test_the_guard_preview_reports_a_block_without_echoing_the_value`
+       `test_api.py::test_the_guard_preview_scans_the_system_field_too`
+       `test_api.py::test_the_guard_preview_follows_grace_mode`
+       `test_api.py::test_the_guard_preview_is_an_admin_tool_with_bounded_input`
+       `test_ui.py::test_the_guard_page_offers_a_preview_that_creates_nothing`
+상태   구현됨
+
 ---
 
 ## 4. 암호화 · 감사
@@ -1187,15 +1205,24 @@
 상태   구현됨
 
 ### OPS-10  사용량 집계
-정의   서비스·엔드유저·역할·노드 축으로 사용량과 지출을 집계한다. 분당 토큰 처리율도 낸다.
-표면   `GET /v1/admin/usage` · `GET /metrics`
-구현   `app/store.py` 사용량 경로 · `app/cost.py`
+정의   서비스·엔드유저·역할·노드 축으로 사용량과 지출을 집계한다. 분당 토큰 처리율도 내고, 시간·일 묶음의 **추이**도 낸다.
+표면   `GET /v1/admin/usage` (`?series=hour|day&offset_minutes=` 로 추이) · `GET /v1/platform/overview` 의 `usage_series`(최근 24시간)
+       · 관제 UI 개요 탭의 「요청 추이 — 최근 24시간」 · 사용량 탭의 요청·토큰 추이(24시간 · 7일 · 30일) · `GET /metrics`
+구현   `app/store.py` 사용량 경로 · `app/store.py:SqliteStore.usage_series` · `app/cost.py` · `static/app.js:trendChart`
 계약   집계는 테넌트 범위를 넘지 않는다 · 처리율은 **보여줄 뿐 한도로 걸지 않는다**
        처리율 창은 낡은 사용량을 배제한다 · 처리율 지표에도 테넌트 라벨이 없다
+       추이는 묶음마다 한 점이고 **빈 묶음도 0 으로 온다** — 화면이 사이를 채우지 않는다 · 일 묶음은 보는 쪽 시간대의 자정으로 끊는다
+       창은 서버가 자른다(시간 묶음 31일 · 일 묶음 400일) · 전 테넌트 추이는 `usage_across_tenants` 와 같은 감사 행에 남는다
+       차트는 축 하나·계열 하나다 — 요청 수에서만 성공 위에 실패를 쌓고, 막대마다 호버로 읽는 줄 하나를 준다
 고정   `test_store.py::test_usage_and_spend_are_scoped`
        `test_idempotency.py::test_the_rate_is_not_a_limit`
        `test_idempotency.py::test_the_rate_window_excludes_old_usage`
        `test_idempotency.py::test_the_metrics_carry_no_tenant_label`
+       `test_api.py::test_usage_comes_with_a_dense_time_series_when_asked`
+       `test_api.py::test_daily_buckets_follow_the_viewers_midnight_and_the_window_is_bounded`
+       `test_api.py::test_the_overview_carries_the_last_24_hours`
+       `test_api.py::test_the_series_bucket_is_a_whitelist`
+       `test_ui.py::test_the_overview_and_usage_pages_draw_a_trend_with_one_axis`
 상태   부분 — 토큰 축 **한도**는 없음, 요청 수 기준만 (D8)
 
 ### OPS-11  클라이언트 페이지
@@ -1207,6 +1234,7 @@
        공용 헬퍼(`t` `applyStaticStrings` `el` `api` `login`)와 테마 토큰은 콘솔에서 글자 그대로 복제하고 테스트가 동일성을 본다 — 공용 모듈은 콘솔의 핀(`import` 금지·함수 순서)이 막는다
        폴링은 서버의 `retry_after` 를 따르고 `setInterval` 을 쓰지 않는다 · 파일은 브라우저 안에서만 읽는다(텍스트 계열 · 2MB) · 문자열은 `client.*` 만 쓰고 죽은 키는 실패한다
        대화는 `POST /v1/chat`(PIPE-10)로 턴 배열을 보낸다 — 오래된 턴부터 잘라 역할의 `max_prompt_chars` 에 맞추되 마지막 사용자 턴은 남긴다(넘치면 서버가 413). 트랜스크립트는 메모리에만 있고, 기록의 턴 말풍선은 `kind` 가 `chat` 인 행의 마스킹본에서만 그린다
+       도우미 답변(요청 결과 · 대화의 도우미 턴 · 기록 상세)은 **제한 마크다운**으로 그린다 — 제목·목록·코드·표·인용·굵게·기울임·`http(s)` 링크만, HTML 은 글자다. 파서는 DOM 을 모르는 순수 함수라 테스트가 node 로 그대로 돌린다 · 사용자 턴은 친 그대로 · 「복사」는 서식 없는 원문을 복사한다
 고정   `test_client_page.py::test_the_client_page_is_served_without_a_build_step`
        `test_client_page.py::test_client_has_no_external_assets`
        `test_client_page.py::test_client_keeps_the_token_in_session_storage_only`
@@ -1217,8 +1245,21 @@
        `test_client_page.py::test_history_renders_chat_transcripts_only_from_the_masked_copy`
        `test_client_page.py::test_client_calls_only_routes_that_exist`
        `test_client_page.py::test_history_shows_masked_prompts_only`
+       `test_client_page.py::test_answers_are_rendered_as_markdown_built_from_nodes`
+       `test_client_page.py::test_the_markdown_parser_reads_the_shapes_models_actually_produce`
        `test_config.py::test_shipped_config_has_a_chat_role_the_client_page_can_use`
 상태   부분 — 스트리밍 없음(G7, 답이 한 번에 온다) · 파일 입력은 텍스트 계열만(PDF 없음)
+
+### OPS-12  시연 시나리오
+정의   제품이 하는 일을 API 로 차례차례 보여 주는 스크립트와, 발표 자리에서 화면을 어떤 순서로 보여 줄지 적은 대본.
+       대시보드를 채우는 트래픽(`--seed`)도 같은 스크립트가 만든다 — 빈 화면으로 발표하지 않기 위해서다.
+표면   `examples/showcase/showcase.py` (장면 1~9 · `--only` · `--seed N`) · [demo-script.md](demo-script.md) (전날 점검 · 장면표 · 비상 계획 · 예상 질문)
+구현   `examples/showcase/showcase.py` — 번들 SDK(META-4) 위에서 돈다
+계약   표준 라이브러리 + 번들 SDK 만 쓴다 · 비밀은 인자·환경으로만 받고 화면에 찍지 않는다
+       역할은 `GET /v1/roles` 에서 **종류**로 고른다(이름은 설치처마다 다르다) — 없는 장면은 건너뛴다
+       데모 프로파일(목 프로바이더)과 실제 설치처에서 같은 스크립트가 돈다 — 예행은 데모에서
+고정   `test_packaging.py::test_the_showcase_script_is_standalone_and_documented`
+상태   구현됨
 
 ---
 
@@ -1641,6 +1682,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `tenant_guard_events` | `GET /v1/admin/guard/events` | GUARD-12 |
 | `tenant_guard_review` | `POST /v1/admin/guard/events/{id}/review` | GUARD-12 |
 | `tenant_guard_promote` | `GET /v1/admin/guard/rules/{id}/promotion` | GUARD-12 |
+| `tenant_guard_preview` | `POST /v1/admin/guard/preview` | GUARD-14 |
 | `tenant_settings` | `GET/PUT /v1/admin/settings` | AUTH-3 DATA-2 CLUSTER-7 |
 | `tenant_overrides` | `GET/POST/DELETE /v1/admin/overrides` | AUTH-7 |
 | `tenant_jobs` | `GET /v1/admin/jobs` | OPS-9 |
@@ -1675,7 +1717,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_model_retarget` | `POST /v1/platform/models/{id}/retarget` | CLUSTER-11 |
 | `platform_model_delete` | `DELETE /v1/platform/nodes/{node}/models/{model}` | CLUSTER-12 |
 | `platform_catalog` | `GET /v1/platform/catalog` | CLUSTER-13 |
-| `platform_overview` | `GET /v1/platform/overview` | OPS-9 |
+| `platform_overview` | `GET /v1/platform/overview` | OPS-9 OPS-10 |
 | `platform_guard_baseline` | `GET /v1/platform/guard/baseline` | GUARD-1 |
 | `platform_grace_mode` | `POST /v1/platform/guard/grace-mode` | GUARD-6 |
 | `platform_evals` | `GET/POST /v1/platform/evals` | GUARD-11 GUARD-13 ROUTE-4 |

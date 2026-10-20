@@ -541,6 +541,153 @@ async function cancelJob(jobId) {
   }
 }
 
+// ── 마크다운(제한) 파서 시작 — 이 블록은 DOM 을 모른다. 테스트가 이 구간을 그대로 node 에서 돌린다.
+
+/**
+ * 모델 답변의 흔한 모양만 읽는다: 제목 · 문단 · 글머리/번호 목록 · 울타리 코드 · 인용 · 구분선 · 표,
+ * 인라인은 코드 · 굵게 · 기울임 · 취소선 · http(s) 링크. HTML 은 해석하지 않고 글자로 둔다.
+ * 결과는 블록 트리(JSON) — 그리는 쪽이 노드로 바꾼다. innerHTML 은 여기에도 저기에도 없다.
+ */
+function parseMarkdown(text) {
+  const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
+  const blocks = [];
+  const FENCE = /^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*)\s*$/;
+  const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+  const RULE = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/;
+  const QUOTE = /^\s{0,3}>\s?/;
+  const ITEM = /^(\s*)([-*+]|\d{1,3}[.)])\s+(.*)$/;
+  const ROW = /^\s*\|.*\|\s*$/;
+  const SEP = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+  const startsBlock = (line) => FENCE.test(line) || HEADING.test(line) || QUOTE.test(line)
+    || ITEM.test(line) || ROW.test(line) || RULE.test(line);
+  const cells = (row) => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => parseInline(c.trim()));
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    let m;
+    if (!line.trim()) { i++; continue; }
+    if ((m = FENCE.exec(line))) {
+      const close = new RegExp('^\\s{0,3}' + m[1][0] + '{' + m[1].length + ',}\\s*$');
+      const buf = [];
+      i++;
+      while (i < lines.length && !close.test(lines[i])) buf.push(lines[i++]);
+      i++;
+      blocks.push({ type: 'code', lang: m[2] || '', text: buf.join('\n') });
+      continue;
+    }
+    if ((m = HEADING.exec(line))) { blocks.push({ type: 'heading', level: m[1].length, inline: parseInline(m[2]) }); i++; continue; }
+    if (RULE.test(line)) { blocks.push({ type: 'rule' }); i++; continue; }
+    if (QUOTE.test(line)) {
+      const buf = [];
+      while (i < lines.length && QUOTE.test(lines[i])) buf.push(lines[i++].replace(QUOTE, ''));
+      blocks.push({ type: 'quote', children: parseMarkdown(buf.join('\n')) });
+      continue;
+    }
+    if (ROW.test(line) && i + 1 < lines.length && SEP.test(lines[i + 1])) {
+      const head = cells(line);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && ROW.test(lines[i])) rows.push(cells(lines[i++]));
+      blocks.push({ type: 'table', head, rows });
+      continue;
+    }
+    if ((m = ITEM.exec(line))) {
+      const ordered = /\d/.test(m[2]);
+      const items = [];
+      while (i < lines.length) {
+        const mm = ITEM.exec(lines[i]);
+        if (mm && /\d/.test(mm[2]) === ordered) { items.push([mm[3]]); i++; continue; }
+        // 들여쓴 이어지는 줄은 앞 항목에 붙는다.
+        if (items.length && !mm && /^\s{2,}\S/.test(lines[i])) { items[items.length - 1].push(lines[i].trim()); i++; continue; }
+        break;
+      }
+      blocks.push({ type: 'list', ordered, items: items.map((parts) => parseInline(parts.join(' '))) });
+      continue;
+    }
+    const buf = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() && !startsBlock(lines[i])) buf.push(lines[i++]);
+    blocks.push({ type: 'paragraph', inline: parseInline(buf.join('\n')) });
+  }
+  return blocks;
+}
+
+/** 인라인 — 코드가 먼저다(안의 기호는 서식이 아니다). 그다음 굵게 · 취소선 · 기울임 · http(s) 링크. */
+function parseInline(text) {
+  const out = [];
+  const re = /(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)|\*\*([^*\n]+)\*\*|__([^_\n]+)__|~~([^~\n]+)~~|\*([^*\n]+)\*|(?<![\w])_([^_\n]+)_(?![\w])|\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push({ t: 'text', v: text.slice(last, m.index) });
+    if (m[2] !== undefined) out.push({ t: 'code', v: m[2] });
+    else if (m[3] !== undefined || m[4] !== undefined) out.push({ t: 'strong', children: parseInline(m[3] !== undefined ? m[3] : m[4]) });
+    else if (m[5] !== undefined) out.push({ t: 'del', children: parseInline(m[5]) });
+    else if (m[6] !== undefined || m[7] !== undefined) out.push({ t: 'em', children: parseInline(m[6] !== undefined ? m[6] : m[7]) });
+    else out.push({ t: 'link', href: m[9], children: parseInline(m[8]) });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push({ t: 'text', v: text.slice(last) });
+  return out;
+}
+
+// ── 마크다운(제한) 파서 끝
+
+/** 블록 트리 → DOM. 글자는 전부 textContent 로 들어간다 — 모델이 무엇을 쓰든 태그가 되지 않는다. */
+function renderMarkdown(text) {
+  const root = el('div', { class: 'md' });
+  for (const block of parseMarkdown(text)) root.appendChild(blockNode(block));
+  return root;
+}
+
+function blockNode(b) {
+  switch (b.type) {
+    // 답변 안의 # 은 화면의 h3 부터 — 페이지 제목과 다투지 않게 두 단계 내린다.
+    case 'heading': return el('h' + Math.min(6, b.level + 2), {}, inlineNodes(b.inline));
+    case 'code': return el('pre', { class: 'code', 'data-lang': b.lang || null }, [el('code', { text: b.text })]);
+    case 'rule': return el('hr');
+    case 'quote': return el('blockquote', {}, b.children.map(blockNode));
+    case 'list': return el(b.ordered ? 'ol' : 'ul', {}, b.items.map((inline) => el('li', {}, inlineNodes(inline))));
+    case 'table': return el('div', { class: 'scroll' }, [el('table', {}, [
+      el('thead', {}, [el('tr', {}, b.head.map((c) => el('th', {}, inlineNodes(c))))]),
+      el('tbody', {}, b.rows.map((r) => el('tr', {}, r.map((c) => el('td', {}, inlineNodes(c)))))),
+    ])]);
+    default: return el('p', {}, inlineNodes(b.inline));
+  }
+}
+
+function inlineNodes(parts) {
+  return (parts || []).map((p) => {
+    if (p.t === 'text') return document.createTextNode(p.v);
+    if (p.t === 'code') return el('code', { text: p.v });
+    if (p.t === 'link') return el('a', { href: p.href, target: '_blank', rel: 'noopener noreferrer' }, inlineNodes(p.children));
+    return el(p.t, {}, inlineNodes(p.children));
+  });
+}
+
+function answerView(text) {
+  return el('div', { class: 'response md-wrap' }, [renderMarkdown(text)]);
+}
+
+/** 복사 — 서식 없는 원문 그대로. 클립보드 API 가 막힌 환경(http · 옛 브라우저)은 선택-복사로 내려간다. */
+function copyButton(text) {
+  return el('button', {
+    type: 'button', class: 'sm copy', text: t('client.copy'),
+    onclick: async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        const scratch = el('textarea', { readonly: true, 'aria-hidden': 'true', class: 'offscreen' });
+        scratch.value = text;
+        document.body.appendChild(scratch);
+        scratch.select();
+        try { document.execCommand('copy'); } finally { scratch.remove(); }
+      }
+      toast(t('client.copied'));
+    },
+  });
+}
+
 function renderPending(p) {
   if (!p) return null;
   return el('section', { class: 'card pending' }, [
@@ -578,9 +725,12 @@ function renderResult(result, error) {
   const j = result.body;
   const failed = j.status !== 'ok';
   return el('section', { class: 'card result' + (failed ? ' bad' : '') }, [
-    el('div', { class: 'card-head' }, [el('h2', { text: t('client.response') }), el('div', { class: 'aside' }, [statusPill(j.status)])]),
+    el('div', { class: 'card-head' }, [el('h2', { text: t('client.response') }), el('div', { class: 'aside' }, [
+      statusPill(j.status), failed ? null : copyButton(j.response || '')])]),
     el('div', { class: 'card-body' }, [
-      el('pre', { class: 'response', text: failed ? (j.error || t(STATUS_LABEL[j.status] || 'client.status_failed')) : (j.response || '') }),
+      failed
+        ? el('pre', { class: 'response', text: j.error || t(STATUS_LABEL[j.status] || 'client.status_failed') })
+        : answerView(j.response || ''),
       guardChips(j.guard_actions),
       el('details', { class: 'meta' }, [
         el('summary', { text: t('client.details') }),
@@ -621,7 +771,10 @@ function renderChat() {
   const log = el('div', { class: 'chat-log', id: 'chat-log' },
     state.chat.turns.length
       ? state.chat.turns.map((turn) => el('div', { class: 'bubble ' + turn.role }, [
-        el('div', { class: 'text', text: turn.text }), turn.guard ? guardChips(turn.guard) : null]))
+        // 도우미 턴만 서식을 푼다 — 사용자가 친 글은 친 그대로 보인다.
+        turn.role === 'assistant' ? el('div', { class: 'text' }, [renderMarkdown(turn.text)]) : el('div', { class: 'text', text: turn.text }),
+        turn.guard ? guardChips(turn.guard) : null,
+        turn.role === 'assistant' ? copyButton(turn.text) : null]))
       : [el('div', { class: 'empty', text: t('client.chat_empty') })]);
   if (state.chat.busy) log.appendChild(el('div', { class: 'bubble assistant pending' }, [el('span', { class: 'dot pulse' }), ' ', t('client.pending')]));
   if (state.chat.error) log.appendChild(el('div', { class: 'bubble error' }, explainError(state.chat.error)));
@@ -768,8 +921,8 @@ function renderDetail(j) {
           el('div', { class: 'who', text: t(m.role === 'user' ? 'client.turn_user' : 'client.turn_assistant') }),
           el('div', { class: 'text', text: m.content })])))
         : el('pre', { class: 'response', text: j.prompt_masked || '' }),
-      j.response ? el('label', { text: t('client.response') }) : null,
-      j.response ? el('pre', { class: 'response', text: j.response }) : null,
+      j.response ? el('div', { class: 'row between' }, [el('label', { text: t('client.response') }), copyButton(j.response)]) : null,
+      j.response ? answerView(j.response) : null,
       guardChips(j.guard_actions),
       el('dl', {}, [
         el('dt', { text: t('client.model') }), el('dd', { class: 'mono', text: (j.model || '—') + (j.tier ? ' · ' + j.tier : '') }),

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -286,3 +287,69 @@ def test_history_shows_masked_prompts_only():
     code = (CLIENT / "client.js").read_text(encoding="utf-8")
     assert "prompt_masked" in code
     assert "/raw" not in code
+
+
+# ── 서식 있는 답변 (OPS-11) ───────────────────────────────────────────────
+
+PARSER_START = "// ── 마크다운(제한) 파서 시작"
+PARSER_END = "// ── 마크다운(제한) 파서 끝"
+
+
+def test_answers_are_rendered_as_markdown_built_from_nodes():
+    """모델 답변은 대개 마크다운이다 — 평문 <pre> 로 보이면 목록·코드·표가 뭉개진다. 그리되 innerHTML 은 없다."""
+    source = (CLIENT / "client.js").read_text(encoding="utf-8")
+    code = strip_comments(source)
+    assert "function parseMarkdown" in code and "function renderMarkdown" in code
+    assert "innerHTML" not in code
+
+    result = block(source, "function renderResult(result, error) {")
+    assert "answerView(j.response" in result and "copyButton(" in result
+    detail = block(source, "function renderDetail(j) {")
+    assert "answerView(j.response)" in detail and "copyButton(j.response)" in detail
+    chat = block(source, "function renderChat() {")
+    assert "renderMarkdown(turn.text)" in chat and "copyButton(turn.text)" in chat
+    assert "turn.role === 'assistant'" in chat, "사용자 턴은 친 그대로 — 서식은 도우미 턴만"
+
+    parser = source[source.index(PARSER_START):source.index(PARSER_END)]
+    assert "https?:" in parser, "링크는 http(s) 만 — javascript: 는 글자로 남는다"
+    assert "document" not in parser and "el(" not in parser, "파서는 DOM 을 몰라야 node 에서 그대로 돌릴 수 있다"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="파서는 node 로 실행해 본다")
+def test_the_markdown_parser_reads_the_shapes_models_actually_produce(tmp_path):
+    source = (CLIENT / "client.js").read_text(encoding="utf-8")
+    parser = source[source.index(PARSER_START):source.index(PARSER_END)]
+    sample = (
+        "# 제목\n\n"
+        "문단 **굵게** 와 `코드` 그리고 [링크](https://example.com) 와 [나쁜](javascript:alert(1))\n\n"
+        "- 하나\n- 둘 *기울임*\n\n"
+        "1. 첫째\n2. 둘째\n\n"
+        "```python\nprint('hi')\n```\n\n"
+        "| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+        "> 인용\n\n"
+        "<b>태그</b>는 글자다"
+    )
+    script = parser + "\nprocess.stdout.write(JSON.stringify(parseMarkdown(" + json.dumps(sample) + ")));\n"
+    path = tmp_path / "parse.js"
+    path.write_text(script, encoding="utf-8")
+    out = subprocess.run(["node", str(path)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    blocks = json.loads(out.stdout)
+
+    assert [b["type"] for b in blocks] == [
+        "heading", "paragraph", "list", "list", "code", "table", "quote", "paragraph",
+    ]
+    assert blocks[0]["level"] == 1 and blocks[0]["inline"] == [{"t": "text", "v": "제목"}]
+    para = blocks[1]["inline"]
+    assert {"t": "code", "v": "코드"} in para
+    assert any(p["t"] == "strong" for p in para)
+    assert [p["href"] for p in para if p["t"] == "link"] == ["https://example.com"]
+    assert "[나쁜](javascript:alert(1))" in "".join(p.get("v", "") for p in para), "javascript: 는 링크가 아니라 글자다"
+    assert blocks[2]["ordered"] is False and len(blocks[2]["items"]) == 2
+    assert any(p["t"] == "em" for p in blocks[2]["items"][1])
+    assert blocks[3]["ordered"] is True and len(blocks[3]["items"]) == 2
+    assert blocks[4] == {"type": "code", "lang": "python", "text": "print('hi')"}
+    assert blocks[5]["head"][0] == [{"t": "text", "v": "a"}]
+    assert blocks[5]["rows"] == [[[{"t": "text", "v": "1"}], [{"t": "text", "v": "2"}]]]
+    assert blocks[6]["children"][0]["type"] == "paragraph"
+    assert blocks[7]["inline"] == [{"t": "text", "v": "<b>태그</b>는 글자다"}]
