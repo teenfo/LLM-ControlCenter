@@ -99,5 +99,7 @@ python examples/showcase/showcase.py --url https://llmcc.example --token "$LCC_T
   ([release-checklist](release-checklist.md) 0.6.0 행). 테넌트 탭이 공개 주소에서도 보인다.
 - 노드는 `macstudio` 하나(Ollama · qwen2.5 7b/14b/32b · bge-m3). 한 노드라 단일 호밍 경고가 역할 수만큼 뜬다 —
   "자동 복제를 안 하니 사람이 본다" 로 설명한다.
-- 0.6.1 업그레이드 때 doctor 가 **가드 유예 모드가 켜져 있다**고 알렸다. 발표 전에 §1 의 결정을 내릴 것.
+- 0.6.1 업그레이드 때 doctor 가 **가드 유예 모드가 켜져 있다**고 알렸고, 2026-10-21 운영자 요청으로 **껐다**
+  (`POST /v1/platform/guard/grace-mode` `{"enabled": false}` · doctor 통과, 알림 0건). 헤더의 빨간 필과 배너는 사라졌다.
+  베이스라인에 block 규칙은 없으므로 장면은 그대로고, 승격한 차단 규칙이 생기면 이제 실제로 막는다.
 - 예제 플러그인 유닛(hosub)은 정지 상태다. 플러그인 탭에는 설치본이 남아 있어 보여 줄 수 있다.
