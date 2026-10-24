@@ -146,6 +146,39 @@ TIERED_RULE = GuardRule(
 # ── 마스킹 ──────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("action,grace", [("full", False), ("partial", False), ("block", True)])
+async def test_context_masking_suppresses_every_classified_field(action, grace):
+    rule = GuardRule(
+        id="finance", kind="llm", action={INTERNAL: "audit", EXTERNAL: action},
+        label="[미공개재무]", description="공시 전 재무 수치", keep_tail=4,
+    )
+
+    async def classifier(text, rules):
+        return {"finance"}
+
+    guard = Guard(make_config((rule,)), classifier=classifier, grace_mode=grace)
+    texts = ["Secret revenue 1234", "Secret margin 5678"]
+    results = await guard.inspect_many(texts, system="Secret forecast 9012")
+
+    assert all(r.prompt_for(EXTERNAL) == rule.label for r in results)
+    assert results[0].systems[EXTERNAL] == rule.label
+    assert [r.prompt_for(INTERNAL) for r in results] == texts
+    assert results[0].systems[INTERNAL] == "Secret forecast 9012"
+    assert all(EXTERNAL in r.allowed_boundaries for r in results)
+    assert sum(len(r.detections) for r in results) == 1
+
+
+async def test_context_masking_single_prompt_without_system():
+    async def classifier(text, rules):
+        return {"finance"}
+
+    guard = Guard(make_config((TIERED_RULE,)), classifier=classifier, grace_mode=True)
+    result = await guard.inspect("Secret revenue 1234")
+    assert result.prompt_for(EXTERNAL) == TIERED_RULE.label
+    assert result.storable_prompt == "Secret revenue 1234"  # internal remains audit
+    assert result.systems[EXTERNAL] is None
+
+
 async def test_full_masking_replaces_the_value():
     guard = Guard(make_config((RRN_RULE,)))
     result = await guard.inspect("제 번호는 900101-1234568 입니다", locales=["ko_KR"])

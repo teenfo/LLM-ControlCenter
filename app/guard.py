@@ -609,6 +609,9 @@ class Guard:
         results: list[GuardResult] = []
         for index, (text, hits) in enumerate(zip(texts, pattern_hits)):
             detections = list(hits) + (llm_detections if index == 0 else [])
+            # The classifier judges the whole conversation without locating spans.
+            # Apply its masking decision to every field, but record the event once.
+            masking_detections = list(hits) + llm_detections
             allowed = {
                 boundary
                 for boundary in boundaries
@@ -626,10 +629,10 @@ class Guard:
             own_system = system if index == 0 else None
             results.append(GuardResult(
                 allowed_boundaries=frozenset(allowed),
-                prompts={b: _apply(text, detections, b) for b in (INTERNAL, EXTERNAL)},
+                prompts={b: _apply(text, masking_detections, b) for b in (INTERNAL, EXTERNAL)},
                 systems={
                     b: (
-                        _apply(own_system, detections, b, field="system_spans")
+                        _apply(own_system, masking_detections, b, field="system_spans")
                         if own_system else None
                     )
                     for b in (INTERNAL, EXTERNAL)
@@ -864,6 +867,10 @@ def _apply(
         if action in ("off", "audit", "block"):
             # audit 은 통과시키되 기록만 한다. block 은 애초에 전송되지 않는다.
             continue
+        if detection.stage == STAGE_LLM:
+            # Context detections have no spans; retaining any field can leak
+            # the classified content (including partial's keep_tail).
+            return detection.label
         for start, end in getattr(detection, field):
             hits.append(
                 (start, end, action, detection.label, detection.keep_tail)
