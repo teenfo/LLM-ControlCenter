@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<!--
+  클라이언트 페이지 — 사람이 LLM 을 쓰는 화면. 관제 UI(/ui/)와 같은 규칙이다:
+  **외부 CDN 을 쓰지 않는다.** 프레임워크도 없다. 자산은 상대 경로다(프록시 접두사 아래서도 뜬다).
+  로그인 전에는 문자열 카탈로그가 비어 있으므로 아래 폴백 텍스트가 첫 화면을 맡는다.
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM ControlCenter</title>
+  <link rel="stylesheet" href="client.css?v=__VERSION__">
+</head>
+<body>
+  <noscript>이 화면은 자바스크립트가 필요합니다.</noscript>
+
+  <!-- 접속 -->
+  <section id="login" hidden>
+    <form id="login-form">
+      <div class="mark" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><rect x="7" y="7" width="10" height="10" rx="2.5"/></svg></div>
+      <h1 data-t="client.sign_in">LLM ControlCenter</h1>
+      <p class="lede" data-t="client.title">문서를 붙여 넣고 요약·분류·분석을 요청합니다. 개인정보는 가드가 가립니다.</p>
+      <!-- 기본은 계정이다. 토큰 접속은 자동화·테스트용으로 남겨 두고 한 번 눌러 연다. -->
+      <div id="account-fields">
+        <label for="username" data-t="client.username">아이디</label>
+        <input id="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false">
+        <label for="password" data-t="client.password">비밀번호</label>
+        <input id="password" type="password" autocomplete="current-password">
+        <p class="hint" data-t="client.login_hint">관리자가 만들어 준 계정으로 로그인합니다. 세션은 12시간 뒤 만료됩니다.</p>
+      </div>
+      <div id="token-fields" hidden>
+        <label for="token" data-t="client.token">서비스 토큰</label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false">
+        <p class="hint" data-t="client.token_hint">서비스 토큰은 자동화·테스트용입니다.</p>
+        <label for="end-user" data-t="client.end_user">이름</label>
+        <input id="end-user" type="text" autocomplete="off" spellcheck="false">
+        <p class="hint" id="end-user-hint" data-t="client.end_user_hint">토큰으로 접속할 때는 이름이 필요합니다. 기록과 사용량이 이 이름 단위로 잡힙니다.</p>
+      </div>
+      <div class="actions">
+        <button type="submit" class="primary" data-t="client.connect">접속</button>
+        <button type="button" id="login-mode-token" class="link" data-t="client.use_token">토큰으로 접속</button>
+        <button type="button" id="login-mode-account" class="link" data-t="client.use_account" hidden>계정으로 접속</button>
+      </div>
+      <p id="login-error" class="error" role="alert" hidden></p>
+    </form>
+  </section>
+
+  <!-- 화면 -->
+  <div id="shell" hidden>
+    <header class="top">
+      <div class="brand"><span class="mark" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><rect x="7" y="7" width="10" height="10" rx="2.5"/></svg></span><span id="brand">LLM ControlCenter</span></div>
+      <nav id="tabs" aria-label="pages"></nav>
+      <div class="identity"><span id="who"></span></div>
+      <button type="button" id="theme" class="ghost" data-t-title="client.theme_toggle" title="테마 전환"></button>
+      <button type="button" id="logout" class="ghost" data-t="client.logout">로그아웃</button>
+    </header>
+    <main id="view" aria-live="polite"></main>
+    <div id="toast" role="status" hidden></div>
+    <p id="error" class="error" role="alert" hidden></p>
+  </div>
+
+  <script src="client.js?v=__VERSION__"></script>
+</body>
+</html>
