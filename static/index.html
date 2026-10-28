@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<!--
+  관제 UI.
+
+  **외부 CDN 을 쓰지 않는다.** 에어갭 설치에서 화면이 깨지고, 인터넷이 있는
+  설치에서도 남의 사이트 개편에 우리 UI 가 끌려 죽는다. 프레임워크도 없다 —
+  의존성 5개를 이식성의 근거로 삼은 제품이 프런트에서 그것을 버릴 이유가 없다.
+
+  구조는 디자인 핸드오프(2026-09)의 것이다: 좌측 아이콘 레일 · 56px 헤더 · 카드 본문 ·
+  우측 드로어 · 하단 토스트. 레일 항목과 페이지는 app.js 가 세션의 역할로 그린다.
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM ControlCenter</title>
+  <link rel="stylesheet" href="style.css?v=__VERSION__">
+</head>
+<body>
+  <noscript>이 관제 화면은 자바스크립트가 필요합니다.</noscript>
+
+  <!-- 접속 -->
+  <section id="login" hidden>
+    <form id="login-form">
+      <div class="mark" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><rect x="7" y="7" width="10" height="10" rx="2.5"/></svg></div>
+      <h1 data-t="ui.sign_in">LLM ControlCenter</h1>
+      <!-- 기본은 계정이다. 토큰 접속은 서비스·운영 자동화용으로 남겨 두고 한 번 눌러 연다. -->
+      <div id="account-fields">
+        <label for="username" data-t="ui.username">아이디</label>
+        <input id="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false">
+        <label for="password" data-t="ui.password">비밀번호</label>
+        <input id="password" type="password" autocomplete="current-password">
+        <p class="hint" data-t="ui.login_hint">관리자 계정으로 로그인합니다. 세션은 12시간 뒤 만료됩니다.</p>
+      </div>
+      <div id="token-fields" hidden>
+        <label for="token" data-t="ui.token">토큰</label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false">
+        <p class="hint" data-t="ui.token_hint">부트스트랩이 1회 표시한 토큰을 붙여 넣으세요.</p>
+      </div>
+      <div class="actions">
+        <button type="submit" class="primary" data-t="ui.connect">접속</button>
+        <button type="button" id="login-mode-token" class="link" data-t="ui.use_token">토큰으로 접속</button>
+        <button type="button" id="login-mode-account" class="link" data-t="ui.use_account" hidden>계정으로 접속</button>
+      </div>
+      <p id="login-error" class="error" role="alert" hidden></p>
+    </form>
+  </section>
+
+  <!-- 관제 -->
+  <div id="shell" hidden>
+    <nav id="rail" aria-label="LLM ControlCenter">
+      <div class="logo"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><rect x="7" y="7" width="10" height="10" rx="2.5"/></svg><span class="sr-only" data-t="ui.title">LLM ControlCenter</span></div>
+      <div id="tabs"></div>
+      <button type="button" id="theme" class="rail-btn" data-t-title="ui.theme_toggle" title="테마 전환"></button>
+      <button type="button" id="avatar" class="avatar" title=""></button>
+    </nav>
+
+    <div class="frame">
+      <header>
+        <div class="titles">
+          <div id="page-title"></div>
+          <div id="page-sub"></div>
+        </div>
+        <div id="pills"></div>
+        <div class="identity"><span id="who"></span><span id="version" class="mono"></span></div>
+        <button type="button" id="refresh" data-t="ui.refresh">새로고침</button>
+        <button type="button" id="logout" data-t="ui.disconnect">연결 해제</button>
+      </header>
+
+      <main id="main">
+        <div class="page">
+          <div id="banners" role="status"></div>
+          <div id="view" aria-live="polite"></div>
+        </div>
+      </main>
+
+      <div id="drawer-overlay" hidden></div>
+      <aside id="drawer" hidden aria-modal="true" role="dialog">
+        <header><h2 id="drawer-title"></h2><button type="button" id="drawer-close" aria-label="close">×</button></header>
+        <div id="drawer-body"></div>
+        <div id="drawer-foot"></div>
+      </aside>
+
+      <div id="toast" role="status" hidden></div>
+      <p id="error" class="error" role="alert" hidden></p>
+    </div>
+  </div>
+
+  <script src="app.js?v=__VERSION__"></script>
+</body>
+</html>
