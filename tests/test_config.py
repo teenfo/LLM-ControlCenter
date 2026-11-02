@@ -294,7 +294,7 @@ def test_shipped_config_loads():
 
 
 def test_shipped_config_has_no_baseline_block_rules():
-    """베이스라인에 block 이 없다.
+    """베이스라인에 전 티어 block 이 없다.
 
     새 규칙을 바로 block 으로 켜면 오탐이 프로덕션을 세우고, 그러면 관리자가 규칙을 꺼버린다.
     차단은 설치처가 자기 데이터를 보고 결정할 일이다.
