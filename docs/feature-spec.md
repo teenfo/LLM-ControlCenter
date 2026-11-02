@@ -330,13 +330,25 @@
 
 ### GUARD-2  체크섬 검증
 정의   숫자 형식만 맞는 값과 진짜 값을 가른다. Luhn(카드) · 주민번호 · 사업자번호 · 마이넘버 · IBAN.
-표면   `config/guard.yaml` 규칙의 `checksum` 키
-구현   `app/guard.py:luhn` `kr_rrn` `kr_biz` `jp_mynumber` `iban_mod97`
-계약   설정에 적힌 모든 체크섬은 실제 구현이 있다 · 체크섬 실패 시 본문을 건드리지 않는다
+       체크섬이 틀려도 **바로 앞에 문맥 단서**("카드번호" 같은 말)가 붙어 있으면 되살린다(0.7.2) — 옮겨 적다 틀린
+       번호·지어낸 번호는 Luhn 을 못 지나지만, 사람이 그것을 카드번호라고 말해 준 것이다.
+표면   `config/guard.yaml` 규칙의 `checksum` · `checksum_failed_action` · `context` · `context_window` · `context_action` 키
+구현   `app/guard.py:luhn` `kr_rrn` `kr_biz` `jp_mynumber` `iban_mod97` `Guard._match_spans` · `app/config.py:_guard_context_from_dict`
+계약   설정에 적힌 모든 체크섬은 실제 구현이 있다 · 체크섬 실패 시 본문을 건드리지 않는다 — 단서가 바로 앞에 있을 때만 예외
        한국어 조사가 붙은 표기(`주민번호는123456-1234567입니다`)도 잡는다
+       확신도마다 규칙 id 가 따로다 — 통과 `<id>` · 단서 `<id>:context` · 실패 `<id>:unverified`
+       단서 없는 체크섬 실패는 예전처럼 버린다(주문번호가 카드가 되지 않는다) · 단서도 정규화본에서 찾는다
+       체크섬 없는 단서 · 빈 문자열에 걸리는 단서 · 등급을 안 적은 단서는 기동 시점에 거절한다
+       유예 모드는 단서·실패 등급의 `block` 도 `full` 로 내린다
 고정   `test_guard.py::test_every_configured_checksum_has_an_implementation`
        `test_guard.py::test_checksum_suppresses_false_positives_in_real_config`
        `test_guard.py::test_checksum_failure_leaves_text_untouched`
+       `test_guard.py::test_a_luhn_failing_card_right_after_the_word_card_is_masked`
+       `test_guard.py::test_the_card_word_rescues_common_phrasings`
+       `test_guard.py::test_without_the_word_right_before_a_luhn_failure_is_still_dropped`
+       `test_guard.py::test_the_context_rescue_is_a_third_confidence`
+       `test_guard.py::test_grace_mode_softens_the_extra_grades_too`
+       `test_config.py::test_guard_context_clues_are_validated_at_startup`
 상태   구현됨
 
 ### GUARD-3  2단 LLM 맥락 분류

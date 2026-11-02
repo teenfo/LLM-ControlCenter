@@ -234,6 +234,39 @@ def test_llm_rule_requires_description(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        ("context_action: full", "context 없이"),                      # 단서 없는 등급
+        ("context: '카드\\s*$'\n  context_action: full", "checksum 없이"),
+        ("checksum: luhn\n  context: '(?:카드)?'\n  context_action: full", "빈 문자열"),
+        ("checksum: luhn\n  context: '카드\\s*$'", "context_action"),   # 등급을 안 적었다
+        ("checksum: luhn\n  context: '카드\\s*$'\n  context_action: full\n  context_window: 0",
+         "context_window"),
+        ("checksum: luhn\n  context: '(카드'\n  context_action: full", "정규식"),
+    ],
+    ids=["단서없는등급", "체크섬없음", "빈문자열", "등급없음", "창크기", "깨진정규식"],
+)
+def test_guard_context_clues_are_validated_at_startup(tmp_path, extra, message):
+    """문맥 단서는 체크섬이 버린 매치를 되살린다 — 잘못 적으면 체크섬을 둔 의미가 사라진다."""
+    rule = "- id: card\n  kind: pattern\n  pattern: '\\d{13,19}'\n  action: full\n  " + extra
+    body = "locale_packs:\n  common:\n    rules:\n" + textwrap.indent(rule, "      ") + "\n"
+    with pytest.raises(ConfigError, match=message):
+        load_config(write_config(tmp_path, **{"guard.yaml": body}))
+
+
+def test_guard_context_window_defaults_when_omitted(tmp_path):
+    rule = (
+        "- id: card\n  kind: pattern\n  pattern: '\\d{13,19}'\n  action: full\n"
+        "  checksum: luhn\n  context: '카드\\s*$'\n  context_action: full"
+    )
+    body = "locale_packs:\n  common:\n    rules:\n" + textwrap.indent(rule, "      ") + "\n"
+    cfg = load_config(write_config(tmp_path, **{"guard.yaml": body}))
+
+    (card,) = [r for r in cfg.guard_rules if r.id == "card"]
+    assert card.context_window > 0 and card.context_action == "full"
+
+
 # ── 오버라이드 ──────────────────────────────────────────────────────────────
 
 

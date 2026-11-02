@@ -847,6 +847,154 @@ def test_the_shipped_rrn_rule_covers_foreign_registration_numbers():
     assert rule.checksum_failed_action == "audit", "체크섬 실패를 통째로 버리고 있다"
 
 
+# ── 문맥 단서 — 체크섬이 틀린 카드번호가 기록도 없이 통과했다 ──────────────────
+#
+# "홍길동 고객의 카드번호 2222-2222-0222-2222 으로 조회 해줘" 가 그대로 노드로 갔다
+# (2026-11-02, 시연 준비 중 실측). Luhn 이 틀린 번호라 "카드 아님" 으로 버려졌고,
+# 카드 규칙에는 체크섬 실패를 남기는 칸도 없었다. 사람이 지어낸 번호는 열에 아홉이
+# 그렇다. "카드번호" 라는 말이 바로 앞에 있으면 그것이 카드번호라는 신호다.
+
+REPORTED_CARD_PROMPT = "홍길동 고객의 카드번호 2222-2222-0222-2222 으로 조회 해줘"
+
+
+async def test_a_luhn_failing_card_right_after_the_word_card_is_masked():
+    """신고된 문장 그대로, 번들 설정 그대로 — 밖으로 나가는 텍스트를 본다."""
+    from app.config import load_config
+    from app.guard import CONTEXT_SUFFIX, Guard
+
+    assert luhn("2222-2222-0222-2222") is False, "전제: 체크섬이 틀린 번호다"
+    guard = Guard(load_config(REPO_CONFIG))
+    verdict = await guard.inspect(
+        REPORTED_CARD_PROMPT, candidate_boundaries=("internal", "external"), locales=("ko_KR",),
+    )
+
+    for boundary, masked in verdict.prompts.items():
+        assert "2222-2222-0222-2222" not in masked, f"{boundary} 로 원문이 나갔다: {masked!r}"
+        assert masked == "홍길동 고객의 카드번호 [카드번호] 으로 조회 해줘", masked
+    rescued = next(d for d in verdict.detections if d.rule_id == f"credit_card{CONTEXT_SUFFIX}")
+    assert set(rescued.actions.values()) == {"full"}
+
+
+@pytest.mark.parametrize("text", [
+    "카드번호는 1234-5678-9012-3456입니다",
+    "카드 번호: 1234 5678 9012 3456",
+    "신용카드 1234567890123456 로 결제",
+    "my card number is 1234 5678 9012 3456",
+    "카드번호：１２３４－５６７８－９０１２－３４５６",   # 전각 — 단서도 정규화본에서 찾는다
+])
+async def test_the_card_word_rescues_common_phrasings(text):
+    from app.config import load_config
+    from app.guard import Guard
+
+    guard = Guard(load_config(REPO_CONFIG))
+    verdict = await guard.inspect(text, candidate_boundaries=("external",), locales=("ko_KR",))
+
+    assert {d.rule_id for d in verdict.detections} == {"credit_card:context"}, text
+    assert "[카드번호]" in verdict.prompts["external"]
+    assert not re.search(r"\d{4}", verdict.prompts["external"]), verdict.prompts["external"]
+
+
+@pytest.mark.parametrize("text", [
+    "주문번호 2222-2222-0222-2222 확인",           # 단서가 없다
+    "카드 결제 주문번호 2024110212345678 확인",     # 단서와 숫자 사이에 다른 말이 낀다
+    "카드번호와 주문번호 2024110212345678 확인",
+    "숫자 1234567890123456 입니다",
+])
+async def test_without_the_word_right_before_a_luhn_failure_is_still_dropped(text):
+    """**단서가 붙어 있을 때만** 되살린다 — 주문번호·타임스탬프가 카드가 되면 안 된다."""
+    from app.config import load_config
+    from app.guard import Guard
+
+    guard = Guard(load_config(REPO_CONFIG))
+    verdict = await guard.inspect(text, candidate_boundaries=("external",), locales=("ko_KR",))
+
+    assert not [d for d in verdict.detections if d.rule_id.startswith("credit_card")], text
+    assert verdict.prompts["external"] == text
+
+
+async def test_a_luhn_valid_card_keeps_its_own_rule_id():
+    """체크섬을 통과한 번호는 단서가 있어도 예전 그대로 `credit_card` 다."""
+    from app.config import load_config
+    from app.guard import Guard
+
+    guard = Guard(load_config(REPO_CONFIG))
+    verdict = await guard.inspect(
+        "카드번호 4111-1111-1111-1111입니다", candidate_boundaries=("external",), locales=("ko_KR",),
+    )
+
+    assert {d.rule_id for d in verdict.detections} == {"credit_card"}
+
+
+CARD_WITH_CLUES = dict(
+    id="card", kind="pattern", action="full", label="[카드]",
+    pattern=r"(?<![A-Za-z0-9_-])(?:\d[ -]?){12,18}\d(?![A-Za-z0-9_-])", checksum="luhn",
+    context=r"카드\s*$", context_window=8, locale_pack="common",
+)
+
+
+def test_the_context_rescue_is_a_third_confidence():
+    """통과·단서·실패 — 확신도가 셋이면 id 도 셋이다. 승격 게이트의 표본이 안 섞인다."""
+    from app.config import GuardRule
+    from app.guard import Guard
+
+    rule = GuardRule(**CARD_WITH_CLUES, context_action="full", checksum_failed_action="audit")
+    guard = Guard(make_config((rule,)))
+    detections = guard._scan(
+        "카드 4111111111111111, 카드 1234567890123456, 주문 2024110212345678", None, (rule,)
+    )
+
+    assert {d.rule_id: set(d.actions.values()) for d in detections} == {
+        "card": {"full"}, "card:context": {"full"}, "card:unverified": {"audit"},
+    }
+
+
+def test_the_clue_must_sit_inside_the_window():
+    """창 밖의 단서는 단서가 아니다 — 앞 문장의 "카드" 가 뒤의 숫자를 카드로 만들면 안 된다."""
+    from app.config import GuardRule
+    from app.guard import Guard
+
+    rule = GuardRule(**{**CARD_WITH_CLUES, "context": "카드"}, context_action="full")
+    guard = Guard(make_config((rule,)))
+
+    assert guard._scan("카드 아홉글자짜리문장 1234567890123456", None, (rule,)) == []
+    assert [d.rule_id for d in guard._scan("카드 1234567890123456", None, (rule,))] == [
+        "card:context"
+    ]
+
+
+def test_context_action_off_rescues_nothing():
+    """`off` 는 끈 것이다 — 단서가 있어도 체크섬 실패의 기본 처리(버림)로 간다."""
+    from app.config import GuardRule
+    from app.guard import Guard
+
+    rule = GuardRule(**CARD_WITH_CLUES, context_action="off")
+    guard = Guard(make_config((rule,)))
+
+    assert guard._scan("카드 1234567890123456", None, (rule,)) == []
+
+
+async def test_grace_mode_softens_the_extra_grades_too():
+    """유예 모드는 block 을 full 로 내린다 — 체크섬 실패·단서 등급도 같은 사다리다."""
+    from app.config import GuardRule
+    from app.guard import Guard
+
+    rule = GuardRule(**CARD_WITH_CLUES, context_action="block", checksum_failed_action="block")
+    guard = Guard(make_config((rule,)), grace_mode=True)
+    verdict = await guard.inspect("카드 1234567890123456, 주문 2024110212345678")
+
+    assert verdict.blocked is False, "유예 중인데 막았다"
+    actions = {d.rule_id: set(d.actions.values()) for d in verdict.detections}
+    assert actions == {"card:context": {"full"}, "card:unverified": {"full"}}
+
+
+def test_the_shipped_card_rule_carries_a_context_clue():
+    from app.config import load_config
+
+    rule = next(r for r in load_config(REPO_CONFIG).guard_rules if r.id == "credit_card")
+
+    assert rule.context and rule.context_action == "full", "체크섬이 틀린 카드번호가 다시 그냥 지나간다"
+
+
 # ── 감사 LOW — 유니코드로 패턴을 빠져나간다 ─────────────────────────────────
 #
 # 전각 하이픈·NBSP·zero-width 를 끼워 넣으면 사람 눈에는 같은 번호인데 정규식은

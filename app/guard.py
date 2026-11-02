@@ -44,6 +44,10 @@ STAGE_PATTERN = "pattern"
 #: 뭉치면 승격 게이트의 오탐률 표본이 섞이고 관제 UI 가 둘을 구분하지 못한다.
 UNVERIFIED_SUFFIX = ":unverified"
 
+#: 체크섬은 틀렸지만 바로 앞에 **문맥 단서**("카드번호" 같은 말)가 있는 매치의 접미사.
+#: 체크섬 통과도, 그냥 실패도 아닌 세 번째 확신도라서 세 번째 id 다 — 이유는 위와 같다.
+CONTEXT_SUFFIX = ":context"
+
 #: 검사 전에 지우는 문자. **보이지 않으면서 패턴만 깨뜨린다** — 주민번호 사이에
 #: zero-width space 하나를 넣으면 사람 눈에는 그대로인데 정규식은 안 걸린다.
 INVISIBLE_CHARS = frozenset("\u200b\u200c\u200d\u2060\ufeff\u00ad")
@@ -734,10 +738,15 @@ class Guard:
             if rule.kind != "pattern" or not rule.pattern:
                 continue
             compiled = self._compile(rule.pattern)
+            context_action = rule.context_action
+            rescues = bool(rule.context) and context_action not in (None, "off")
+            context = self._compile(rule.context) if rescues else None
 
-            spans, unverified = self._match_spans(compiled, rule, normalized_prompt)
-            system_spans, system_unverified = self._match_spans(
-                compiled, rule, normalized_system
+            spans, contextual, unverified = self._match_spans(
+                compiled, rule, normalized_prompt, context
+            )
+            system_spans, system_contextual, system_unverified = self._match_spans(
+                compiled, rule, normalized_system, context
             )
 
             if spans or system_spans:
@@ -750,6 +759,20 @@ class Guard:
                         },
                         spans=tuple(spans),
                         system_spans=tuple(system_spans),
+                        label=rule.label or f"[{rule.id}]",
+                        keep_tail=rule.keep_tail,
+                    )
+                )
+
+            # 체크섬은 틀렸지만 단서가 붙어 있는 매치 — "카드번호 2222-…" 처럼 사람이
+            # 그것을 카드번호라고 말해 준 경우다. 단서 없는 실패와 섞지 않는다.
+            if contextual or system_contextual:
+                detections.append(
+                    Detection(
+                        rule_id=f"{rule.id}{CONTEXT_SUFFIX}", stage=STAGE_PATTERN,
+                        actions={INTERNAL: context_action, EXTERNAL: context_action},
+                        spans=tuple(contextual),
+                        system_spans=tuple(system_contextual),
                         label=rule.label or f"[{rule.id}]",
                         keep_tail=rule.keep_tail,
                     )
@@ -780,21 +803,28 @@ class Guard:
         """
         if rule.kind != "pattern" or not rule.pattern:
             return 0
-        verified, _ = self._match_spans(
+        verified, _, _ = self._match_spans(
             self._compile(rule.pattern), rule, normalize_for_match(text)
         )
         return len(verified)
 
     @staticmethod
     def _match_spans(
-        compiled: re.Pattern[str], rule: GuardRule, normalized: Normalized
-    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-        """(체크섬을 통과한 스팬, 통과하지 못한 스팬).
+        compiled: re.Pattern[str],
+        rule: GuardRule,
+        normalized: Normalized,
+        context: re.Pattern[str] | None = None,
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]]]:
+        """(체크섬을 통과한 스팬, 체크섬은 틀렸지만 문맥 단서가 앞에 있는 스팬, 나머지 실패 스팬).
 
-        둘을 나누는 이유: 체크섬 불일치를 **버리는 것**이 기본이지만 늘 맞지는
+        나누는 이유: 체크섬 불일치를 **버리는 것**이 기본이지만 늘 맞지는
         않다. 버리면 숫자 나열이 전부 PII 가 되는 오탐 홍수를 막는 대신,
         체크섬 자체가 성립하지 않게 된 식별자 체계(2020-10 이후 주민등록번호)를
         통째로 놓친다. 나눠서 돌려주면 규칙이 그 둘에 다른 등급을 줄 수 있다.
+
+        **단서는 정규화본에서, 매치 바로 앞 `context_window` 글자 안에서 찾는다.**
+        잘라 붙이지 않고 `search(…, pos, endpos)` 로 찾으므로 단서 정규식의 `$` 는
+        "매치 바로 앞" 에 걸린다. `context` 가 `None` 이면 둘째 칸은 늘 비어 있다.
 
         **정규화본을 받는다 — 여기서 정규화하지 않는다.** 정규화는 텍스트의 성질이지
         규칙의 성질이 아니라서, 규칙마다 다시 하면 같은 일을 규칙 수만큼 반복한다.
@@ -802,7 +832,7 @@ class Guard:
         """
         haystack, index = normalized
         if not haystack:
-            return [], []
+            return [], [], []
 
         def to_source(span: tuple[int, int]) -> tuple[int, int]:
             if index is None:
@@ -822,16 +852,24 @@ class Guard:
             return [
                 to_source(m.span())
                 for m in compiled.finditer(haystack) if m.start() != m.end()
-            ], []
+            ], [], []
 
         verified: list[tuple[int, int]] = []
+        contextual: list[tuple[int, int]] = []
         unverified: list[tuple[int, int]] = []
         for match in compiled.finditer(haystack):
             if match.start() == match.end():
                 continue
-            target = verified if validator(match.group(0)) else unverified
+            if validator(match.group(0)):
+                target = verified
+            elif context is not None and context.search(
+                haystack, max(0, match.start() - rule.context_window), match.start()
+            ):
+                target = contextual
+            else:
+                target = unverified
             target.append(to_source(match.span()))
-        return verified, unverified
+        return verified, contextual, unverified
 
     def _apply_classifier_failure(self, boundaries: frozenset[str]) -> frozenset[str]:
         policy = self._settings.on_classifier_error
@@ -949,15 +987,22 @@ def _downgraded(rule: GuardRule) -> GuardRule:
     def soften(action: str) -> str:
         return GRACE_FALLBACK if action == "block" else action
 
+    changes: dict[str, Any] = {}
     if isinstance(rule.action, str):
-        if rule.action != "block":
-            return rule
-        return replace(rule, action=GRACE_FALLBACK)
+        if rule.action == "block":
+            changes["action"] = GRACE_FALLBACK
+    else:
+        lowered = {b: soften(a) for b, a in rule.action.items()}
+        if lowered != dict(rule.action):
+            changes["action"] = lowered
 
-    lowered = {b: soften(a) for b, a in rule.action.items()}
-    if lowered == dict(rule.action):
-        return rule
-    return replace(rule, action=lowered)
+    # 체크섬 실패·문맥 단서 매치의 등급도 같은 사다리다. 여기서 빠지면 유예 중에도
+    # `kr_rrn:unverified` 나 `credit_card:context` 를 block 으로 올린 설치처는 막힌다.
+    for field in ("checksum_failed_action", "context_action"):
+        if getattr(rule, field) == "block":
+            changes[field] = GRACE_FALLBACK
+
+    return replace(rule, **changes) if changes else rule
 
 
 def _stronger_of(baseline: GuardRule, candidate: GuardRule) -> GuardRule:

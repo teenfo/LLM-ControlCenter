@@ -33,6 +33,12 @@ DEFAULT_MAX_PROMPT_CHARS = 200_000
 
 GUARD_ACTIONS = ("off", "audit", "partial", "full", "block")
 
+#: 문맥 단서를 찾는 범위(매치 시작 앞 글자 수)의 기본값과 상한. 단서는 "카드번호: "
+#: 처럼 매치에 붙어 있을 때만 신호다 — 멀리까지 보면 앞 문장의 "카드" 가 뒤 문장의
+#: 주문번호를 카드로 만든다.
+DEFAULT_CONTEXT_WINDOW = 24
+MAX_CONTEXT_WINDOW = 200
+
 #: `partial` 등급이 남길 수 있는 뒷자리의 상한.
 #:
 #: 상한이 없으면 `keep_tail: 100` 같은 값이 통과하고, 그 규칙은 **값 전체를 남기는
@@ -200,6 +206,19 @@ class GuardRule:
     #: 체크섬을 없애면 오탐이 쏟아져 관리자가 규칙을 꺼버리고(C2), 그대로 두면
     #: 진짜 PII 가 샌다. 그래서 **세 번째 칸**을 둔다 — `audit` 로 남겨서 보이게 한다.
     checksum_failed_action: str | None = None
+    #: 체크섬이 틀린 매치를 되살리는 **문맥 단서**(정규식). 매치 시작 앞
+    #: `context_window` 글자 안에서 찾고, 걸리면 그 매치를 `<id>:context` 로
+    #: `context_action` 등급에 태운다. 끝을 `$` 로 묶으면 "바로 앞" 이 된다.
+    #:
+    #: 체크섬은 오탐을 막지만, 사람이 옮겨 적다 한 자리 틀린 카드번호나 시험 삼아
+    #: 지어낸 번호도 같이 버린다 — 무작위 16자리의 열에 아홉이 Luhn 을 못 지난다.
+    #: "고객의 카드번호 2222-2222-0222-2222" 가 그렇게 기록도 없이 통과했다.
+    #: 체크섬을 빼면 주문번호·타임스탬프가 전부 카드가 되므로, 둘을 가르는 신호를
+    #: 숫자 밖에서 — **"카드번호" 라는 말** 에서 — 얻는다. 상용 DLP 의 근접
+    #: 키워드(hotword)와 같은 발상이다.
+    context: str | None = None
+    context_window: int = 0
+    context_action: str | None = None
     keep_tail: int = 0
     description: str | None = None
     #: 이 규칙이 속한 로케일 팩. common 은 항상 켜진다.
@@ -519,6 +538,8 @@ def _guard_rule_from_dict(raw: Mapping[str, Any], locale_pack: str) -> GuardRule
                 f"가드 규칙 {rule_id}: checksum_failed_action 은 {GUARD_ACTIONS} 중 하나여야 한다"
             )
 
+    context, context_window, context_action = _guard_context_from_dict(raw, str(rule_id))
+
     return GuardRule(
         id=str(rule_id),
         kind=kind,
@@ -527,10 +548,60 @@ def _guard_rule_from_dict(raw: Mapping[str, Any], locale_pack: str) -> GuardRule
         pattern=pattern,
         checksum=raw.get("checksum"),
         checksum_failed_action=failed_action,
+        context=context,
+        context_window=context_window,
+        context_action=context_action,
         keep_tail=int(raw.get("keep_tail", 0)),
         description=raw.get("description"),
         locale_pack=locale_pack,
     )
+
+
+def _guard_context_from_dict(
+    raw: Mapping[str, Any], rule_id: str
+) -> tuple[str | None, int, str | None]:
+    """`context`·`context_window`·`context_action` 세 키를 함께 읽고 검증한다."""
+    context = raw.get("context")
+    window = raw.get("context_window")
+    action = raw.get("context_action")
+
+    if context is None:
+        if window is not None or action is not None:
+            raise ConfigError(
+                f"가드 규칙 {rule_id}: context 없이 context_window·context_action 은 의미가 없다"
+            )
+        return None, 0, None
+
+    if not raw.get("checksum"):
+        raise ConfigError(
+            f"가드 규칙 {rule_id}: checksum 없이 context 는 의미가 없다 — "
+            "체크섬이 없으면 모든 매치가 이미 탐지다"
+        )
+    try:
+        compiled = re.compile(str(context))
+    except re.error as exc:
+        raise ConfigError(f"가드 규칙 {rule_id}: context 정규식이 잘못됐다 — {exc}") from exc
+    if compiled.search("") is not None:
+        # 빈 문자열에 걸리는 단서는 어디에나 있다 — 체크섬이 틀린 매치가 전부
+        # 되살아나 체크섬을 둔 의미가 사라진다.
+        raise ConfigError(
+            f"가드 규칙 {rule_id}: context 가 빈 문자열에도 걸린다 — 단서가 될 수 없다"
+        )
+    if action not in GUARD_ACTIONS:
+        # 되살린 매치를 어떤 등급으로 다룰지는 규칙을 쓴 사람이 정한다. 기본값을
+        # 두면 본 등급(`full`)을 물려받는지 `audit` 인지가 설정만 봐서는 안 보인다.
+        raise ConfigError(
+            f"가드 규칙 {rule_id}: context 를 쓰면 context_action 을 {GUARD_ACTIONS} 중 하나로 적어야 한다"
+        )
+    if window is None:
+        window = DEFAULT_CONTEXT_WINDOW
+    if isinstance(window, bool) or not isinstance(window, int) or not (
+        1 <= window <= MAX_CONTEXT_WINDOW
+    ):
+        raise ConfigError(
+            f"가드 규칙 {rule_id}: context_window 는 1~{MAX_CONTEXT_WINDOW} 사이 정수여야 한다"
+        )
+    return str(context), window, str(action)
 
 
 def _load_guard(

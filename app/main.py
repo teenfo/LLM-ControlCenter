@@ -101,7 +101,7 @@ from .store import (
     TenantScope,
 )
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
