@@ -5,44 +5,42 @@
  * 이 화면에 필요한 것만 다시 적었다(관제 CSS 를 통째로 링크하지 않는다 — 수명이 다르다). */
 
 :root {
-  --bg: #f3f4f6; --surface: #ffffff; --surface2: #f7f8fa; --border: #e4e7eb;
-  --text: #15181e; --muted: #6b7280;
-  --accent: oklch(52% 0.16 255); --accent-fg: #ffffff; --accent-soft: oklch(94% 0.03 255);
-  --ok: oklch(52% 0.15 155); --ok-soft: oklch(94% 0.05 155);
-  --warn: oklch(58% 0.15 70); --warn-soft: oklch(95% 0.06 80);
-  --danger: oklch(54% 0.19 25); --danger-soft: oklch(95% 0.04 25);
-  --info: oklch(52% 0.12 230); --info-soft: oklch(94% 0.03 230);
-  --rail: #111318; --rail-fg: #a3a9b5;
-  --code: #eef0f3; --shadow: 0 1px 2px rgba(16, 20, 28, .06);
-  --lane-batch: oklch(70% 0.1 200);
-  --sans: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
-  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --bg: oklch(98% 0.006 85); --surface: oklch(99.4% 0.004 85); --surface2: oklch(95.3% 0.008 85);
+  --border: oklch(89.5% 0.008 85); --border-2: oklch(80.5% 0.010 85); --edge: oklch(61% 0.012 60);
+  --text: oklch(19% 0.010 60); --text-2: oklch(33% 0.010 60); --muted: oklch(46% 0.010 60);
+  --accent: oklch(54% 0.14 70); --accent-fg: oklch(99% 0.006 85); --accent-soft: oklch(93.5% 0.045 80);
+  --cool: oklch(52% 0.14 250); --cool-soft: oklch(94.5% 0.03 250);
+  --ok: oklch(49% 0.12 150); --ok-soft: oklch(94.5% 0.035 150);
+  --danger: oklch(52% 0.18 25); --danger-soft: oklch(94.5% 0.03 25);
+  --warn: var(--accent); --warn-soft: var(--accent-soft); --info: var(--cool); --info-soft: var(--cool-soft);
+  --focus: var(--accent); --code: var(--surface2); --shadow: none;
+  --scrim: oklch(19% 0.010 60 / 0.18);
+  --sans: "Host Grotesk", "Pretendard", "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  --mono: "Atkinson Hyperlegible Mono", "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0e1014; --surface: #161920; --surface2: #1b1f27; --border: #262b34;
-    --text: #e6e8ed; --muted: #8a919e;
-    --accent: oklch(74% 0.12 255); --accent-fg: #0e1014; --accent-soft: oklch(30% 0.06 255);
-    --ok: oklch(74% 0.14 155); --ok-soft: oklch(28% 0.06 155);
-    --warn: oklch(78% 0.14 75); --warn-soft: oklch(30% 0.06 80);
-    --danger: oklch(72% 0.16 25); --danger-soft: oklch(30% 0.07 25);
-    --info: oklch(74% 0.1 230); --info-soft: oklch(30% 0.05 230);
-    --rail: #090b0e; --rail-fg: #8a919e;
-    --code: #0f1216; --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+    --bg: oklch(17% 0.008 250); --surface: oklch(21% 0.009 250); --surface2: oklch(13.5% 0.007 250);
+    --border: oklch(31% 0.01 250); --border-2: oklch(42% 0.012 250); --edge: oklch(55% 0.012 250);
+    --text: oklch(95% 0.005 250); --text-2: oklch(83% 0.008 250); --muted: oklch(71% 0.01 250);
+    --accent: oklch(82% 0.15 80); --accent-fg: oklch(18% 0.04 75); --accent-soft: oklch(29% 0.05 80);
+    --cool: oklch(77% 0.12 245); --cool-soft: oklch(29% 0.05 245);
+    --ok: oklch(76% 0.15 150); --ok-soft: oklch(24.5% 0.03 150);
+    --danger: oklch(70% 0.17 25); --danger-soft: oklch(24.5% 0.035 25);
+    --scrim: oklch(13.5% 0.007 250 / 0.6);
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
-  --bg: #0e1014; --surface: #161920; --surface2: #1b1f27; --border: #262b34;
-  --text: #e6e8ed; --muted: #8a919e;
-  --accent: oklch(74% 0.12 255); --accent-fg: #0e1014; --accent-soft: oklch(30% 0.06 255);
-  --ok: oklch(74% 0.14 155); --ok-soft: oklch(28% 0.06 155);
-  --warn: oklch(78% 0.14 75); --warn-soft: oklch(30% 0.06 80);
-  --danger: oklch(72% 0.16 25); --danger-soft: oklch(30% 0.07 25);
-  --info: oklch(74% 0.1 230); --info-soft: oklch(30% 0.05 230);
-  --rail: #090b0e; --rail-fg: #8a919e;
-  --code: #0f1216; --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+  --bg: oklch(17% 0.008 250); --surface: oklch(21% 0.009 250); --surface2: oklch(13.5% 0.007 250);
+  --border: oklch(31% 0.01 250); --border-2: oklch(42% 0.012 250); --edge: oklch(55% 0.012 250);
+  --text: oklch(95% 0.005 250); --text-2: oklch(83% 0.008 250); --muted: oklch(71% 0.01 250);
+  --accent: oklch(82% 0.15 80); --accent-fg: oklch(18% 0.04 75); --accent-soft: oklch(29% 0.05 80);
+  --cool: oklch(77% 0.12 245); --cool-soft: oklch(29% 0.05 245);
+  --ok: oklch(76% 0.15 150); --ok-soft: oklch(24.5% 0.03 150);
+  --danger: oklch(70% 0.17 25); --danger-soft: oklch(24.5% 0.035 25);
+  --scrim: oklch(13.5% 0.007 250 / 0.6);
   color-scheme: dark;
 }
 
@@ -120,7 +118,7 @@ button.ghost:hover { color: var(--text); border-color: var(--border); }
   width: min(420px, 100%); background: var(--surface); border: 1px solid var(--border);
   border-radius: 14px; padding: 28px; box-shadow: var(--shadow); animation: fadeUp .25s ease;
 }
-#login .mark { width: 40px; height: 40px; border-radius: 12px; background: var(--accent); color: #fff; display: grid; place-items: center; margin-bottom: 14px; }
+#login .mark { width: 40px; height: 40px; border-radius: 12px; background: var(--accent); color: var(--accent-fg); display: grid; place-items: center; margin-bottom: 14px; }
 #login h1 { font-size: 18px; }
 #login .lede { color: var(--muted); font-size: 13px; margin: 6px 0 14px; }
 #login label { margin-top: 10px; }
@@ -134,7 +132,7 @@ header.top {
   padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--border);
 }
 header.top .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; white-space: nowrap; }
-header.top .brand .mark { width: 28px; height: 28px; border-radius: 8px; background: var(--accent); color: #fff; display: grid; place-items: center; }
+header.top .brand .mark { width: 28px; height: 28px; border-radius: 8px; background: var(--accent); color: var(--accent-fg); display: grid; place-items: center; }
 #tabs { display: flex; gap: 2px; margin-left: 12px; }
 .tab { min-height: 34px; padding: 0 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); }
 .tab:hover { color: var(--text); }

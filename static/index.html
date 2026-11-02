@@ -3,17 +3,21 @@
   관제 UI.
 
   **외부 CDN 을 쓰지 않는다.** 에어갭 설치에서 화면이 깨지고, 인터넷이 있는
-  설치에서도 남의 사이트 개편에 우리 UI 가 끌려 죽는다. 프레임워크도 없다 —
-  의존성 5개를 이식성의 근거로 삼은 제품이 프런트에서 그것을 버릴 이유가 없다.
+  설치에서도 남의 사이트 개편에 우리 UI 가 끌려 죽는다. 글꼴도 static/fonts 에
+  들어 있다. 프레임워크도 없다 — 의존성 5개를 이식성의 근거로 삼은 제품이 프런트에서
+  그것을 버릴 이유가 없다.
 
-  구조는 디자인 핸드오프(2026-09)의 것이다: 좌측 아이콘 레일 · 56px 헤더 · 카드 본문 ·
-  우측 드로어 · 하단 토스트. 레일 항목과 페이지는 app.js 가 세션의 역할로 그린다.
+  구조: 좌측 라벨 사이드바(플랫폼 · 테넌트 두 묶음, 테넌트 범위 표시) · 상태 칩이 있는
+  56px 상단 바 · 본문 머리(제목 · 설명 · 화면 동작) · 패널 · 우측 드로어 · 토스트.
+  좁은 화면에서는 사이드바가 메뉴 버튼으로 여닫는 서랍이 된다. 사이드바 항목과 화면은
+  app.js 가 세션의 역할로 그린다.
 -->
 <html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LLM ControlCenter</title>
+  <meta name="description" content="설치형 LLM 통합 관제 센터의 운영자 콘솔. 노드, 레인, 테넌트, 모델, 가드, 작업, 사용량을 한 곳에서 본다.">
   <link rel="stylesheet" href="style.css?v=__VERSION__">
 </head>
 <body>
@@ -22,8 +26,8 @@
   <!-- 접속 -->
   <section id="login" hidden>
     <form id="login-form">
-      <div class="mark" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><rect x="7" y="7" width="10" height="10" rx="2.5"/></svg></div>
-      <h1 data-t="ui.sign_in">LLM ControlCenter</h1>
+      <div class="mark" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><rect x="7" y="7" width="10" height="10" rx="2.5"/></svg><span class="brand-name" data-t="ui.title">LLM ControlCenter</span></div>
+      <h1 data-t="ui.login_title">관리자 로그인</h1>
       <!-- 기본은 계정이다. 토큰 접속은 서비스·운영 자동화용으로 남겨 두고 한 번 눌러 연다. -->
       <div id="account-fields">
         <label for="username" data-t="ui.username">아이디</label>
@@ -49,33 +53,42 @@
   <!-- 관제 -->
   <div id="shell" hidden>
     <nav id="rail" aria-label="LLM ControlCenter">
-      <div class="logo"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><rect x="7" y="7" width="10" height="10" rx="2.5"/></svg><span class="sr-only" data-t="ui.title">LLM ControlCenter</span></div>
+      <div class="rail-top">
+        <div class="brand"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><rect x="7" y="7" width="10" height="10" rx="2.5"/></svg><span class="brand-name" data-t="ui.title">LLM ControlCenter</span><span id="version" class="mono"></span></div>
+        <button type="button" id="rail-close" class="ghost sm rail-close"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg><span class="sr-only" data-t="ui.menu_close">메뉴 닫기</span></button>
+      </div>
       <div id="tabs"></div>
-      <button type="button" id="theme" class="rail-btn" data-t-title="ui.theme_toggle" title="테마 전환"></button>
-      <button type="button" id="avatar" class="avatar" title=""></button>
+      <div class="rail-foot">
+        <button type="button" id="theme" class="ghost sm rail-btn" data-t-title="ui.theme_toggle" title="테마 전환"></button>
+        <div class="who"><button type="button" id="avatar" class="avatar" title=""></button><span id="who"></span></div>
+        <button type="button" id="rail-logout" class="ghost sm phone-only" data-t="ui.disconnect">연결 해제</button>
+      </div>
     </nav>
+    <div id="nav-scrim"></div>
 
     <div class="frame">
       <header>
-        <div class="titles">
-          <div id="page-title"></div>
-          <div id="page-sub"></div>
-        </div>
+        <button type="button" id="menu" class="sm" aria-controls="rail" aria-expanded="false"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg><span data-t="ui.menu">메뉴</span></button>
         <div id="pills"></div>
-        <div class="identity"><span id="who"></span><span id="version" class="mono"></span></div>
-        <button type="button" id="refresh" data-t="ui.refresh">새로고침</button>
-        <button type="button" id="logout" data-t="ui.disconnect">연결 해제</button>
+        <span class="bar-gap"></span>
+        <span id="refreshed"></span>
+        <button type="button" id="refresh" class="sm" data-t="ui.refresh">새로고침</button>
+        <button type="button" id="logout" class="sm ghost" data-t="ui.disconnect">연결 해제</button>
       </header>
 
       <main id="main">
         <div class="page">
+          <div class="page-title-row">
+            <div><h1 id="page-title"></h1><p id="page-sub"></p></div>
+            <div id="page-actions"></div>
+          </div>
           <div id="banners" role="status"></div>
           <div id="view" aria-live="polite"></div>
         </div>
       </main>
 
       <div id="drawer-overlay" hidden></div>
-      <aside id="drawer" hidden aria-modal="true" role="dialog">
+      <aside id="drawer" hidden aria-modal="true" role="dialog" aria-labelledby="drawer-title">
         <header><h2 id="drawer-title"></h2><button type="button" id="drawer-close" aria-label="close">×</button></header>
         <div id="drawer-body"></div>
         <div id="drawer-foot"></div>

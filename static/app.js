@@ -8,9 +8,11 @@
  *    안 보여주면 사람이 판단할 수 없고, 다국어에서는 켰다고 착각하기가 더 쉽다.
  * ③ **외부 CDN 도 프레임워크도 없다.** 에어갭에서 그대로 떠야 한다.
  *
- * 화면 구조는 디자인 핸드오프(2026-09)의 것이다 — 좌측 아이콘 레일 9개 진입점 · 헤더의
- * 상태 필 · 카드 · 우측 드로어 · 토스트. 기능 면은 그대로다: 서버가 주는 것만 그리고,
- * 토큰 원값 열람이나 역할 편집처럼 API 에 없는 것은 화면에도 없다.
+ * 화면 구조(2026-11 개편): 좌측 라벨 사이드바 — 플랫폼 · 테넌트 두 묶음에 9개 진입점, 테넌트
+ * 묶음 머리에 지금 보고 있는 테넌트 — · 상단 바의 상태 칩 · 본문 머리(제목 · 설명 · 화면 동작) ·
+ * 패널 · 우측 드로어 · 토스트. 개요의 첫 패널은 레인 보드다. 색은 뜻으로만 쓴다: 호박색은
+ * 사람이 볼 것, 청색은 계기가 잰 것, 녹색 · 적색은 상태. 기능 면은 그대로다: 서버가 주는 것만
+ * 그리고, 토큰 원값 열람이나 역할 편집처럼 API 에 없는 것은 화면에도 없다.
  */
 
 'use strict';
@@ -136,13 +138,14 @@ function isFlush(node) {
   return node && node.classList && FLUSH.some((cls) => node.classList.contains(cls));
 }
 
-/** 카드. 제목 줄 + 본문. 표·목록은 가장자리에 붙고, 문단·폼은 여백 안에 들어간다.
- *  `aside` 는 제목 줄 오른쪽(보조 문구·버튼). */
-function card(title, children, cls, aside) {
+/** 카드(패널). 제목 줄 + 본문. 표·목록은 가장자리에 붙고, 문단·폼은 여백 안에 들어간다.
+ *  `aside` 는 제목 줄 오른쪽(보조 문구·버튼), `meta` 는 제목 바로 뒤의 조용한 설명. */
+function card(title, children, cls, aside, meta) {
   const node = el('section', { class: 'card' + (cls ? ' ' + cls : '') });
   if (title || aside) {
     node.appendChild(el('div', { class: 'card-head' }, [
       title ? el('h2', { text: title }) : null,
+      meta ? el('span', { class: 'meta', text: meta }) : null,
       aside ? el('div', { class: 'aside' }, [].concat(aside)) : null,
     ]));
   }
@@ -161,23 +164,14 @@ function cardFoot(children) {
   return el('div', { class: 'card-foot' }, children);
 }
 
-/** 통계 타일. 라벨 · 큰 숫자 · 보조 문구. */
-function stat(label, value, tone, sub) {
-  return el('section', { class: 'card stat-card' }, [
-    el('div', { class: 'label', text: label }),
-    el('div', { class: 'value' }, [
-      el('span', { class: 'stat' + (tone ? ' ' + tone : ''), text: String(value) }),
-      sub ? el('span', { class: 'sub', text: sub }) : null,
-    ]),
-  ]);
-}
-
 /* 배지 → 필. 예전 클래스 이름은 톤으로 옮긴다 — 호출부가 데이터 값을 그대로 넘기기 때문이다. */
+//: 톤은 뜻이다 — 사람이 볼 것(warn = 호박색), 계기가 잰 것 · 계기가 한 일(info = 청색), 상태(ok · danger).
+//: 경계(internal · external)는 상태가 아니라 사실이라 중립이다. 마스킹(full · partial)은 가드가 한 일이다.
 const TONE_OF = {
-  healthy: 'ok', internal: 'ok', ok: 'ok', active: 'ok', ready: 'ok',
-  unhealthy: 'danger', block: 'danger', bad: 'danger', failed: 'danger', danger: 'danger',
-  draining: 'warn', warn: 'warn', full: 'warn', partial: 'warn', external: 'warn', pending: 'warn', blocked: 'warn',
-  info: 'info', running: 'info', pulling: 'info', approved: 'info',
+  healthy: 'ok', ok: 'ok', active: 'ok', ready: 'ok',
+  unhealthy: 'danger', block: 'danger', bad: 'danger', failed: 'danger', danger: 'danger', blocked: 'danger',
+  draining: 'warn', warn: 'warn', pending: 'warn',
+  info: 'info', running: 'info', pulling: 'info', approved: 'info', full: 'info', partial: 'info',
   accent: 'accent',
 };
 
@@ -187,10 +181,6 @@ function pill(text, tone) {
 
 function badge(text, cls) {
   return pill(text, TONE_OF[cls] || '');
-}
-
-function dot(tone, pulse) {
-  return el('span', { class: 'dot' + (tone ? ' ' + tone : '') + (pulse ? ' pulse' : '') });
 }
 
 /* 키를 문자열로 조립하지 않는다. 조립한 키는 카탈로그 대조 테스트가 못 잡고,
@@ -226,10 +216,10 @@ function requestBadge(status) {
   return badge(t(REQUEST_LABEL[status] || 'ui.unknown'), status);
 }
 
-function table(headers, rows) {
+function table(headers, rows, cls) {
   if (!rows.length) return emptyState(t('ui.empty'));
   return el('div', { class: 'scroll' }, [
-    el('table', {}, [
+    el('table', { class: cls || null }, [
       // **머리글은 값이 아니라 모양으로 가른다.** 라벨 자리에 falsy 폴백을 쓰면
       // 빈 문자열 라벨(`{label:'', num:true}` — 제목 없이 오른쪽 정렬만 하는 칸)이
       // 객체 자체로 떨어져 화면에 `[object Object]` 가 뜬다. 카탈로그 표가 그랬다.
@@ -238,16 +228,16 @@ function table(headers, rows) {
           class: h && h.num ? 'num' : null,
           text: (h && typeof h === 'object') ? (h.label ?? '') : (h ?? ''),
         })))]),
-      el('tbody', {}, rows.map((cells) => el('tr', {}, cells.map((cell, i) =>
+      el('tbody', {}, rows.map((cells) => el('tr', { class: cells.rowClass || null }, cells.map((cell, i) =>
         el('td', { class: headers[i] && headers[i].num ? 'num' : null },
           typeof cell === 'object' && cell !== null ? [cell] : [String(cell ?? '')]))))),
     ]),
   ]);
 }
 
-/** 빈 상태. 점 하나와 문장 — "표시할 항목이 없음" 이 왜 없음인지 말할 자리다. */
+/** 빈 상태. 문장 하나 — "표시할 항목이 없음" 이 왜 없음인지 말할 자리다. 색 점 대신 문장이 상태를 말한다. */
 function emptyState(text, tone) {
-  return el('div', { class: 'empty' }, [dot(tone || ''), el('span', { text })]);
+  return el('div', { class: 'empty' + (tone === 'danger' || tone === 'bad' ? ' bad' : '') }, [el('span', { text })]);
 }
 
 function listRows(items) {
@@ -256,7 +246,6 @@ function listRows(items) {
 
 function listRow(parts) {
   return el('div', { class: 'list-row' }, [
-    parts.dot ? dot(parts.dot) : null,
     el('div', { class: 'body' }, [
       el('div', { class: 'title' }, [].concat(parts.title || [])),
       parts.detail ? el('div', { class: 'detail' }, [].concat(parts.detail)) : null,
@@ -266,12 +255,37 @@ function listRow(parts) {
   ]);
 }
 
-function bar(ratio, warnAt, thick) {
+/** 비율 막대. 폭을 바꾸지 않고 비율(transform)로 그린다 — 값이 바뀌어도 레이아웃이 흔들리지 않는다.
+ *  가득 참(1.0)은 한도에 닿았다는 뜻이라 적색이 된다. 비교 막대(`plain`)는 1.0 이 "가장 큰 것" 일 뿐이라 색을 바꾸지 않는다. */
+function bar(ratio, warnAt, thick, plain) {
   const pct = Math.max(0, Math.min(1, ratio || 0));
-  const tone = pct >= 1 ? 'bad' : (warnAt && pct >= warnAt ? 'warn' : '');
-  return el('div', { class: 'bar' + (thick ? ' thick' : '') }, [
-    el('span', { class: tone, style: 'width:' + (pct * 100).toFixed(1) + '%' }),
+  const tone = plain ? '' : (pct >= 1 ? 'bad' : (warnAt && pct >= warnAt ? 'warn' : ''));
+  return el('span', { class: 'bar' + (thick ? ' thick' : ''), 'aria-hidden': 'true' }, [
+    el('span', { class: tone || null, style: '--v:' + pct.toFixed(3) }),
   ]);
+}
+
+/** 막대와 읽은 값을 한 줄에 — 값이 막대에 덮이지 않게 칸을 나눈다. */
+function meterRow(ratio, text, warnAt) {
+  return el('span', { class: 'meter-row' }, [bar(ratio, warnAt), el('span', { class: 'mono', text })]);
+}
+
+/** 동시성 칸. 칸 하나가 실행 자리 하나, 찬 칸이 지금 도는 것. 읽은 값을 옆에 붙인다. */
+function slotCell(running, max) {
+  const cells = [];
+  for (let i = 0; i < (max || 0); i++) cells.push(el('i', { class: i < running ? 'on' : null }));
+  return el('span', { class: 'slot-cell' }, [
+    el('span', { class: 'cap', 'aria-hidden': 'true' }, cells),
+    el('span', { class: 'mono', text: (running || 0) + ' / ' + (max || 0) }),
+  ]);
+}
+
+/** 큰 숫자 칸들 — 라벨 · 값(잰 값의 글꼴) · 단위. 아이콘도 추세 화살표도 없다. */
+function figures(items) {
+  return el('dl', { class: 'figures' }, items.filter(Boolean).map(([label, value, unit]) => el('div', {}, [
+    el('dt', { text: label }),
+    el('dd', {}, [el('span', { class: 'reading', text: String(value) }), unit ? el('span', { class: 'unit', text: unit }) : null]),
+  ])));
 }
 
 // ── 추이 차트 ─────────────────────────────────────────────────────────────
@@ -308,8 +322,10 @@ function bucketLabel(start, bucket) {
 
 /**
  * 막대 하나가 한 묶음(시간·일). **축은 하나, 계열도 하나** — 요청 수에서만 실패를 위에 쌓아 두 색이 된다.
- * 색은 상태 토큰(성공 = accent · 실패 = danger)만, 글자는 본문 토큰만 쓴다. 빈 묶음은 서버가 0 으로 채워
- * 보내므로 받은 점을 그대로 그린다. 호버는 막대보다 넓은 투명 영역이 받아 읽는 줄 하나에 쓴다.
+ * 막대는 가로로 늘어나는 SVG(가로 n×10, 세로 100)에 그리고, 눈금 · 범례는 HTML 이다 — 화면 폭이 달라도
+ * 글자는 같은 크기로 읽힌다(SVG 안 글자는 폭에 따라 7px 까지 줄었다). 색은 계기가 잰 것(--cool)과 실패
+ * (--danger)뿐이다. 빈 묶음은 서버가 0 으로 채워 보내므로 받은 점을 그대로 그린다. 호버는 묶음 전체
+ * 너비의 투명 영역이 받아 읽는 줄 하나에 쓴다.
  */
 function trendChart(series, opts) {
   const o = opts || {};
@@ -318,67 +334,123 @@ function trendChart(series, opts) {
   const metric = o.metric || 'calls';
   const valueOf = (p) => (metric === 'tokens' ? (p.input_tokens || 0) + (p.output_tokens || 0)
     : (metric === 'cost' ? (p.cost_usd || 0) : (p.calls || 0)));
-  const W = 720, H = 150, L = 40, R = 8, T = 10, B = 22;
-  const innerW = W - L - R, innerH = H - T - B;
+  const n = points.length;
   const top = niceCeiling(Math.max(...points.map(valueOf)));
-  const slot = innerW / points.length;
-  const barW = Math.max(2, Math.min(26, slot * 0.7));
   const split = metric === 'calls' && points.some((p) => (p.calls || 0) > (p.ok || 0));
-  const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'trend', role: 'img', 'aria-label': o.label || '' });
+  const svg = svgEl('svg', { viewBox: '0 0 ' + (n * 10) + ' 100', preserveAspectRatio: 'none', class: 'trend-svg', 'aria-hidden': 'true' });
+  const ys = el('div', { class: 'trend-y', 'aria-hidden': 'true' });
   // 눈금은 0 · 절반 · 상한. 상한이 1 이면(빈 창) 절반 눈금은 뜻이 없어 뺀다.
   for (const frac of (top < 2 && metric !== 'cost' ? [0, 1] : [0, 0.5, 1])) {
-    const y = T + innerH * (1 - frac);
-    svg.appendChild(svgEl('line', { x1: L, x2: W - R, y1: y, y2: y, class: 'grid' }));
-    svg.appendChild(svgEl('text', { x: L - 6, y: y + 4, class: 'tick', 'text-anchor': 'end' }, compact(top * frac)));
+    const y = 100 * (1 - frac);
+    svg.appendChild(svgEl('line', { x1: 0, x2: n * 10, y1: y, y2: y, class: 'grid' }));
+    ys.appendChild(el('span', { style: 'top:' + y + '%', text: compact(top * frac) }));
   }
   const tip = el('div', { class: 'trend-tip' });
   tip.hidden = true;
-  const every = Math.max(1, Math.ceil(points.length / 8));
+  const xs = el('div', { class: 'trend-x', 'aria-hidden': 'true' });
+  const every = Math.max(1, Math.ceil(n / 6));
   points.forEach((p, i) => {
-    const x = L + i * slot + (slot - barW) / 2;
-    const total = Math.max(0, innerH * (valueOf(p) / top));
+    const x = i * 10 + 1;
+    const total = Math.max(0, 100 * (valueOf(p) / top));
     const g = svgEl('g', { class: 'bar' });
     if (split) {
-      const okH = innerH * ((p.ok || 0) / top);
+      const okH = 100 * ((p.ok || 0) / top);
       const failH = total - okH;
-      if (okH > 0) g.appendChild(svgEl('rect', { x, y: T + innerH - okH, width: barW, height: okH, rx: 2, class: 'ok' }));
-      // 쌓인 두 조각 사이는 바탕색 2px — 경계가 색 차이에만 기대지 않게.
-      if (failH > 0) g.appendChild(svgEl('rect', { x, y: T + innerH - total, width: barW, height: Math.max(0.5, failH - (okH > 0 ? 2 : 0)), rx: 2, class: 'fail' }));
+      if (okH > 0) g.appendChild(svgEl('rect', { x, y: 100 - okH, width: 8, height: okH, class: 'ok' }));
+      // 쌓인 두 조각 사이는 바탕색 틈 — 경계가 색 차이에만 기대지 않게.
+      if (failH > 0) g.appendChild(svgEl('rect', { x, y: 100 - total, width: 8, height: Math.max(0.6, failH - (okH > 0 ? 0.8 : 0)), class: 'fail' }));
     } else if (total > 0) {
-      g.appendChild(svgEl('rect', { x, y: T + innerH - total, width: barW, height: total, rx: 2, class: 'ok' }));
+      g.appendChild(svgEl('rect', { x, y: 100 - total, width: 8, height: total, class: 'ok' }));
     }
     // 호버 영역은 묶음 폭·높이 전체 — 얇은 막대와 빈 묶음도 읽을 수 있어야 한다.
-    const hit = svgEl('rect', { x: L + i * slot, y: T, width: slot, height: innerH, class: 'hit' });
+    const hit = svgEl('rect', { x: i * 10, y: 0, width: 10, height: 100, class: 'hit' });
     const failed = (p.calls || 0) - (p.ok || 0);
-    const label = bucketLabel(p.start, series.bucket) + ' · ' + t('ui.calls') + ' ' + (p.calls || 0)
+    const label = bucketLabel(p.start, series.bucket) + ', ' + t('ui.calls') + ' ' + (p.calls || 0)
       + (failed > 0 ? ' (' + t('ui.legend_failed') + ' ' + failed + ')' : '')
-      + ' · ' + t('ui.tokens_used') + ' ' + ((p.input_tokens || 0) + (p.output_tokens || 0))
-      + (p.cost_usd ? ' · ' + money(p.cost_usd) : '')
-      + (p.avg_duration_ms ? ' · ' + p.avg_duration_ms + ' ms' : '');
+      + ', ' + t('ui.tokens_used') + ' ' + ((p.input_tokens || 0) + (p.output_tokens || 0))
+      + (p.cost_usd ? ', ' + money(p.cost_usd) : '')
+      + (p.avg_duration_ms ? ', ' + p.avg_duration_ms + ' ms' : '');
     hit.addEventListener('mouseenter', () => { tip.textContent = label; tip.hidden = false; g.classList.add('hover'); });
     hit.addEventListener('mouseleave', () => { tip.hidden = true; g.classList.remove('hover'); });
     g.appendChild(hit);
     svg.appendChild(g);
     if (i % every === 0) {
-      svg.appendChild(svgEl('text', { x: L + i * slot + slot / 2, y: H - 6, class: 'xlabel', 'text-anchor': 'middle' }, bucketLabel(p.start, series.bucket)));
+      xs.appendChild(el('span', { style: 'left:' + ((i + 0.5) / n * 100).toFixed(2) + '%', text: bucketLabel(p.start, series.bucket) }));
     }
   });
+  const figure = el('figure', { class: 'trend', role: 'img', 'aria-label': o.label || '' },
+    [ys, el('div', { class: 'trend-plot' }, [svg]), xs]);
   const legend = split ? el('div', { class: 'trend-legend' }, [
     el('span', {}, [el('i', { class: 'ok' }), t('ui.legend_ok')]),
     el('span', {}, [el('i', { class: 'fail' }), t('ui.legend_failed')]),
   ]) : null;
-  return el('div', { class: 'trend-wrap' }, [svg, tip, legend]);
+  return el('div', { class: 'trend-wrap' }, [figure, tip, legend]);
 }
 
+/* 레인 이름의 뜻. 키를 조립하지 않고 조회표로 고른다. */
+const LANE_LABEL = {
+  interactive: 'ui.lane_interactive',
+  batch: 'ui.lane_batch',
+  guard: 'ui.lane_guard',
+};
+
+/** 레인 이름 — 시스템이 쓰는 이름(interactive · batch · guard)과 그 뜻을 한 칸에. */
 function laneChip(name) {
-  return el('span', { class: 'lane-chip ' + (name === 'batch' || name === 'guard' ? name : '') });
+  return el('div', { class: 'lane-name' }, [
+    el('h3', { text: name }),
+    LANE_LABEL[name] ? el('span', { class: 'lane-sub', text: t(LANE_LABEL[name]) }) : null,
+  ]);
+}
+
+/** 대기 사유 한 줄. 'none' 은 사유 없이 차례를 기다리는 것 — 멈춘 큐로 세지 않되 숨기지도 않는다
+ *  (예전 화면은 12건이 차례를 기다리는 중에도 "모든 레인이 유휴" 라고 말했다). */
+function waitingLine(waiting, queued) {
+  const stopped = Object.entries(waiting || {}).filter(([reason]) => reason !== 'none');
+  const text = stopped.length
+    ? stopped.map(([reason, count]) => reason + ' ' + count).join(', ')
+    : (queued ? t('ui.queue_in_turn', { n: queued }) : t('ui.no_waiting'));
+  return [el('strong', { text: t('ui.waiting_reason') }), el('span', { text: t('ui.waiting_note') }), el('span', { text })];
+}
+
+/**
+ * 레인 보드 — 이 콘솔의 첫 물건. 레인마다 동시성 칸 대비 실행, 대기 수(크게), 스캔 창 대비 대기.
+ * 스캔 창은 스케줄러가 한 번에 훑는 대기 수다 — 대기가 그 창을 넘으면 뒤쪽 잡이 안 보인다(절단).
+ * `waiting` 을 주면(플랫폼 개요) 바닥 줄에 대기 사유를 적는다.
+ */
+function laneBoard(lanes, waiting, aside) {
+  const entries = Object.entries(lanes || {});
+  const queued = entries.reduce((sum, [, l]) => sum + (l.queued || 0), 0);
+  const running = entries.reduce((sum, [, l]) => sum + (l.running || 0), 0);
+  const capLabel = t('ui.running') + ' / ' + t('ui.concurrency');
+  const rows = entries.map(([name, l]) => el('li', { class: 'lane' }, [
+    laneChip(name),
+    el('dl', { class: 'lane-vals' }, [
+      el('div', { class: 'lane-cap' }, [el('dt', { text: capLabel }), el('dd', {}, [slotCell(l.running || 0, l.max_concurrent || 0)])]),
+      el('div', { class: 'lane-q' }, [el('dt', { text: t('ui.queued') }),
+        el('dd', {}, [el('span', { class: 'reading' + (l.queued ? '' : ' zero'), text: String(l.queued || 0) })])]),
+      el('div', { class: 'lane-scan' }, [el('dt', { text: t('ui.scan_window') }), el('dd', {}, [
+        meterRow(l.scan_window ? (l.queued || 0) / l.scan_window : 0, (l.queued || 0) + ' / ' + (l.scan_window || 0)),
+        l.scan_truncated ? badge(t('ui.scan_truncated'), 'block') : null,
+      ])]),
+    ]),
+  ]));
+  const head = el('div', { class: 'lane-cols flush', 'aria-hidden': 'true' }, [
+    el('span', { text: t('ui.lane') }), el('span', { text: capLabel }),
+    el('span', { text: t('ui.queued') }), el('span', { text: t('ui.scan_window') }),
+  ]);
+  return card(t('ui.lane'), [
+    head,
+    el('ul', { class: 'lane-list flush' }, rows),
+    waiting ? cardFoot(waitingLine(waiting, queued)) : null,
+  ], 'lane-board', [].concat(aside || [],
+    pill(t('ui.queued') + ' ' + queued, ''), pill(t('ui.running') + ' ' + running, '')), t('ui.lane_note'));
 }
 
 function kv(pairs) {
   return el('div', { class: 'kv' }, pairs.filter(Boolean).map(([key, value, span]) =>
     el('div', { class: span ? 'span' : null }, [
       el('div', { class: 'k', text: key }),
-      typeof value === 'object' && value !== null ? value : el('div', { text: String(value ?? '—') }),
+      typeof value === 'object' && value !== null ? value : el('div', { text: String(value ?? t('ui.none')) }),
     ])));
 }
 
@@ -391,6 +463,14 @@ function segment(options, activeId, onPick, danger) {
       text: o.label,
       onclick: () => onPick(o.id),
     })));
+}
+
+/** 화면 안의 하위 탭 — 밑줄 하나로 지금 탭을 표시한다(호박색 = 지금 보고 있는 것). */
+function tabRow(options, activeId, onPick) {
+  return el('div', { class: 'tabs', role: 'tablist' }, options.map((o) => el('button', {
+    type: 'button', role: 'tab', class: o.id === activeId ? 'active' : null,
+    'aria-selected': o.id === activeId ? 'true' : 'false', text: o.label, onclick: () => onPick(o.id),
+  })));
 }
 
 function switchControl(on, onToggle, label) {
@@ -410,12 +490,25 @@ function pageHead(desc, actions) {
 }
 
 function when(ts) {
-  if (!ts) return '—';
+  if (!ts) return t('ui.none');
   return new Date(ts * 1000).toLocaleString();
+}
+
+/** 목록용 짧은 시각 — 월-일 시:분:초(24시간). 자정을 넘는 목록에서도 날짜가 보인다. */
+function stamp(ts) {
+  if (!ts) return t('ui.none');
+  const d = new Date(ts * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
 }
 
 function money(value) {
   return '$' + (Number(value) || 0).toFixed(4);
+}
+
+/** 예산 · 한도처럼 사람이 정한 금액 — 센트까지. 쓴 비용은 money() 로 넷째 자리까지 적는다. */
+function dollars(value) {
+  return '$' + (Number(value) || 0).toFixed(2);
 }
 
 // ── 토스트 · 드로어 ──────────────────────────────────────────────────────
@@ -524,7 +617,6 @@ function renderBanners(extra) {
 
   for (const [text, cls, action] of warnings) {
     box.appendChild(el('div', { class: 'banner' + (cls ? ' ' + cls : '') }, [
-      dot(),
       el('div', { class: 'text', text }),
       action ? el('button', { type: 'button', text: action[0], onclick: () => go(action[1]) }) : null,
     ]));
@@ -569,20 +661,55 @@ function go(pageId, sub) {
   state.page = pageId;
   if (sub) state.sub[pageId] = sub;
   closeDrawer();
+  setNav(false);
   refresh();
 }
 
+/** 사이드바. 플랫폼 면(플랫폼 관리자의 개요 포함)과 테넌트 면을 두 묶음으로 나누고, 테넌트 묶음 머리에
+ *  그 화면들이 보는 테넌트를 적는다 — 플랫폼 관리자가 `_platform` 의 빈 테넌트 화면을 보면서도 그 사실을
+ *  몰랐다. 승인 대기는 모델 항목의 숫자로, 노드 상태는 좁은 화면에서 노드 항목의 숫자로 따라온다. */
 function renderTabs() {
-  const rail = $('tabs');
-  rail.replaceChildren();
-  for (const page of pagesFor(state.session)) {
-    rail.appendChild(el('button', {
-      type: 'button',
-      class: 'rail-item' + (page.id === state.page ? ' active' : ''),
-      'aria-current': page.id === state.page ? 'page' : null,
-      onclick: () => go(page.id),
-    }, [icon(page.icon), el('span', { text: t(page.label) })]));
+  const box = $('tabs');
+  box.replaceChildren();
+  const s = state.session;
+  const pages = pagesFor(s);
+  const platform = pages.filter((p) => p.platform || (p.id === 'overview' && s.is_platform_admin));
+  const tenant = pages.filter((p) => !platform.includes(p));
+  if (platform.length) box.appendChild(navGroup(t('ui.nav_platform'), platform));
+  if (tenant.length) {
+    box.appendChild(navGroup(t('ui.nav_tenant'), tenant, el('div', { class: 'scope', title: t('ui.tenant_scope') }, [
+      el('span', { class: 'scope-name', text: s.tenant.name }),
+      el('span', { class: 'mono', text: s.tenant.id }),
+    ])));
   }
+}
+
+function navGroup(title, pages, scope) {
+  return el('div', { class: 'nav-group' }, [el('p', { class: 'nav-head', text: title }), scope || null].concat(pages.map(railItem)));
+}
+
+function railItem(page) {
+  const current = page.id === state.page;
+  const nodes = state.header.nodes;
+  return el('button', {
+    type: 'button',
+    class: 'rail-item' + (current ? ' active' : ''),
+    'aria-current': current ? 'page' : null,
+    onclick: () => go(page.id),
+  }, [
+    icon(page.icon),
+    el('span', { text: t(page.label) }),
+    page.id === 'models' && state.header.pending > 0
+      ? el('span', { class: 'count', 'aria-label': t('ui.pending_approval') + ' ' + state.header.pending, text: String(state.header.pending) }) : null,
+    page.id === 'nodes' && nodes
+      ? el('span', { class: 'count phone-only' + (nodes.healthy === nodes.total ? ' ok' : ''), text: nodes.healthy + '/' + nodes.total }) : null,
+  ]);
+}
+
+/** 좁은 화면의 사이드바 서랍. */
+function setNav(open) {
+  $('shell').classList.toggle('nav-open', open);
+  $('menu').setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 
 function renderHeader(page) {
@@ -601,18 +728,18 @@ function renderPills() {
   if (state.header.pending > 0 && pages.includes('models')) {
     box.appendChild(el('button', {
       type: 'button', class: 'hpill warn', onclick: () => go('models'),
-    }, [dot('warn', true), el('span', { text: t('ui.pending_approval') + ' ' + state.header.pending })]));
+    }, [t('ui.pending_approval') + ' ', el('span', { class: 'mono', text: String(state.header.pending) })]));
   }
   if (s.guard_grace_mode) {
     box.appendChild(el('button', {
       type: 'button', class: 'hpill danger', onclick: () => go(pages.includes('rules') ? 'rules' : 'overview'),
-    }, [el('span', { text: t('ui.guard') + ' ' + t('ui.lenient') })]));
+    }, [t('ui.guard') + ' ' + t('ui.lenient')]));
   }
   const nodes = state.header.nodes;
   if (nodes) {
     const tone = nodes.healthy === nodes.total ? 'ok' : (nodes.healthy ? 'warn' : 'danger');
-    box.appendChild(el('span', { class: 'hpill' }, [
-      dot(tone), el('span', { text: t('ui.nodes') + ' ' + nodes.healthy + '/' + nodes.total }),
+    box.appendChild(el('span', { class: 'hpill nodes ' + tone }, [
+      t('ui.nodes') + ' ', el('span', { class: 'mono', text: nodes.healthy + '/' + nodes.total }),
     ]));
   }
 }
@@ -626,6 +753,7 @@ async function refreshHeader(generation) {
   if (data.status && data.status.nodes) state.header.nodes = data.status.nodes;
   if (data.models) state.header.pending = data.models.pending || 0;
   renderPills();
+  renderTabs();   // 사이드바의 승인 대기 숫자 · 노드 숫자
 }
 
 //: 자동 갱신 주기(ms). **노드가 죽어도 새로고침 전까지 과거 화면을 본다** —
@@ -656,11 +784,21 @@ async function refresh(options) {
     return;
   }
   // 자동 갱신은 화면을 비우지 않는다 — 15초마다 깜빡이면 읽을 수가 없다.
-  if (!quiet) view.replaceChildren(el('p', { class: 'muted', text: t('ui.loading') }));
+  if (!quiet) {
+    view.replaceChildren(el('p', { class: 'muted', text: t('ui.loading') }));
+    $('page-actions').replaceChildren();
+  }
   try {
     const nodes = await page.render();
     if (generation !== refreshGeneration) return;   // 지나간 탭의 결과다
-    view.replaceChildren.apply(view, [].concat(nodes).filter(Boolean));
+    const list = [].concat(nodes).filter(Boolean);
+    // 화면 동작(추가 버튼 · 필터)은 본문 머리의 제목 옆으로 옮긴다. 세대가 맞을 때만 옮기므로 지나간 탭의
+    // 버튼이 남지 않는다. 버튼만 오고 입력 칸은 오지 않는다 — 편집 중 판정은 #view 안만 본다.
+    const head = list.find((node) => node.classList && node.classList.contains('page-head'));
+    const actions = head ? head.querySelector('.actions') : null;
+    $('page-actions').replaceChildren.apply($('page-actions'), actions ? Array.from(actions.childNodes) : []);
+    view.replaceChildren.apply(view, list.filter((node) => node !== head));
+    $('refreshed').replaceChildren(t('ui.refresh_note', { time: '' }), el('span', { class: 'mono', text: stamp(Date.now() / 1000).slice(6) }));
   } catch (err) {
     if (generation !== refreshGeneration) return;
     if (!quiet) {
@@ -715,77 +853,69 @@ function stopAutoRefresh() {
 // ── 플랫폼: 개요 ──────────────────────────────────────────────────────────
 
 async function renderPlatformOverview() {
-  const data = await fetchAll({ overview: '/v1/platform/overview' });
+  // 승인 대기 요청의 노드 · 모델은 헤더가 이미 부르는 모델 응답에 있다 — 같은 경로를 한 번 더 읽는다.
+  const data = await fetchAll({ overview: '/v1/platform/overview', models: '/v1/platform/models' });
   const o = data.overview;
   if (!o) return [emptyState(t('ui.empty'))];
 
   const singleHomed = Object.entries(o.single_homed_roles || {});
-  const waiting = Object.entries(o.waiting_by_reason || {})
-    .filter(([reason]) => reason !== 'none');
   const pending = o.model_requests_pending || 0;
   state.header.pending = pending;
+  renderBanners();
 
-  renderBanners(pending > 0
-    ? [[t('ui.pending_approval') + ' ' + pending + ' — ' + t('ui.pending_help'), '', [t('ui.go_models'), 'models']]]
-    : []);
+  // **확인할 일** — 사람의 판단이 필요한 것만 한 패널에. 승인 대기와 단일 호밍은 자동으로 풀리지 않는다
+  // (자동 복제를 하지 않으므로 사람이 판단할 재료를 준다).
+  const requests = ((data.models && data.models.install_requests) || []).filter((r) => r.status === 'pending');
+  const todo = [];
+  if (pending > 0) {
+    const r = requests[0];
+    todo.push(el('li', {}, [
+      el('div', { class: 'todo-head' }, [
+        pill(t('ui.pending_approval') + ' ' + pending, 'warn'),
+        el('button', { type: 'button', class: 'sm', text: t('ui.go_models'), onclick: () => go('models') }),
+      ]),
+      r ? el('dl', { class: 'pairs' }, [
+        el('dt', { text: t('ui.node') }), el('dd', {}, [el('span', { class: 'mono', text: r.node })]),
+        el('dt', { text: t('ui.model') }), el('dd', {}, [el('span', { class: 'mono', text: r.model })]),
+      ]) : null,
+      el('p', { text: t('ui.pending_help') }),
+    ]));
+  }
+  if (singleHomed.length) {
+    todo.push(el('li', {}, [
+      el('div', { class: 'todo-head' }, [
+        pill(t('ui.single_homed_warning') + ' ' + singleHomed.length, 'warn'),
+        el('button', { type: 'button', class: 'sm', text: t('ui.nodes'), onclick: () => go('nodes') }),
+      ]),
+      el('p', { text: t('ui.single_homed_help') }),
+      el('dl', { class: 'pairs' }, [].concat(...singleHomed.map(([role, node]) =>
+        [el('dt', { text: role }), el('dd', {}, [el('span', { class: 'mono', text: node })])]))),
+    ]));
+  }
+  const attention = card(t('ui.attention'),
+    [todo.length ? el('ul', { class: 'todo flush' }, todo) : emptyState(t('ui.attention_none'))],
+    null, null, t('ui.attention_note'));
 
-  const nodes = o.nodes || [];
-  const lanes = Object.entries(o.lanes || {});
-  const healthy = nodes.filter((n) => n.status === 'healthy').length;
-  const queued = lanes.reduce((sum, [, l]) => sum + l.queued, 0);
-  const running = lanes.reduce((sum, [, l]) => sum + l.running, 0);
+  // 테넌트별 사용량 — 서버의 기본 창(30일)이다. 기간을 적지 않으면 24시간 추이와 섞어 읽는다.
   const usage = o.usage_by_tenant || [];
   const maxCalls = Math.max(1, ...usage.map((r) => r.calls || 0));
+  const usageCard = card(t('ui.usage'), usage.length ? [
+    el('div', { class: 'hbars' }, usage.map((r) => el('div', { class: 'hbar' }, [
+      el('span', { class: 'mono', text: r.tenant_id }),
+      bar((r.calls || 0) / maxCalls, null, true, true),
+      el('span', { class: 'mono', text: t('ui.count', { n: r.calls || 0 }) }),
+    ]))),
+    el('p', { text: t('ui.usage_30d_calls') }),
+  ] : [emptyState(t('ui.none'))], null, null, t('ui.tenants') + ' ' + (o.tenants || []).length);
 
   return [
-    el('div', { class: 'grid' }, [
-      stat(t('ui.tenants'), (o.tenants || []).length),
-      stat(t('ui.nodes'), healthy + ' / ' + nodes.length,
-        nodes.some((n) => n.status === 'unhealthy') ? 'bad' : 'ok', t('ui.online')),
-      stat(t('ui.queued'), queued, '', t('ui.running') + ' ' + running),
-      stat(t('ui.pending_approval'), pending, pending ? 'warn' : '', t('ui.install_requests')),
-    ]),
-
-    // 추이 한 줄 — 전 테넌트 합계, 최근 24시간. 숫자 타일 다음에 "지금 흐름" 을 보여 준다.
-    card(t('ui.trend_24h'), [trendChart(o.usage_series, { metric: 'calls', label: t('ui.trend_24h') })],
-      null, el('span', { text: t('ui.per_hour') })),
-
-    el('div', { class: 'grid wide' }, [
-      card(t('ui.lane'), [table(
-        [t('ui.lane'), { label: t('ui.running'), num: true }, { label: t('ui.queued'), num: true },
-         { label: t('ui.concurrency'), num: true }, t('ui.scan_truncated')],
-        lanes.map(([name, l]) => [
-          el('span', { class: 'mono' }, [laneChip(name), name]),
-          l.running, l.queued, l.max_concurrent,
-          l.scan_truncated ? badge(t('ui.scan_truncated'), 'block') : '—',
-        ]))], null, el('span', { text: t('ui.lane_note') })),
-
-      // **1급 카드 ①** — 자동 복제를 하지 않으므로 사람이 판단할 재료를 준다.
-      card(t('ui.single_homed_warning'), [
-        el('p', { class: 'hint', text: t('ui.single_homed_help') }),
-        singleHomed.length
-          ? table([t('ui.role'), t('ui.node')], singleHomed.map(([role, node]) =>
-              [el('span', { text: role, style: 'font-weight:500' }), el('span', { class: 'mono', text: node })]))
-          : emptyState(t('ui.none'), 'ok'),
-      ], singleHomed.length ? 'warn' : null, singleHomed.length ? pill(singleHomed.length, 'warn') : null),
-    ]),
-
-    el('div', { class: 'grid wide' }, [
-      // **1급 카드 ②** — "노드 정비로 대기 12건" 을 못 보여주면 관리자는 큐가 왜
-      // 안 줄어드는지 알 수 없고, 노드를 늘리는 잘못된 대응을 한다.
-      card(t('ui.waiting_reason'), [
-        waiting.length
-          ? table([t('ui.waiting_reason'), { label: t('ui.queued'), num: true }], waiting)
-          : emptyState(t('ui.no_waiting'), 'ok'),
-      ], waiting.length ? 'warn' : null, el('span', { text: t('ui.waiting_note') })),
-
-      card(t('ui.usage'), usage.length
-        ? usage.map((r) => el('div', { class: 'usage-row' }, [
-            el('span', { class: 'mono', text: r.tenant_id }),
-            bar((r.calls || 0) / maxCalls, null, true),
-            el('span', { class: 'n', text: t('ui.count', { n: r.calls || 0 }) }),
-          ]))
-        : [emptyState(t('ui.none'))]),
+    el('div', { class: 'cols' }, [
+      el('div', { class: 'stack' }, [
+        laneBoard(o.lanes, o.waiting_by_reason),
+        // 추이 한 줄 — 전 테넌트 합계, 최근 24시간. 레인 보드 다음에 "지금 흐름" 을 보여 준다.
+        card(t('ui.trend_24h'), [trendChart(o.usage_series, { metric: 'calls', label: t('ui.trend_24h') })], null, null, t('ui.per_hour')),
+      ]),
+      el('div', { class: 'stack' }, [attention, usageCard]),
     ]),
   ];
 }
@@ -796,39 +926,34 @@ async function renderNodes() {
   const data = await api('/v1/platform/nodes');
   renderBanners();
 
-  const cards = (data.nodes || []).map((n) => {
-    const tone = n.status === 'healthy' ? 'ok' : (n.status === 'draining' ? 'warn' : 'danger');
-    const memRatio = n.mem_budget_gb ? (n.mem_reserved_gb || 0) / n.mem_budget_gb : 0;
-    return el('section', { class: 'card node-card' }, [
-      el('div', { class: 'card-head' }, [
-        dot(tone),
-        el('span', { class: 'name', text: n.node }),
-        pill(n.provider, ''),
+  // 카드 대신 표 — 노드가 늘어도 한눈에 비교된다. 행마다 경계(기계의 위치) · 상태 · 동시성 칸 · 메모리 · 보유 모델.
+  const rows = (data.nodes || []).map((n) => {
+    const memText = n.mem_budget_gb ? (n.mem_reserved_gb || 0) + ' / ' + n.mem_budget_gb + ' GB' : null;
+    return [
+      el('div', {}, [
+        el('span', { class: 'mono', text: n.node }),
+        el('span', { class: 'sub', text: n.provider }),
+      ]),
+      el('div', { class: 'tags' }, [
         // **소프트웨어가 아니라 기계의 위치가 경계를 정한다.**
         boundaryBadge(n.data_boundary),
-        n.metered ? badge(t('ui.cost'), 'external') : null,
-        el('div', { class: 'aside' }, [statusBadge(n.status)]),
+        n.metered ? badge(t('ui.cost'), 'warn') : null,
       ]),
-      el('div', { class: 'card-body' }, [
-        kv([
-          [t('ui.concurrency'), el('div', {}, [
-            el('div', { text: n.running + ' / ' + n.max_concurrent }),
-            el('div', { style: 'margin-top:6px' }, [bar(n.load_ratio || 0, 0.8)]),
-          ])],
-          n.mem_budget_gb ? [t('ui.memory'), el('div', {}, [
-            el('div', { text: (n.mem_reserved_gb || 0) + ' / ' + n.mem_budget_gb + ' GB' }),
-            el('div', { style: 'margin-top:6px' }, [bar(memRatio, 0.6)]),
-          ])] : [t('ui.memory'), '—'],
-          [t('ui.models_held') + ' ' + (n.models || []).length, el('div', { class: 'tags' },
-            (n.models || []).length
-              ? n.models.map((m) => el('span', { class: 'tag' + (m === n.loaded_model ? ' accent' : ''), text: m }))
-              : [el('span', { class: 'muted', text: t('ui.none') })]), true],
-          n.tenant_affinity && n.tenant_affinity.length
-            ? [t('ui.tenant_affinity'), n.tenant_affinity.join(', '), true] : null,
-        ]),
-        n.last_error ? el('div', { class: 'err', text: n.last_error }) : null,
+      el('div', {}, [
+        statusBadge(n.status),
+        n.last_error ? el('span', { class: 'sub', text: n.last_error }) : null,
       ]),
-      el('div', { class: 'card-foot' }, [
+      slotCell(n.running || 0, n.max_concurrent || 0),
+      memText ? meterRow((n.mem_reserved_gb || 0) / n.mem_budget_gb, memText, 0.6) : el('span', { class: 'muted', text: t('ui.none') }),
+      el('div', {}, [
+        el('div', { class: 'tags' }, (n.models || []).length
+          ? n.models.map((m) => el('span', { class: 'tag' + (m === n.loaded_model ? ' loaded' : ''), text: m + (m === n.loaded_model ? ' ' + t('ui.model_loaded') : '') }))
+          : [el('span', { class: 'muted', text: t('ui.none') })]),
+        n.tenant_affinity && n.tenant_affinity.length
+          ? el('span', { class: 'sub', text: t('ui.tenant_affinity') + ': ' + n.tenant_affinity.join(', ') }) : null,
+      ]),
+      el('div', { class: 'row end' }, [
+        n.disabled_by_airgap ? el('span', { class: 'muted', text: t('ui.airgap_on') }) : null,
         el('button', {
           type: 'button', class: 'sm',
           text: n.status === 'draining' ? t('ui.undrain') : t('ui.drain'),
@@ -841,9 +966,10 @@ async function renderNodes() {
             } catch (err) { showError(err); }
           },
         }),
-        // 삭제는 드레이닝 뒤의 결정이다 — 실행 중인 잡이 있으면 서버가 409 로 거절한다.
+        // 삭제는 드레이닝 뒤의 결정이다 — 실행 중인 잡이 있으면 서버가 409 로 거절한다. 행에서는 중립 버튼,
+        // 경고는 확인 단계가 맡는다.
         el('button', {
-          type: 'button', class: 'sm danger', text: t('ui.delete'),
+          type: 'button', class: 'sm', text: t('ui.delete'),
           onclick: async () => {
             if (!confirm(t('ui.confirm_delete_node', { node: n.node }))) return;
             try {
@@ -853,9 +979,8 @@ async function renderNodes() {
             } catch (err) { showError(err); }
           },
         }),
-        n.disabled_by_airgap ? el('span', { class: 'muted right', text: t('ui.airgap_on') }) : null,
       ]),
-    ]);
+    ];
   });
 
   return [
@@ -865,7 +990,9 @@ async function renderNodes() {
         onclick: () => openDrawer(t('ui.register_node'), [registerNodeForm()]),
       }),
     ]),
-    cards.length ? el('div', { class: 'grid cards' }, cards) : card(t('ui.nodes'), [emptyState(t('ui.empty'))]),
+    card(t('ui.nodes'), [table(
+      [t('ui.node'), t('ui.boundary'), t('ui.status'), t('ui.concurrency'), t('ui.memory'), t('ui.models_held'), ''],
+      rows)], null, null, t('ui.count', { n: rows.length })),
   ];
 }
 
@@ -929,16 +1056,18 @@ async function renderTenants() {
 
   const rows = (data.tenants || []).map((tenant) => [
     el('div', {}, [
-      el('div', { class: 'mono', text: tenant.id, style: 'font-weight:500' }),
-      el('div', { class: 'sub', text: tenant.name }),
+      el('span', { class: 'mono', text: tenant.id }),
+      el('span', { class: 'sub', text: tenant.name }),
     ]),
-    tenant.locale,
+    el('span', { class: 'mono', text: tenant.locale }),
     badge(tenant.status, tenant.status === 'active' ? 'healthy' : 'unhealthy'),
-    tenant.budget_usd_per_month ? money(tenant.budget_usd_per_month) : '—',
-    tenant.has_dek ? badge('DEK', 'internal') : badge(t('ui.none')),
+    tenant.budget_usd_per_month ? el('span', { class: 'mono', text: dollars(tenant.budget_usd_per_month) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
+    tenant.rate_limit_per_min ? el('span', { class: 'mono', text: t('ui.rate_per_min', { n: tenant.rate_limit_per_min }) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
+    tenant.has_dek ? badge('DEK', 'info') : badge(t('ui.none')),
     el('div', { class: 'row end' }, [
+      // 파기는 행에서는 중립 버튼이다 — 되돌릴 수 없다는 경고와 확인값 입력은 다음 단계가 맡는다.
       el('button', {
-        type: 'button', class: 'danger sm', text: t('ui.purge_tenant'),
+        type: 'button', class: 'sm', text: t('ui.purge_tenant'),
         onclick: () => purgeTenant(tenant.id),
       }),
     ]),
@@ -952,8 +1081,8 @@ async function renderTenants() {
       }),
     ]),
     card(t('ui.tenants'), [table(
-      [t('ui.tenants'), t('ui.locale'), t('ui.status'), { label: t('ui.budget'), num: true }, '', ''], rows)],
-      null, el('span', { text: t('ui.count', { n: rows.length }) })),
+      [t('ui.tenants'), t('ui.locale'), t('ui.status'), { label: t('ui.budget'), num: true }, { label: t('ui.rate_limit'), num: true }, '', ''], rows)],
+      null, null, t('ui.count', { n: rows.length })),
   ];
 }
 
@@ -1026,77 +1155,90 @@ async function renderModels() {
       }, r.eligible_nodes.map((n) => el('option', { value: n, selected: n === r.node ? true : null, text: n })))
     : el('span', { class: 'mono', text: r.node });
 
-  const pending = (m.install_requests || []).map((r) => [
-    el('span', { class: 'mono', text: r.model, style: 'font-weight:500' }),
-    nodeCell(r),
-    el('div', {}, [
-      requestBadge(r.status),
-      r.status === 'pulling' ? el('div', { style: 'width:110px;margin-top:6px' }, [bar((r.progress || 0) / 100)]) : null,
-    ]),
-    r.error ? el('span', { class: 'error', text: r.error }) : '',
-    el('div', { class: 'row end' }, r.status === 'pending' ? [
-      el('button', {
-        type: 'button', class: 'primary sm', text: t('ui.approve'),
-        onclick: () => modelDecision(r.id, false),
-      }),
-      el('button', { type: 'button', class: 'sm', text: t('ui.reject'), onclick: () => modelDecision(r.id, true) }),
-    ] : []),
-  ]);
+  const pending = (m.install_requests || []).map((r) => {
+    const row = [
+      el('span', { class: 'mono', text: r.model }),
+      nodeCell(r),
+      el('div', {}, [
+        requestBadge(r.status),
+        r.status === 'pulling' ? meterRow((r.progress || 0) / 100, (r.progress || 0) + '%') : null,
+      ]),
+      r.error ? el('span', { class: 'error', text: r.error }) : '',
+      el('div', { class: 'row end' }, r.status === 'pending' ? [
+        el('button', {
+          type: 'button', class: 'primary sm', text: t('ui.approve'),
+          onclick: () => modelDecision(r.id, false),
+        }),
+        el('button', { type: 'button', class: 'sm', text: t('ui.reject'), onclick: () => modelDecision(r.id, true) }),
+      ] : []),
+    ];
+    // 사람이 결정할 행은 호박색 바탕 — 이 화면에서 지금 할 일이 어디 있는지 한눈에 보인다.
+    if (r.status === 'pending') row.rowClass = 'selected';
+    return row;
+  });
 
-  const inventory = (m.inventory || []).map((r) => [
-    el('div', {}, [
-      el('div', { class: 'mono', text: r.model, style: 'font-weight:500' }),
-      el('div', { class: 'sub', text: r.node }),
-    ]),
-    r.loaded ? badge(t('ui.model_loaded'), 'healthy') : '',
-    r.est_size_gb ? r.est_size_gb + ' GB' : '—',
-    (r.deletion_blockers || []).length
-      ? el('span', { class: 'muted', title: r.deletion_blockers.join(', '), text: r.deletion_blockers.join(', ') })
-      : '',
-    el('div', { class: 'row end' }, [
-      el('button', {
-        type: 'button', class: 'danger sm', text: t('ui.delete'),
-        disabled: (r.deletion_blockers || []).length ? true : null,
-        onclick: () => deleteModel(r.node, r.model),
-      }),
-    ]),
-  ]);
+  const inventory = (m.inventory || []).map((r) => {
+    const blockers = r.deletion_blockers || [];
+    return [
+      el('div', {}, [
+        el('span', { class: 'mono', text: r.model }),
+        el('span', { class: 'sub', text: r.node }),
+      ]),
+      r.loaded ? badge(t('ui.model_loaded'), 'info') : '',
+      el('span', { class: 'mono', text: (r.est_size_gb || 0) + ' GB' }),
+      blockers.length ? el('div', { class: 'tags' }, blockers.map((b) => el('span', { class: 'tag', text: b }))) : '',
+      el('div', { class: 'row end' }, [
+        // 막힌 삭제는 누를 수 없게 두고 이유를 단다 — 이유는 옆 칸에도 있다.
+        el('button', {
+          type: 'button', class: 'sm', text: t('ui.delete'),
+          disabled: blockers.length ? true : null,
+          title: blockers.length ? t('ui.delete_blocked') + ': ' + blockers.join(', ') : null,
+          onclick: () => deleteModel(r.node, r.model),
+        }),
+      ]),
+    ];
+  });
 
   // **"역할이 요구하는데 어느 노드에도 없는 모델"** — 서버가 주는데 화면이
   // 안 그렸다. 그 잡들은 레인을 막지 않고 조용히 대기하므로(§13-6), 여기
   // 안 보이면 관리자는 왜 그 역할만 안 도는지 알 방법이 없다.
   const missing = (m.missing || []).map((x) => [
     el('span', { class: 'mono', text: x.node }),
-    el('span', { class: 'mono', text: x.model, style: 'font-weight:500' }),
+    el('span', { class: 'mono', text: x.model }),
     el('div', { class: 'row end' }, [
       el('button', {
-        type: 'button', class: 'primary sm', text: t('ui.request_install'),
+        type: 'button', class: 'sm', text: t('ui.request_install'),
         onclick: () => requestInstall(x.node, x.model),
       }),
     ]),
   ]);
 
-  const catalog = (data.catalog ? data.catalog.catalog : []).map((c) => listRow({
-    title: [el('span', { class: 'mono', text: c.name, style: 'font-weight:500' }), ' ', pill(c.provider, '')],
-    detail: [c.purpose || '', c.est_size_gb ? ' · ' + c.est_size_gb + ' GB' : ''],
-  }));
+  const catalog = (data.catalog ? data.catalog.catalog : []).map((c) => [
+    el('span', { class: 'mono', text: c.name }),
+    c.provider,
+    el('span', { class: 'mono', text: (c.est_size_gb || 0) + ' GB' }),
+    c.purpose || '',
+    c.note ? el('span', { class: 'muted', text: c.note }) : '',
+  ]);
 
+  const missingCard = missing.length
+    ? card(t('ui.missing_models'), [table([t('ui.node'), t('ui.model'), ''], missing)], 'warn', pill(missing.length, 'warn'))
+    : null;
+  const pendingCard = pending.length
+    ? card(t('ui.install_requests'), [
+        m.pending ? el('p', { text: t('ui.pending_help') }) : null,
+        table([t('ui.model'), t('ui.node'), t('ui.status'), '', ''], pending),
+      ], null, m.pending ? pill(t('ui.pending_approval') + ' ' + m.pending, 'warn') : null)
+    : null;
   return [
     pageHead(t('ui.desc_models')),
-    missing.length
-      ? card(t('ui.missing_models'), [table([t('ui.node'), t('ui.model'), ''], missing)], 'warn', pill(missing.length, 'warn'))
-      : null,
-    pending.length
-      ? card(t('ui.install_requests'), [table(
-          [t('ui.model'), t('ui.node'), t('ui.status'), '', ''], pending)],
-          null, m.pending ? pill(t('ui.pending_approval') + ' ' + m.pending, 'warn') : null)
-      : null,
-    el('div', { class: 'grid split' }, [
-      card(t('ui.models'), [table(
-        [t('ui.model'), '', { label: t('ui.size'), num: true }, t('ui.deletion_blocked'), ''], inventory)],
-        null, el('span', { text: t('ui.count', { n: inventory.length }) })),
-      card(t('ui.catalog'), [catalog.length ? listRows(catalog) : emptyState(t('ui.none'))]),
-    ]),
+    missingCard && pendingCard ? el('div', { class: 'cols even' }, [pendingCard, missingCard]) : (pendingCard || missingCard),
+    card(t('ui.models'), [table(
+      [t('ui.model'), '', { label: t('ui.size'), num: true }, t('ui.deletion_blocked'), ''], inventory)],
+      null, null, t('ui.count', { n: inventory.length })),
+    card(t('ui.catalog'), [catalog.length
+      ? table([t('ui.model'), t('ui.provider'), { label: t('ui.size'), num: true }, t('ui.purpose'), ''], catalog)
+      : emptyState(t('ui.none'))], null, null, t('ui.count', { n: catalog.length })),
   ];
 }
 
@@ -1148,10 +1290,7 @@ async function renderRules() {
   const active = subs.some((x) => x.id === state.sub.rules) ? state.sub.rules : subs[0].id;
   state.sub.rules = active;
 
-  const head = el('div', { class: 'page-head' }, [
-    subs.length > 1 ? segment(subs, active, (id) => go('rules', id)) : null,
-    el('p', { class: 'desc', text: t('ui.desc_rules') }),
-  ]);
+  const head = subs.length > 1 ? tabRow(subs, active, (id) => go('rules', id)) : null;
   if (active === 'baseline') {
     if (state.platformBlocked) return [head, blockedNotice()];
     return [head].concat(await renderBaseline());
@@ -1177,31 +1316,35 @@ async function renderBaseline() {
   };
 
   return [
-    el('div', { class: 'grid split-2' }, [
-      // **안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.**
-      card(t('ui.locale_packs_on'), [
-        el('p', { class: 'hint', text: t('ui.locale_pack_warning') }),
-        table([t('ui.locale_packs_on'), t('ui.tenants')],
-          Object.entries(data.packs_in_use || {}).map(([pack, tenants]) =>
-            [pill(pack, 'ok'), tenants.join(', ')])),
-        unused.length ? cardFoot([el('span', { text: t('ui.locale_packs_off') + ': ' + unused.join(', ') })]) : null,
-      ], unused.length ? 'warn' : null),
-
+    el('div', { class: 'cols even' }, [
       card(t('ui.mode'), [
         el('p', { class: 'hint', text: t('ui.grace_help') }),
         segment([{ id: 'enforce', label: t('ui.enforce') }, { id: 'lenient', label: t('ui.lenient') }],
           data.grace_mode ? 'lenient' : 'enforce', (id) => setGrace(id === 'lenient'), 'lenient'),
       ], data.grace_mode ? 'bad' : null),
+
+      // **안 켜진 필터는 없는 필터인데, 다국어에서는 켰다고 착각하기가 더 쉽다.**
+      card(t('ui.locale_packs_on'), [
+        el('p', { class: 'hint', text: t('ui.locale_pack_warning') }),
+        table([t('ui.pack'), t('ui.tenants')],
+          Object.entries(data.packs_in_use || {}).map(([pack, tenants]) =>
+            [el('span', { class: 'mono', text: pack }), el('div', { class: 'tags' }, tenants.map((x) => el('span', { class: 'tag', text: x })))])),
+        unused.length ? cardFoot([el('span', { text: t('ui.locale_packs_off') }),
+          el('div', { class: 'tags' }, unused.map((x) => el('span', { class: 'tag', text: x })))]) : null,
+      ], unused.length ? 'warn' : null),
     ]),
 
     card(t('ui.baseline'), [table(
-      [t('ui.rule'), '', t('ui.boundary_internal'), t('ui.boundary_external'), 'checksum', 'pack'],
+      [t('ui.rule'), t('ui.replacement_label'), t('ui.boundary_internal'), t('ui.boundary_external'), t('ui.checksum'), t('ui.pack')],
       (data.baseline || []).map((r) => [
-        el('span', { class: 'mono', text: r.id }), r.label || '',
+        el('span', { class: 'mono', text: r.id }),
+        // 표지는 가드가 프롬프트에 써 넣는 글자 그대로다 — 코드로 적는다.
+        r.label ? el('code', { class: 'token', text: r.label }) : '',
         badge(r.action.internal, r.action.internal),
         badge(r.action.external, r.action.external),
-        el('span', { class: 'mono muted', text: r.checksum || '—' }), pill(r.locale_pack, ''),
-      ]))], null, el('span', { text: t('ui.count', { n: (data.baseline || []).length }) })),
+        r.checksum ? el('span', { class: 'mono muted', text: r.checksum }) : el('span', { class: 'muted', text: t('ui.none') }),
+        el('span', { class: 'mono', text: r.locale_pack }),
+      ]))], null, null, t('ui.count', { n: (data.baseline || []).length })),
   ];
 }
 
@@ -1220,40 +1363,38 @@ async function renderGuard() {
   return [
     // **미리보기가 맨 위다** — 규칙 표는 "무엇이 켜져 있나" 이고, 미리보기는 "그래서 이 문장은 어떻게 되나" 다.
     previewCard(),
-    el('div', { class: 'grid split-2' }, [
-      // **오탐 검토 큐** — 이게 밀리면 승격 게이트가 영원히 안 열린다.
-      card(t('ui.false_positive_queue'), [
-        el('p', { class: 'hint', text: t('ui.review_help') }),
-        table([t('ui.rule'), t('ui.stage'), t('ui.action'), { label: t('ui.hits'), num: true }, '', ''],
-          events.map((e) => [
-            el('span', { class: 'mono', text: e.rule_id }), e.stage, badge(e.action, e.action), e.match_count,
-            el('span', { class: 'muted', text: when(e.ts) }),
-            el('div', { class: 'row end' }, [
-              el('button', { type: 'button', class: 'sm', text: t('ui.true_positive'), onclick: () => review(e.id, 'true_positive') }),
-              el('button', { type: 'button', class: 'sm', text: t('ui.false_positive'), onclick: () => review(e.id, 'false_positive') }),
-            ]),
-          ])),
-      ], events.length ? 'warn' : null, events.length ? pill(events.length, 'warn') : null),
+    // **오탐 검토 큐** — 이게 밀리면 승격 게이트가 영원히 안 열린다. 표가 넓어 전체 폭을 쓴다.
+    card(t('ui.false_positive_queue'), [
+      el('p', { class: 'hint', text: t('ui.review_help') }),
+      table([t('ui.rule'), t('ui.stage'), t('ui.action'), { label: t('ui.hits'), num: true }, '', ''],
+        events.map((e) => [
+          el('span', { class: 'mono', text: e.rule_id }), e.stage, badge(e.action, e.action), e.match_count,
+          el('span', { class: 'mono muted', text: stamp(e.ts) }),
+          el('div', { class: 'row end' }, [
+            el('button', { type: 'button', class: 'sm', text: t('ui.true_positive'), onclick: () => review(e.id, 'true_positive') }),
+            el('button', { type: 'button', class: 'sm', text: t('ui.false_positive'), onclick: () => review(e.id, 'false_positive') }),
+          ]),
+        ])),
+    ], events.length ? 'warn' : null, events.length ? pill(events.length, 'warn') : null),
 
-      card(t('ui.locale_packs_on'), [
-        el('p', {}, [rules.locale_pack ? badge(rules.locale_pack, 'internal') : badge(t('ui.none'), 'block')]),
-        el('p', { class: 'hint', text: t('ui.locale_pack_warning') }),
-      ], rules.locale_pack ? null : 'bad'),
-    ]),
+    card(t('ui.locale_packs_on'), [
+      el('div', { class: 'tags' }, [rules.locale_pack ? badge(rules.locale_pack, 'info') : badge(t('ui.none'), 'block')]),
+      el('p', { class: 'hint', text: t('ui.locale_pack_warning') }),
+    ], rules.locale_pack ? null : 'bad'),
 
     card(t('ui.rule'), [
-      table([t('ui.rule'), t('ui.boundary_internal'), t('ui.boundary_external'), 'pack', ''],
+      table([t('ui.rule'), t('ui.boundary_internal'), t('ui.boundary_external'), t('ui.pack'), ''],
         (rules.effective || []).map((r) => [
           el('span', { class: 'mono', text: r.id }),
           badge(r.action.internal, r.action.internal),
           badge(r.action.external, r.action.external),
-          pill(r.locale_pack, ''),
+          el('span', { class: 'mono', text: r.locale_pack }),
           el('div', { class: 'row end' }, [
-            el('button', { type: 'button', class: 'sm accent', text: t('ui.promote'), onclick: () => checkPromotion(r.id) }),
+            el('button', { type: 'button', class: 'sm', text: t('ui.promote'), onclick: () => checkPromotion(r.id) }),
           ]),
         ])),
       cardFoot([el('span', { text: t('ui.masked_only') })]),
-    ], null, el('span', { text: t('ui.count', { n: (rules.effective || []).length }) })),
+    ], null, null, t('ui.count', { n: (rules.effective || []).length })),
   ];
 }
 
@@ -1292,6 +1433,7 @@ function previewCard() {
   const run = el('button', { type: 'button', class: 'primary', text: t('ui.preview_run'), onclick: () => runPreview(input.value) });
   return card(t('ui.guard_preview'), [
     el('p', { class: 'hint', text: t('ui.preview_help') }),
+    el('label', { for: 'guard-preview-text', class: 'sr-only', text: t('ui.guard_preview') }),
     input,
     el('div', { class: 'row' }, [run, pv.result && pv.result.grace_mode ? pill(t('ui.grace_mode_on'), 'warn') : null]),
     pv.result ? previewResult(pv.checked, pv.result) : null,
@@ -1307,44 +1449,85 @@ async function runPreview(text) {
   } catch (err) { showError(err); }
 }
 
-/** 원문 위에 걸린 자리를 표시하고, 경계마다 "나가는 모양" 과 판정을 나란히 — 차단된 경계는 본문이 없다(서버가 안 준다). */
+/** 글 안의 몇 조각만 칠한다 — 앞에서부터 찾고 겹치면 앞엣것이 이긴다. 문자열 HTML 이 아니라 노드로 조립한다. */
+function markTokens(text, tokens) {
+  const out = el('pre', { class: 'preview' });
+  let cursor = 0;
+  while (cursor < text.length) {
+    let best = null;
+    for (const tok of tokens) {
+      if (!tok.text) continue;
+      const at = text.indexOf(tok.text, cursor);
+      if (at >= 0 && (!best || at < best.at)) best = { at, tok };
+    }
+    if (!best) break;
+    if (best.at > cursor) out.appendChild(document.createTextNode(text.slice(cursor, best.at)));
+    out.appendChild(el('mark', { class: best.tok.cls, text: best.tok.text }));
+    cursor = best.at + best.tok.text.length;
+  }
+  if (cursor < text.length) out.appendChild(document.createTextNode(text.slice(cursor)));
+  return out;
+}
+
+/** 원문의 걸린 자리와 경계마다 "나가는 모양" 을 한 판에 나란히 — 가려진 원문(적색 바탕 · 취소선),
+ *  대체 표지(녹색 바탕), 기록만 하고 통과(청색 바탕). 차단된 경계는 본문이 없다(서버가 안 준다). */
 function previewResult(original, r) {
   const spans = [];
-  for (const d of r.detections || []) {
-    const blocks = d.actions && (d.actions.internal === 'block' || d.actions.external === 'block');
-    for (const s of d.spans || []) spans.push([s[0], s[1], blocks]);
+  const detections = r.detections || [];
+  for (const d of detections) {
+    const acts = d.actions || {};
+    const blocks = acts.internal === 'block' || acts.external === 'block';
+    const audit = acts.internal === 'audit' && acts.external === 'audit';
+    for (const s of d.spans || []) spans.push([s[0], s[1], blocks ? 'block' : (audit ? 'seen' : null)]);
   }
   spans.sort((a, b) => a[0] - b[0]);
   const marked = el('pre', { class: 'preview' });
   let cursor = 0;
-  for (const [start, end, blocks] of spans) {
+  for (const [start, end, kind] of spans) {
     if (start < cursor) continue;   // 겹치는 스팬은 앞엣것이 이긴다 — 표시용이라 병합까지는 안 한다
     if (start > cursor) marked.appendChild(document.createTextNode(original.slice(cursor, start)));
-    marked.appendChild(el('mark', { class: blocks ? 'block' : null, text: original.slice(start, end) }));
+    marked.appendChild(el('mark', { class: kind, text: original.slice(start, end) }));
     cursor = end;
   }
   if (cursor < original.length) marked.appendChild(document.createTextNode(original.slice(cursor)));
 
+  // 나가는 쪽: 마스킹한 규칙의 표지와, 기록만 한 원문 조각을 칠한다.
+  const tokens = [];
+  for (const d of detections) {
+    const acts = d.actions || {};
+    if ((acts.internal === 'full' || acts.internal === 'partial' || acts.external === 'full' || acts.external === 'partial') && d.label) {
+      tokens.push({ text: d.label, cls: 'put' });
+    }
+    if (acts.internal === 'audit' && acts.external === 'audit') {
+      for (const s of d.spans || []) tokens.push({ text: original.slice(s[0], s[1]), cls: 'seen' });
+    }
+  }
   const boundaryBox = (b) => {
     const v = (r.boundaries || {})[b] || {};
     return el('div', { class: 'stack' }, [
-      el('div', { class: 'row' }, [
-        el('strong', { text: t(b === 'internal' ? 'ui.boundary_internal' : 'ui.boundary_external') }),
+      el('div', { class: 'preview-head' }, [
+        el('span', { text: t(b === 'internal' ? 'ui.boundary_internal' : 'ui.boundary_external') }),
         pill(v.allowed ? t('ui.preview_allowed') : t('ui.preview_blocked'), v.allowed ? 'ok' : 'danger'),
       ]),
-      v.allowed ? el('pre', { class: 'preview', text: v.prompt || '' }) : el('p', { class: 'hint', text: t('ui.preview_not_sent') }),
+      v.allowed ? markTokens(v.prompt || '', tokens) : el('p', { class: 'hint', text: t('ui.preview_not_sent') }),
     ]);
   };
-  const detections = r.detections || [];
   return el('div', { class: 'stack' }, [
     el('div', { class: 'preview-grid' }, [
-      el('div', { class: 'stack' }, [el('strong', { text: t('ui.preview_original') }), marked]),
-      el('div', { class: 'stack' }, [boundaryBox('internal'), boundaryBox('external')]),
+      el('div', {}, [el('div', { class: 'preview-head' }, [t('ui.preview_original')]), marked]),
+      el('div', {}, [boundaryBox('internal'), boundaryBox('external')]),
+    ]),
+    el('div', { class: 'preview-legend' }, [
+      el('span', {}, [el('mark', { text: t('ui.preview_cut') })]),
+      el('span', {}, [el('mark', { class: 'put', text: t('ui.preview_put') })]),
+      el('span', {}, [el('mark', { class: 'seen', text: t('ui.preview_seen') })]),
     ]),
     detections.length
-      ? table([t('ui.rule'), t('ui.stage'), t('ui.boundary_internal'), t('ui.boundary_external'), { label: t('ui.hits'), num: true }],
+      ? table([t('ui.rule'), t('ui.replacement_label'), t('ui.stage'), t('ui.boundary_internal'), t('ui.boundary_external'), { label: t('ui.hits'), num: true }],
           detections.map((d) => [
-            el('span', { class: 'mono', text: d.rule_id }), d.stage,
+            el('span', { class: 'mono', text: d.rule_id }),
+            d.label ? el('code', { class: 'token', text: d.label }) : '',
+            d.stage,
             badge(d.actions.internal, d.actions.internal), badge(d.actions.external, d.actions.external), d.match_count,
           ]))
       : emptyState(t('ui.preview_clean'), 'ok'),
@@ -1391,64 +1574,63 @@ async function renderJobs() {
   const filter = JOB_FILTERS.find((f) => f.id === state.jobFilter) || JOB_FILTERS[0];
   const shown = jobs.filter(filter.match);
 
-  const chips = el('div', { class: 'chips' }, JOB_FILTERS.map((f) => {
+  const chips = el('div', { class: 'chips', role: 'group', 'aria-label': t('ui.status') }, JOB_FILTERS.map((f) => {
     const count = jobs.filter(f.match).length;
     return el('button', {
       type: 'button', class: 'chip' + (f.id === filter.id ? ' active' : ''),
+      'aria-pressed': f.id === filter.id ? 'true' : 'false',
       onclick: () => { state.jobFilter = f.id; refresh(); },
     }, [t(f.label), el('span', { class: 'n', text: String(count) })]);
   }));
 
   return [
-    // **화면은 마스킹본만 본다.** 원문은 단건 API + 감사다.
-    pageHead(t('ui.desc_jobs')),
-    chips,
+    // **화면은 마스킹본만 본다.** 원문은 단건 API + 감사다. 상태 필터는 제목 줄로 올라간다.
+    pageHead(t('ui.desc_jobs'), [chips]),
     card(t('ui.jobs'), [
       table(
-        [t('ui.status'), t('ui.role'), t('ui.node'), t('ui.model'), t('ui.prompt'), { label: t('ui.cost'), num: true }, t('ui.created'), ''],
+        [t('ui.job'), t('ui.status'), t('ui.role'), t('ui.node') + ', ' + t('ui.model'), t('ui.prompt'), { label: t('ui.cost'), num: true }, { label: t('ui.created'), num: true }],
         shown.map((j) => [
+          // 행 이름이 곧 상세를 여는 단추다 — 따로 "상세" 칸을 두지 않는다.
+          el('button', { type: 'button', class: 'idlink', 'aria-label': t('ui.details') + ' ' + j.id, text: j.id.slice(0, 8), onclick: () => openJob(j) }),
           badge(j.status, j.status),
-          el('span', { text: j.role, style: 'font-weight:500' }),
-          el('span', { class: 'mono nowrap', text: j.node || '—' }),
-          // **"왜 이 모델로 갔는가" 는 모델 옆에서 물어보게 된다.** 열을 따로 두면
-          // 라우팅을 안 켠 설치처에서 언제나 비어 있는 열이 하나 는다.
-          el('div', {}, [
-            el('div', { class: 'mono nowrap', text: j.model || '—' }),
-            // 밑줄 시작은 판정 센티널(_failed/_none)이다 — 화면에는 실제 라우트만.
-            // 어느 쪽이든 기본 모델로 갔고, 실패율은 메트릭이 답한다.
-            j.route && !j.route.startsWith('_') ? el('div', { class: 'sub', text: '← ' + j.route }) : null,
+          j.role,
+          el('div', { class: 'nowrap' }, [
+            j.node ? el('span', { class: 'mono', text: j.node }) : el('span', { class: 'muted', text: t('ui.none') }),
+            // **"왜 이 모델로 갔는가" 는 모델 옆에서 물어보게 된다.** 열을 따로 두면 라우팅을 안 켠 설치처에서
+            // 언제나 비어 있는 열이 하나 는다. 밑줄 시작은 판정 센티널(_failed/_none)이다 — 화면에는 실제 라우트만.
+            j.model ? el('span', { class: 'sub', text: j.model + (j.route && !j.route.startsWith('_') ? ' (' + j.route + ')' : '') }) : null,
           ]),
           transcriptOf(j)
-            ? el('div', { class: 'row' }, [pill('chat', 'info'), el('span', { class: 'mono muted', text: lastUserText(j).slice(0, 60) })])
-            : el('span', { class: 'mono muted', text: (j.prompt_masked || '').slice(0, 60) }),
-          money(j.cost_usd),
-          el('span', { class: 'muted nowrap', text: when(j.created_at) }),
-          el('div', { class: 'row end' }, [
-            el('button', { type: 'button', class: 'sm', text: t('ui.details'), onclick: () => openJob(j) }),
-          ]),
-        ])),
-      cardFoot([el('span', { text: t('ui.masked_only') }), el('span', { class: 'right', text: t('ui.count', { n: shown.length }) })]),
-    ]),
+            ? el('div', { class: 'row' }, [pill('chat', 'info'), el('span', { class: 'clip muted', title: lastUserText(j), text: lastUserText(j) })])
+            : el('span', { class: 'clip muted', title: j.prompt_masked || '', text: j.prompt_masked || '' }),
+          el('span', { class: 'mono', text: money(j.cost_usd) }),
+          el('span', { class: 'mono', text: stamp(j.created_at) }),
+        ]), 'pin'),
+      cardFoot([el('span', { text: t('ui.masked_only') })]),
+    ], null, null, t('ui.count', { n: shown.length })),
   ];
 }
 
 /** 작업 상세 드로어. 목록이 준 것만 보여주고, 원문은 사람이 한 번 더 확인한 뒤 단건으로 연다. */
 function openJob(j) {
+  const route = j.route && !j.route.startsWith('_') ? j.route : null;
   const body = [
     kv([
       [t('ui.status'), badge(j.status, j.status)],
-      [t('ui.role'), el('div', {}, [j.role, ' → ', el('span', { class: 'mono', text: j.model || '—' })])],
-      [t('ui.node') + ' · ' + t('ui.lane'), el('div', { class: 'mono', text: (j.node || '—') + ' · ' + (j.lane || '—') })],
-      [t('ui.attempts'), String(j.attempts ?? '—')],
-      [t('ui.cost'), money(j.cost_usd)],
-      [t('ui.tokens_used'), (j.input_tokens || 0) + ' / ' + (j.output_tokens || 0)],
-      [t('ui.created'), when(j.created_at)],
-      [t('ui.finished'), when(j.finished_at)],
-      j.wait_reason ? [t('ui.wait_reason'), j.wait_reason, true] : null,
-      j.error_code ? [t('ui.error_code'), el('div', { class: 'mono', text: j.error_code }), true] : null,
-      j.route && !j.route.startsWith('_') ? ['route', el('div', { class: 'mono', text: j.route }), true] : null,
+      [t('ui.role'), el('div', {}, [j.role, ' ', el('span', { class: 'muted', text: j.kind || '' })])],
+      [t('ui.lane'), j.lane || t('ui.none')],
+      [t('ui.node'), j.node ? el('div', { class: 'mono', text: j.node }) : t('ui.none')],
+      [t('ui.model'), j.model ? el('div', { class: 'mono', text: j.model }) : t('ui.none')],
+      route ? [t('ui.route'), el('div', { class: 'mono', text: route })] : null,
+      [t('ui.attempts'), String(j.attempts ?? 0)],
+      [t('ui.cost'), el('div', { class: 'mono', text: money(j.cost_usd) })],
+      [t('ui.tokens_used'), el('div', { class: 'mono', text: (j.input_tokens || 0) + ' / ' + (j.output_tokens || 0) })],
+      [t('ui.created'), el('div', { class: 'mono', text: when(j.created_at) })],
+      [t('ui.finished'), j.finished_at ? el('div', { class: 'mono', text: when(j.finished_at) }) : t('ui.none')],
+      j.wait_reason ? [t('ui.wait_reason'), j.wait_reason] : null,
+      j.error_code ? [t('ui.error_code'), el('div', { class: 'mono', text: j.error_code })] : null,
     ]),
-    el('div', {}, [el('label', { text: t('ui.prompt') + ' · ' + t('ui.masked_only') }),
+    el('div', {}, [el('label', { text: t('ui.prompt') }), el('p', { class: 'hint', text: t('ui.masked_only') }),
       transcriptOf(j) ? transcriptView(transcriptOf(j)) : el('pre', { class: 'code', text: j.prompt_masked || '' })]),
     j.response ? el('div', {}, [el('label', { text: t('ui.response') }), el('pre', { class: 'code', text: j.response })]) : null,
   ];
@@ -1456,7 +1638,7 @@ function openJob(j) {
     j.has_raw ? el('button', { type: 'button', text: t('ui.view_raw'), onclick: () => viewRaw(j.id) }) : null,
     drawerClose(),
   ];
-  openDrawer(t('ui.job_detail') + ' ' + j.id, body, foot);
+  openDrawer(t('ui.job_detail') + ' ' + j.id.slice(0, 8), body, foot);
 }
 
 async function viewRaw(jobId) {
@@ -1496,35 +1678,35 @@ async function renderUsage() {
   const budget = data.budget || {};
   const burn = budget.burn_rate || 0;
   const rows = data.rows || [];
-  const unit = el('span', { text: t(win.bucket === 'day' ? 'ui.per_day' : 'ui.per_hour') });
+  const unit = t(win.bucket === 'day' ? 'ui.per_day' : 'ui.per_hour');
+  const rate = data.token_rate || {};
 
   return [
-    el('div', { class: 'page-head' }, [
-      el('div', { class: 'row' }, [
-        segment(USAGE_AXES.map((name) => ({ id: name, label: name })), axis,
-          (id) => { state.usageAxis = id; refresh(); }),
-        segment(USAGE_WINDOWS.map((w) => ({ id: w.id, label: t(w.label) })), win.id,
-          (id) => { state.usageWindow = id; refresh(); }),
-      ]),
-      el('p', { class: 'desc', text: t('ui.desc_usage') }),
+    // 축과 창은 제목 줄로 올라간다 — 표도 추이도 같은 since 를 본다.
+    pageHead(t('ui.desc_usage'), [
+      segment(USAGE_AXES.map((name) => ({ id: name, label: name })), axis,
+        (id) => { state.usageAxis = id; refresh(); }),
+      segment(USAGE_WINDOWS.map((w) => ({ id: w.id, label: t(w.label) })), win.id,
+        (id) => { state.usageWindow = id; refresh(); }),
     ]),
-    el('div', { class: 'grid wide' }, [
-      card(t('ui.trend_requests'), [trendChart(data.series, { metric: 'calls', label: t('ui.trend_requests') })], null, unit),
-      card(t('ui.trend_tokens'), [trendChart(data.series, { metric: 'tokens', label: t('ui.trend_tokens') })], null, unit.cloneNode(true)),
-    ]),
-    el('div', { class: 'grid' }, [
-      stat(t('ui.calls'), rows.reduce((sum, r) => sum + r.calls, 0)),
-      stat(t('ui.tokens_used'), rows.reduce((sum, r) => sum + (r.input_tokens || 0) + (r.output_tokens || 0), 0)),
-      stat(t('ui.cost'), money(data.spend_usd)),
-      el('section', { class: 'card stat-card' }, [
-        el('div', { class: 'label', text: t('ui.budget_used') }),
-        el('div', { class: 'value' }, [
-          el('span', { class: 'stat' + (burn >= 1 ? ' bad' : (burn >= (budget.warn_at || 0.8) ? ' warn' : '')),
-            text: budget.limit ? (burn * 100).toFixed(1) + '%' : '—' }),
-          budget.limit ? el('span', { class: 'sub', text: money(budget.committed) + ' / ' + money(budget.limit) }) : null,
-        ]),
-        budget.limit ? el('div', { style: 'margin-top:10px' }, [bar(burn, budget.warn_at)]) : null,
+    el('section', { class: 'card' }, [
+      figures([
+        [t('ui.calls'), rows.reduce((sum, r) => sum + r.calls, 0).toLocaleString()],
+        [t('ui.tokens_used'), rows.reduce((sum, r) => sum + (r.input_tokens || 0) + (r.output_tokens || 0), 0).toLocaleString()],
+        [t('ui.cost'), money(data.spend_usd)],
+        budget.limit
+          ? [t('ui.budget_used'), (burn * 100).toFixed(2), '% / ' + dollars(budget.limit)]
+          : [t('ui.budget_used'), t('ui.no_limit')],
       ]),
+      budget.limit ? cardFoot([
+        el('span', { class: 'grow' }, [bar(burn, budget.warn_at, true)]),
+        el('span', { text: t('ui.budget_line', { warn: Math.round((budget.warn_at || 0.8) * 100), remaining: dollars(budget.remaining) }) }),
+        rate.tokens_per_minute !== undefined ? el('span', { text: t('ui.tokens_per_min', { n: rate.tokens_per_minute }) }) : null,
+      ]) : null,
+    ]),
+    el('div', { class: 'cols even' }, [
+      card(t('ui.trend_requests'), [trendChart(data.series, { metric: 'calls', label: t('ui.trend_requests') })], null, null, unit),
+      card(t('ui.trend_tokens'), [trendChart(data.series, { metric: 'tokens', label: t('ui.trend_tokens') })], null, null, unit),
     ]),
     card(t('ui.usage'), [
       table(
@@ -1532,11 +1714,14 @@ async function renderUsage() {
          { label: t('ui.cost'), num: true }, { label: t('ui.latency'), num: true },
          { label: t('ui.success_rate'), num: true }],
         rows.map((r) => [
-          el('span', { class: 'mono', text: r.key || '—' }), r.calls, r.input_tokens + r.output_tokens,
-          money(r.cost_usd), r.avg_duration_ms + ' ms',
-          (r.success_rate * 100).toFixed(1) + '%',
+          r.key ? el('span', { class: 'mono', text: r.key }) : el('span', { class: 'muted', text: t('ui.none') }),
+          el('span', { class: 'mono', text: r.calls.toLocaleString() }),
+          el('span', { class: 'mono', text: (r.input_tokens + r.output_tokens).toLocaleString() }),
+          el('span', { class: 'mono', text: money(r.cost_usd) }),
+          el('span', { class: 'mono', text: r.avg_duration_ms + ' ms' }),
+          el('span', { class: 'mono', text: (r.success_rate * 100).toFixed(1) + '%' }),
         ])),
-    ], null, el('span', { text: t('ui.count', { n: rows.length }) })),
+    ], null, null, t('ui.count', { n: rows.length })),
   ];
 }
 
@@ -1546,37 +1731,46 @@ async function renderNotifications() {
   const data = await api('/v1/platform/notifications');
   renderBanners();
 
-  const recent = (data.recent || []).slice().reverse().map((n) => listRow({
-    dot: /offline|failed|exhausted|spike|error|needs_review/.test(n.event || '') ? 'danger'
-      : (/recovered|ready|normal/.test(n.event || '') ? 'ok' : 'warn'),
-    title: n.event,
-    detail: JSON.stringify(n.detail),
-    time: when(n.ts),
-  }));
+  // 최근 알림 — 상세는 JSON 덩어리가 아니라 "키 값" 으로 읽힌다. 톤은 사건의 뜻(이상 · 회복 · 그 밖)이다.
+  const recent = (data.recent || []).slice().reverse().map((n) => {
+    const tone = /offline|failed|exhausted|spike|error|needs_review/.test(n.event || '') ? 'danger'
+      : (/recovered|ready|normal/.test(n.event || '') ? 'ok' : 'warn');
+    return [
+      el('span', { class: 'mono', text: stamp(n.ts) }),
+      pill(n.event || '', tone),
+      el('span', { class: 'muted', text: Object.entries(n.detail || {}).map(([k, v]) => k + ' ' + v).join(', ') }),
+    ];
+  });
 
   return [
     pageHead(t('ui.desc_alerts')),
-    el('div', { class: 'grid split' }, [
-      card(t('ui.recent_events'), [recent.length ? listRows(recent) : emptyState(t('ui.none'), 'ok')],
-        null, el('span', { text: t('ui.count', { n: recent.length }) })),
+    el('div', { class: 'cols even' }, [
       card(t('ui.channels'), [
         data.configured
           ? el('div', { class: 'tags' }, data.channels.map((c) => pill(c, 'ok')))
-          : el('p', { class: 'error', text: t('ui.no_notify_channel') }),
+          : el('div', { class: 'empty bad flush' }, [
+              el('strong', { text: t('ui.no_notify_channel') }),
+              // 채널은 화면이 아니라 서버 설정에서 붙는다 — 어디서 붙이는지 말한다.
+              el('p', { class: 'muted', text: t('ui.notify_channel_hint') }),
+            ]),
         el('div', { class: 'row' }, [
           el('button', {
-            type: 'button', text: t('ui.test_notify'),
+            type: 'button', class: 'sm', text: t('ui.test_notify'),
             onclick: async () => {
               try { await api('/v1/platform/notifications', { method: 'POST', body: {} }); toast(t('ui.saved')); refresh(); }
               catch (err) { showError(err); }
             },
           }),
           el('button', {
-            type: 'button', text: t('ui.diagnostics'),
+            type: 'button', class: 'sm', text: t('ui.diagnostics'),
             onclick: () => downloadJson('/v1/platform/diagnostics', 'diagnostics.json'),
           }),
         ]),
+        cardFoot([el('span', { text: t('ui.notify_stats', { tracked: data.tracked_subjects || 0, sent: data.sent || 0 }) })]),
       ], data.configured ? null : 'bad'),
+      card(t('ui.recent_events'), [recent.length
+        ? table([t('ui.time'), t('ui.event'), t('ui.detail')], recent)
+        : emptyState(t('ui.none'), 'ok')], null, null, t('ui.count', { n: recent.length })),
     ]),
   ];
 }
@@ -1612,10 +1806,10 @@ async function renderPlugins() {
 
   const rows = (data.plugins || []).map((p) => [
     el('div', {}, [
-      el('div', { text: p.name, style: 'font-weight:500' }),
-      el('div', { class: 'sub mono', text: p.version }),
+      el('span', { text: p.name }),
+      el('span', { class: 'sub', text: p.id + ', ' + p.version }),
     ]),
-    pill(p.signature, p.signature === 'verified' || p.signature === 'signed' ? 'ok' : ''),
+    pill(p.signature, p.signature === 'verified' || p.signature === 'signed' ? 'ok' : 'warn'),
     switchControl(!!p.active, async () => {
       try {
         await api('/v1/platform/plugins/' + encodeURIComponent(p.id) + '/activate',
@@ -1627,13 +1821,13 @@ async function renderPlugins() {
     // 이 플러그인이 만든 잡 수. "얼마나 쓰고 있나" 를 답한다.
     String(p.jobs_created || 0),
     // 트리거. 안 돌고 있는 것이 보여야 한다 — 스케줄은 "아직 안 돎", 이벤트는 밀린 건수로.
-    el('span', { class: 'mono', text: triggerCell(p) }),
+    triggerCell(p),
     p.files_present ? '' : pill(t('ui.plugin_missing_files'), 'danger'),
     el('div', { class: 'row end' }, [
       // 토큰을 잃은 플러그인의 유일한 재발급 경로 — 재설치는 토큰을 다시 주지 않는다.
       el('button', { type: 'button', class: 'sm', text: t('ui.plugin_rotate_token'), onclick: () => rotatePluginToken(p.id) }),
       el('button', {
-        type: 'button', class: 'danger sm', text: t('ui.plugin_remove'),
+        type: 'button', class: 'sm', text: t('ui.plugin_remove'),
         onclick: async () => {
           if (!window.confirm(p.id)) return;
           try {
@@ -1681,17 +1875,22 @@ async function rotatePluginToken(pluginId) {
 function triggerCell(p) {
   const parts = [];
   if (p.schedule) {
-    parts.push(p.schedule + (p.last_run_at ? '' : ' · ' + t('ui.plugin_never_ran')));
+    parts.push(el('div', {}, [
+      el('span', { class: 'mono', text: p.schedule }),
+      p.last_run_at ? null : ' ', p.last_run_at ? null : pill(t('ui.plugin_never_ran'), 'warn'),
+    ]));
   }
   if (p.event) {
     const roles = (p.event_roles && p.event_roles.length) ? p.event_roles.join(', ') : '*';
-    let text = p.event + ' (' + roles + ')';
-    if (p.events_pending !== null && p.events_pending !== undefined) {
-      text += ' · ' + t('ui.plugin_events_pending', { n: p.events_pending });
-    }
-    parts.push(text);
+    const pending = p.events_pending !== null && p.events_pending !== undefined;
+    parts.push(el('div', {}, [
+      el('span', { class: 'mono', text: p.event }), ' ', el('span', { class: 'muted', text: '(' + roles + ')' }),
+      pending ? ' ' : null,
+      // 켜 놓았는데 밀림이 늘기만 하면 플러그인이 안 돌고 있는 것이다 — 사람이 볼 것이라 호박색.
+      pending ? pill(t('ui.plugin_events_pending', { n: p.events_pending }), p.events_pending ? 'warn' : '') : null,
+    ]));
   }
-  return parts.join(' / ');
+  return parts.length ? el('div', {}, parts) : el('span', { class: 'muted', text: t('ui.none') });
 }
 
 
@@ -1752,34 +1951,34 @@ async function renderConnections() {
     card(t('ui.services'), [table(
       [t('ui.services'), t('ui.role'), t('ui.rate_limit'), t('ui.budget'), t('ui.end_users'), t('ui.status'), ''],
       services.map((s) => [
-        el('span', { class: 'mono', text: s.id, style: 'font-weight:500' }), s.allow_roles.join(', '),
-        s.rate_limit_per_min ? s.rate_limit_per_min + '/min' : '—',
-        s.budget_usd_per_month ? money(s.budget_usd_per_month) : '—',
-        s.require_end_user ? badge('required', 'internal') : '—',
+        el('span', { class: 'mono', text: s.id }), s.allow_roles.join(', '),
+        s.rate_limit_per_min ? el('span', { class: 'mono', text: t('ui.rate_per_min', { n: s.rate_limit_per_min }) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
+        s.budget_usd_per_month ? el('span', { class: 'mono', text: dollars(s.budget_usd_per_month) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
+        s.require_end_user ? badge(t('ui.required'), 'info') : el('span', { class: 'muted', text: t('ui.optional') }),
         badge(s.status, s.status === 'active' ? 'healthy' : 'unhealthy'),
         el('div', { class: 'row end' }, [
           el('button', { type: 'button', class: 'sm', text: t('ui.edit'), onclick: () => openServiceForm(s, roleCatalog) }),
         ]),
       ]))], null, [
-      el('span', { text: t('ui.count', { n: services.length }) }),
-      el('button', { type: 'button', class: 'primary sm', text: t('ui.add_service'), onclick: () => openServiceForm(null, roleCatalog) }),
-    ]),
+      el('button', { type: 'button', class: 'sm', text: t('ui.add_service'), onclick: () => openServiceForm(null, roleCatalog) }),
+    ], t('ui.count', { n: services.length })),
 
     card(t('ui.tokens'), [
       // **원값도 해시도 나가지 않는다.** 접두사만으로 어느 토큰인지 식별한다.
       table([t('ui.tokens'), t('ui.services'), t('ui.role'), t('ui.last_request'), '', ''],
         tokens.map((tok) => [
           el('code', { text: tok.prefix + '…' }),
-          el('span', { class: 'mono', text: tok.service_id }), pill(tok.role, tok.role === 'platform_admin' ? 'accent' : ''), when(tok.last_used_at),
-          tok.revoked_at ? badge(t('ui.revoke'), 'unhealthy')
-            : (tok.expires_at ? badge(when(tok.expires_at), 'draining') : '—'),
+          el('span', { class: 'mono', text: tok.service_id }), pill(tok.role, tok.role === 'platform_admin' ? 'accent' : ''),
+          el('span', { class: 'mono', text: stamp(tok.last_used_at) }),
+          tok.revoked_at ? badge(t('ui.revoked'), 'unhealthy')
+            : (tok.expires_at ? badge(when(tok.expires_at), 'draining') : el('span', { class: 'muted', text: t('ui.none') })),
           el('div', { class: 'row end' }, tok.revoked_at ? [] : [
             el('button', { type: 'button', class: 'sm', text: t('ui.rotate'), onclick: () => rotateToken(tok.id) }),
-            el('button', { type: 'button', class: 'danger sm', text: t('ui.revoke'), onclick: () => revokeToken(tok.id) }),
+            el('button', { type: 'button', class: 'sm', text: t('ui.revoke'), onclick: () => revokeToken(tok.id) }),
           ]),
         ])),
       issueTokenForm(services),
-    ], null, el('span', { text: t('ui.count', { n: tokens.length }) })),
+    ], null, null, t('ui.count', { n: tokens.length })),
   ];
 }
 
@@ -1882,7 +2081,7 @@ function serviceForm(existing, roleCatalog) {
 }
 
 function openServiceForm(existing, roleCatalog) {
-  openDrawer(existing ? t('ui.edit') + ' · ' + existing.id : t('ui.add_service'), [serviceForm(existing, roleCatalog)], [drawerClose()]);
+  openDrawer(existing ? t('ui.edit') + ': ' + existing.id : t('ui.add_service'), [serviceForm(existing, roleCatalog)], [drawerClose()]);
 }
 
 /** 발급된 토큰을 한 번만 보여준다. 드로어는 갱신이 안 건드리므로 닫기 전까지 남는다. */
@@ -1993,24 +2192,19 @@ async function renderConsumerStatus() {
   const data = await fetchAll({ status: '/v1/status', roles: '/v1/roles' });
   renderBanners();
   const s = data.status || { lanes: {}, nodes: {} };
-  const lanes = Object.entries(s.lanes || {});
+  const nodes = s.nodes || {};
+  const healthy = nodes.total && nodes.healthy === nodes.total;
 
   return [
-    el('div', { class: 'grid' }, [
-      stat(t('ui.nodes'), (s.nodes.healthy || 0) + ' / ' + (s.nodes.total || 0),
-        s.nodes.total && s.nodes.healthy === s.nodes.total ? 'ok' : '', t('ui.online')),
-      stat(t('ui.queued'), lanes.reduce((sum, [, l]) => sum + l.queued, 0), '',
-        t('ui.running') + ' ' + lanes.reduce((sum, [, l]) => sum + (l.running || 0), 0)),
-    ]),
-    el('div', { class: 'grid wide' }, [
-      card(t('ui.lane'), [table(
-        [t('ui.lane'), { label: t('ui.running'), num: true }, { label: t('ui.queued'), num: true }],
-        lanes.map(([name, l]) => [el('span', { class: 'mono' }, [laneChip(name), name]), l.running || 0, l.queued || 0]))]),
-      card(t('ui.role'), [table(
-        [t('ui.role'), t('ui.kind'), { label: t('ui.timeout'), num: true }, { label: t('ui.max_prompt_chars'), num: true }],
-        ((data.roles && data.roles.roles) || []).map((r) =>
-          [el('span', { text: r.name, style: 'font-weight:500' }), pill(r.kind, ''), r.timeout_seconds + 's', r.max_prompt_chars]))]),
-    ]),
+    laneBoard(s.lanes, null,
+      [pill(t('ui.nodes') + ' ' + (nodes.healthy || 0) + ' / ' + (nodes.total || 0) + ' ' + t('ui.online'), healthy ? 'ok' : 'warn')]),
+    card(t('ui.role'), [table(
+      [t('ui.role'), t('ui.kind'), t('ui.lane'), { label: t('ui.timeout'), num: true }, { label: t('ui.max_prompt_chars'), num: true }],
+      ((data.roles && data.roles.roles) || []).map((r) => [
+        r.name, pill(r.kind, ''), r.lane || '',
+        el('span', { class: 'mono', text: r.timeout_seconds + 's' }),
+        el('span', { class: 'mono', text: Number(r.max_prompt_chars || 0).toLocaleString() }),
+      ]))], null, null, t('ui.count', { n: ((data.roles && data.roles.roles) || []).length })),
   ];
 }
 
@@ -2048,11 +2242,11 @@ async function renderAccount() {
   const s = state.session;
   return [
     card(t('ui.account'), [
-      el('div', { class: 'row' }, [
-        el('span', { class: 'avatar', style: 'width:44px;height:44px;font-size:15px', text: initialOf(s) }),
+      el('div', { class: 'who' }, [
+        el('span', { class: 'avatar', 'aria-hidden': 'true', text: initialOf(s) }),
         el('div', {}, [
-          el('div', { text: s.account, style: 'font-weight:600' }),
-          el('div', { class: 'sub muted', text: s.tenant.name + ' · ' + s.role }),
+          el('div', { class: 'who-name', text: s.account }),
+          el('div', { class: 'who-role', text: s.tenant.name + ', ' + s.role }),
         ]),
       ]),
       el('p', { class: 'hint', text: t('ui.signed_in_as', { name: s.account }) }),
@@ -2066,10 +2260,10 @@ async function renderAccount() {
  *  목록에 해시는 없다 — 서버가 애초에 내주지 않는다. */
 function accountsPanel(basePath, accounts, options) {
   const rows = accounts.map((a) => [
-    el('span', { class: 'mono', text: a.username, style: 'font-weight:500' }),
+    el('span', { class: 'mono', text: a.username }),
     pill(a.role, a.role === 'platform_admin' ? 'accent' : (a.role === 'user' ? 'info' : '')),
     el('span', { class: 'mono', text: options.showTenant ? a.tenant_id : a.service_id }),
-    el('span', { class: 'muted', text: a.last_login_at ? when(a.last_login_at) : '—' }),
+    el('span', { class: 'mono muted', text: stamp(a.last_login_at) }),
     a.disabled_at ? pill(t('ui.disabled'), 'danger') : pill(t('ui.plugin_active'), 'ok'),
     switchControl(!a.disabled_at, async () => {
       try {
@@ -2216,8 +2410,15 @@ function effectiveTheme() {
 function applyTheme(theme) {
   if (theme) document.documentElement.dataset.theme = theme;
   else delete document.documentElement.dataset.theme;
-  const button = $('theme');
-  button.replaceChildren(icon(effectiveTheme() === 'dark' ? 'sun' : 'moon'));
+  paintThemeButton();
+}
+
+/** 토글은 지금과 반대 모드의 이름을 단다. 로그인 전에는 문구 카탈로그가 비어 있어 아이콘만 그리고,
+ *  세션을 열면 다시 그린다 — 빈 카탈로그의 t() 는 키 문자열을 돌려주기 때문이다. */
+function paintThemeButton() {
+  const dark = effectiveTheme() === 'dark';
+  const label = state.strings['ui.dark_mode'] ? t(dark ? 'ui.light_mode' : 'ui.dark_mode') : '';
+  $('theme').replaceChildren(icon(dark ? 'sun' : 'moon'), label ? el('span', { text: label }) : null);
 }
 
 function initTheme() {
@@ -2260,14 +2461,17 @@ async function loadSession() {
   applyTitleStrings();
   state.platformBlocked = await platformSurfaceBlocked();
 
-  const who = state.session.account
-    ? t('ui.signed_in_as', { name: state.session.account }) + ' · '
-    : '';
-  $('who').textContent = who + state.session.tenant.name + ' · ' + state.session.role;
-  $('version').textContent = 'v' + state.session.version;
+  const s = state.session;
+  // 누구로 들어왔는지: 이름(계정이 없으면 역할) 한 줄, 테넌트와 역할 한 줄. 가운뎃점으로 잇지 않는다.
+  $('who').replaceChildren(
+    el('span', { class: 'who-name', text: s.account ? t('ui.signed_in_as', { name: s.account }) : s.role }),
+    el('span', { class: 'who-role', text: s.tenant.name + ', ' + s.role }),
+  );
+  $('version').textContent = 'v' + s.version;
   const avatar = $('avatar');
-  avatar.textContent = initialOf(state.session);
-  avatar.title = (state.session.account || state.session.role) + ' · ' + state.session.tenant.name;
+  avatar.textContent = initialOf(s);
+  avatar.title = (s.account || s.role) + ', ' + s.tenant.name;
+  paintThemeButton();
 }
 
 /** 플랫폼 관리 면이 이 주소에서 열리는가.
@@ -2343,13 +2547,19 @@ async function boot() {
     }
   });
   $('refresh').addEventListener('click', async () => { await refresh(); toast(t('ui.refreshed')); });
-  $('logout').addEventListener('click', async () => {
+  const logout = async () => {
     // 계정 세션이면 서버의 세션 토큰도 폐기한다. 화면만 지우면 토큰은 만료까지 살아 있다.
     if (state.session && state.session.account) {
       try { await api('/v1/logout', { method: 'POST' }); } catch (_) { /* 이미 만료됐을 수 있다 */ }
     }
+    setNav(false);
     disconnect();
-  });
+  };
+  $('logout').addEventListener('click', logout);
+  $('rail-logout').addEventListener('click', logout);   // 좁은 화면에서는 상단 바 대신 서랍에 있다
+  $('menu').addEventListener('click', () => setNav(!$('shell').classList.contains('nav-open')));
+  $('rail-close').addEventListener('click', () => { setNav(false); $('menu').focus(); });
+  $('nav-scrim').addEventListener('click', () => setNav(false));
   $('theme').addEventListener('click', toggleTheme);
   $('avatar').addEventListener('click', () => {
     if (!state.session) return;
@@ -2359,7 +2569,9 @@ async function boot() {
   $('drawer-close').addEventListener('click', closeDrawer);
   $('drawer-overlay').addEventListener('click', closeDrawer);
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && !$('drawer').hidden) closeDrawer();
+    if (event.key !== 'Escape') return;
+    if (!$('drawer').hidden) closeDrawer();
+    else if ($('shell').classList.contains('nav-open')) { setNav(false); $('menu').focus(); }
   });
 
   let saved = null;

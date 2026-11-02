@@ -1170,17 +1170,23 @@
 상태   구현됨
 
 ### OPS-8  관제 UI
-정의   빌드 단계 없는 정적 화면. 좌측 아이콘 레일 · 상태 필이 있는 헤더 · 카드 본문 · 우측 드로어 · 토스트로
-       노드·테넌트·모델·규칙·작업·사용량·알림·설정을 한 곳에서 본다(2026-09 디자인 핸드오프 구조).
-       레일 항목은 세션의 역할로 결정된다 — 플랫폼 면(노드·테넌트·모델·알림)은 플랫폼 관리자에게만 보인다.
-       라이트·다크 테마는 OS 설정을 따르고 레일 버튼으로 뒤집는다(선택은 `localStorage` 의 테마 키 하나뿐).
+정의   빌드 단계 없는 정적 화면. 좌측 라벨 사이드바(플랫폼 · 테넌트 두 묶음, 테넌트 묶음 머리에 지금 보고 있는
+       테넌트) · 상태 칩이 있는 상단 바 · 본문 머리(제목 · 설명 · 화면 동작) · 패널 · 우측 드로어 · 토스트로
+       노드·레인·테넌트·모델·규칙·작업·사용량·알림·설정을 한 곳에서 본다(0.7.1 개편).
+       사이드바 항목은 세션의 역할로 결정된다 — 플랫폼 면(노드·테넌트·모델·알림)은 플랫폼 관리자에게만 보인다.
+       색은 뜻이 하나씩이다 — 호박색은 사람이 손댈 것(주 버튼 · 승인 대기 · 고른 행), 청록은 계기 읽기(도는 슬롯 ·
+       차트 · 적재된 모델 · 마스킹), 녹색·빨강은 상태에만 쓴다. 패널은 그림자 없이 가는 선으로 나눈다.
+       라이트·다크 테마는 OS 설정을 따르고 사이드바 버튼으로 뒤집는다(선택은 `localStorage` 의 테마 키 하나뿐).
+       60rem 보다 좁으면 사이드바가 메뉴 버튼으로 여닫는 서랍이 된다.
+       글꼴 셋(Host Grotesk · Pretendard 공식 서브셋 · Atkinson Hyperlegible Mono)은 `static/fonts` 에
+       OFL-1.1 라이선스 사본과 함께 들어 있다(woff2 약 0.58MB).
 표면   `GET /ui` · `static/`
-구현   `app/main.py:ui_index` · `static/app.js` `static/index.html` `static/style.css`
-계약   빌드 없이 서빙된다 · 외부 자산(CDN·웹폰트)과 프레임워크 번들을 안 쓴다
+구현   `app/main.py:ui_index` · `static/app.js` `static/index.html` `static/style.css` · `static/fonts`
+계약   빌드 없이 서빙된다 · 외부 자산(CDN·외부 웹폰트)과 프레임워크 번들을 안 쓴다 — 글꼴도 같은 출처에서 나간다
        서버 데이터를 HTML 로 쓰지 않는다(XSS) · 토큰은 세션 스토리지에만 둔다
        `index.html` 이 `app.js` 참조에 버전을 박는다 — 업그레이드 후 캐시된 옛 JS 가 새 API 를 안 때린다
        화면이 쓰는 모든 문자열이 모든 로케일에 있고, 안 쓰는 문자열은 없다
-       레일은 역할이 쓸 수 있는 페이지만 내놓는다 · 드로어·토스트는 `#view` 밖에 살아 자동 갱신에 지워지지 않는다
+       사이드바(`#rail`)는 역할이 쓸 수 있는 페이지만 내놓는다 · 드로어·토스트는 `#view` 밖에 살아 자동 갱신에 지워지지 않는다
        1회 표시 값(발급 토큰)은 드로어에서만 보여 주고 목록에는 남기지 않는다
 고정   `test_ui.py::test_the_ui_is_served_without_a_build_step`
        `test_ui.py::test_no_external_assets`
@@ -1230,7 +1236,7 @@
 표면   `GET /client` (308 → `/client/`) · `/client/*` 정적 자산 · `static/client/{index.html, client.js, client.css}`
        로그인은 사용자 계정(AUTH-10, 기본) 또는 서비스 토큰 붙여넣기(이름 필수) · 탭: 요청 · 대화(`chat` 역할이 보일 때만) · 기록(PIPE-9) · 계정
 구현   `app/main.py:_serve_index` `client_page` · `VersionedStaticFiles` · `static/client/client.js` · `config/roles.yaml` 의 `chat` 역할
-계약   관제 UI 와 같은 규칙 — 빌드 단계·프레임워크·CDN·웹폰트 없음 · `innerHTML` 없음 · 토큰은 `sessionStorage` 만(키는 콘솔과 다르다) · 화면은 마스킹본만 · API 에 없는 기능은 그리지 않는다
+계약   관제 UI 와 같은 규칙 — 빌드 단계·프레임워크·CDN·외부 웹폰트 없음 · `innerHTML` 없음 · 토큰은 `sessionStorage` 만(키는 콘솔과 다르다) · 화면은 마스킹본만 · API 에 없는 기능은 그리지 않는다
        공용 헬퍼(`t` `applyStaticStrings` `el` `api` `login`)와 테마 토큰은 콘솔에서 글자 그대로 복제하고 테스트가 동일성을 본다 — 공용 모듈은 콘솔의 핀(`import` 금지·함수 순서)이 막는다
        폴링은 서버의 `retry_after` 를 따르고 `setInterval` 을 쓰지 않는다 · 파일은 브라우저 안에서만 읽는다(텍스트 계열 · 2MB) · 문자열은 `client.*` 만 쓰고 죽은 키는 실패한다
        대화는 `POST /v1/chat`(PIPE-10)로 턴 배열을 보낸다 — 오래된 턴부터 잘라 역할의 `max_prompt_chars` 에 맞추되 마지막 사용자 턴은 남긴다(넘치면 서버가 413). 트랜스크립트는 메모리에만 있고, 기록의 턴 말풍선은 `kind` 가 `chat` 인 행의 마스킹본에서만 그린다

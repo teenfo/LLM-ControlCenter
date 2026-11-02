@@ -1399,6 +1399,36 @@ def test_the_wheel_carries_the_client_page():
         assert pattern in data, f"app.bundled_static 에 {pattern} 이 없다"
 
 
+def test_the_wheel_carries_the_bundled_fonts():
+    """글꼴도 `static/fonts/` 한 단계 아래라 같은 틈이다 — 선언이 빠지면 휠 설치본만 조용히 시스템 글꼴로 떨어진다.
+
+    스타일시트가 가리키는 글꼴 파일이 실제로 있는지, 글꼴 패밀리마다 OFL 라이선스 사본(`OFL-<패밀리>.txt`)이 옆에
+    있는지도 본다. OFL 은 글꼴과 함께 라이선스 사본을 내보내는 것이 배포 조건이다.
+    """
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        config = tomllib.load(handle)
+
+    data = config["tool"]["setuptools"]["package-data"]["app.bundled_static"]
+    for pattern in ("fonts/*.woff2", "fonts/*.txt"):
+        assert pattern in data, f"app.bundled_static 에 {pattern} 이 없다"
+
+    css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    cited = set(re.findall(r'url\("(fonts/[^"]+)"\)', css))
+    assert cited, "style.css 가 글꼴 파일을 하나도 안 가리킨다 — 형식이 바뀌었다"
+    missing = sorted(one for one in cited if not (ROOT / "static" / one).is_file())
+    assert not missing, f"style.css 가 가리키는데 없는 글꼴: {missing}"
+
+    families = set(re.findall(r'@font-face\s*\{\s*font-family:\s*"([^"]+)"', css))
+    assert families, "style.css 에서 @font-face 를 하나도 못 읽었다"
+    unlicensed = sorted(
+        family for family in families
+        if not (ROOT / "static" / "fonts" / f"OFL-{family.replace(' ', '')}.txt").is_file()
+    )
+    assert not unlicensed, f"라이선스 사본 없이 나가는 글꼴: {unlicensed}"
+
+
 def test_asset_lookup_handles_both_layouts():
     """저장소에서는 루트에, 설치본에서는 패키지 아래에 있다 — 한쪽만 보면 깨진다."""
     from app.cli_paths import PACKAGE, ROOT as APP_ROOT, bundled
