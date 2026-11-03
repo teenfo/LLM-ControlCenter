@@ -233,6 +233,9 @@ button svg { flex-shrink: 0; }
 .scope { display: grid; padding: var(--space-xs) var(--space-sm); margin-block: var(--space-2xs); border: var(--rule-hair) solid var(--border); border-radius: var(--radius-pill); background: var(--surface); }
 .scope-name { font-size: var(--text-sm); font-weight: 500; overflow-wrap: anywhere; }
 .scope .mono { font-size: var(--text-xs); color: var(--muted); }
+/* 플랫폼 관리자의 테넌트 고르기 — 상자 안에 상자를 겹치지 않는다(고르기 상자가 곧 테두리다). */
+.scope.pick { gap: var(--space-2xs); padding: 0; border: 0; background: none; }
+.scope.pick .scope-name { font-size: var(--text-xs); color: var(--muted); font-weight: 400; }
 .rail-item {
   position: relative; display: flex; align-items: center; gap: var(--space-sm); width: 100%;
   min-height: 2.375rem; padding: 0 var(--space-xs); justify-content: flex-start;

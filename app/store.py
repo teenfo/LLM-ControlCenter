@@ -3199,7 +3199,9 @@ class SqliteStore:
     ) -> list[sqlite3.Row]:
         """플랫폼 관리자용 전 테넌트 사용량.
 
-        경계를 넘는 유일한 조회 경로이며, 넘은 사실이 감사에 남는다.
+        경계를 넘는 조회이며 넘은 사실이 감사에 남는다. 다른 하나는 플랫폼 관리자의
+        테넌트 보기(`main._tenant_admin` 의 `X-LCC-Tenant`)로, 고른 테넌트의 감사에
+        `platform_view` 로 남는다.
         """
         if not isinstance(scope, PlatformScope):
             raise ScopeViolation("전 테넌트 조회는 PlatformScope 를 요구한다")

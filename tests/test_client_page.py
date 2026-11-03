@@ -302,6 +302,13 @@ def test_the_ask_tab_explains_itself_when_the_account_has_no_role():
     assert "s.service.id" in empty, "어느 서비스에 역할이 없는지 말해야 관리자에게 물을 수 있다"
 
 
+def test_the_client_page_never_picks_another_tenant():
+    """api() 는 관제 UI 와 글자 그대로 같다 — 그 안의 scopeHeaders 자리가 클라이언트 페이지에서는 언제나 비어 있다."""
+    code = (CLIENT / "client.js").read_text(encoding="utf-8")
+    assert "return {};" in block(code, "function scopeHeaders() {")
+    assert "X-LCC-Tenant" not in code
+
+
 def test_history_shows_masked_prompts_only():
     code = (CLIENT / "client.js").read_text(encoding="utf-8")
     assert "prompt_masked" in code

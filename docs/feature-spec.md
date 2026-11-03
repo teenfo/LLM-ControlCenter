@@ -80,10 +80,19 @@
 계약   테넌트 관리자는 플랫폼 작업을 할 수 없다 · 서비스 토큰은 관리자가 아니다
        정지된 테넌트의 토큰은 인증되지 않는다
        계정 역할 `user`(AUTH-10)는 토큰 역할 `service` 로 내려온다 — 사람은 네 번째 등급이 아니라 서비스 토큰의 앞문이다
+       **플랫폼 관리자는 슈퍼유저다(0.7.5)** — `/v1/admin/*` 에 `X-LCC-Tenant: <테넌트>` 를 보내면 그 테넌트의 관리 면을 그대로 본다·바꾼다
+       (원문 열람 포함, 그 테넌트의 DEK 로). 대신 **들여다본 테넌트의 감사에 `platform_view` 가 남는다** — 읽기는 5분 창으로 합치고
+       쓰기는 방법·경로를 적는다 · 다른 역할이 그 머리글을 보내면 403 `forbidden_platform_admin`, 없는 테넌트는 404, 자기 테넌트면 아무 일 없음
+       진입점은 `main._tenant_admin` 하나이고, 그 뒤 핸들러는 돌려받은 범위만 쓴다
 고정   `test_auth.py::test_tenant_admin_cannot_do_platform_things`
        `test_auth.py::test_service_token_is_not_an_admin`
        `test_auth.py::test_token_of_suspended_tenant_is_rejected`
        `test_accounts.py::test_a_user_session_cannot_reach_admin_or_platform_routes`
+       `test_api.py::test_the_platform_admin_can_view_another_tenant`
+       `test_api.py::test_a_platform_view_is_recorded_in_the_viewed_tenant`
+       `test_api.py::test_only_the_platform_admin_can_view_another_tenant`
+       `test_api.py::test_writes_through_the_view_land_in_the_viewed_tenant_on_the_record`
+       `test_api.py::test_the_platform_admin_reads_a_raw_prompt_of_the_viewed_tenant_on_the_record`
 상태   구현됨
 
 ### AUTH-5  엔드유저 신원 해싱
@@ -1205,6 +1214,8 @@
        「감사」 화면(0.7.4, 테넌트 관리자): 관리 감사 기록(`GET /v1/admin/audit` — 원문 열람 · 계정 · 토큰 · 규칙 · 설정, "원문 열람" 필터,
        "누가" 는 토큰 목록으로 풀어 계정 세션이면 아이디)과 가드 탐지 전체 이력(`GET /v1/admin/guard/events` — 검토 대기만이 아니다).
        매 요청 남는 2단 분류기 정상 표지(`_classifier_ok`)는 접고 수만 말한다(실패 표지는 보인다) · 원문은 여기서 열지 않는다 — 열람 사실만 보인다
+       플랫폼 관리자는 테넌트 묶음 머리의 「볼 테넌트」에서 테넌트를 고른다(0.7.5, AUTH-4) — `X-LCC-Tenant` 는 `/v1/admin/*` 에만 붙고,
+       보고 있는 동안 화면마다 배너(「플랫폼으로 돌아가기」)가 뜬다 · 고른 값은 세션 스토리지에만, 로그아웃이 지운다 · 감사 화면은 그 행위자를 "플랫폼 관리자" 로 보인다
 고정   `test_ui.py::test_the_ui_is_served_without_a_build_step`
        `test_ui.py::test_no_external_assets`
        `test_ui.py::test_server_data_is_never_written_as_html`
@@ -1214,6 +1225,8 @@
        `test_ui.py::test_the_rail_offers_only_the_pages_the_role_can_use`
        `test_ui.py::test_the_drawer_and_toast_live_outside_the_view`
        `test_ui.py::test_the_audit_page_shows_who_did_what_and_what_the_guard_caught`
+       `test_ui.py::test_the_platform_admin_picks_which_tenant_the_tenant_pages_show`
+       `test_client_page.py::test_the_client_page_never_picks_another_tenant`
        `test_api.py::test_admin_audit_and_usage_never_cross_tenants`
        `test_api.py::test_raw_prompt_read_is_audited`
 상태   구현됨

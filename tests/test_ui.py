@@ -125,6 +125,24 @@ def test_the_audit_page_shows_who_did_what_and_what_the_guard_caught():
     assert "'login:'" in actor, "계정 세션은 토큰 id 대신 아이디로 보여야 '누가' 가 읽힌다"
 
 
+def test_the_platform_admin_picks_which_tenant_the_tenant_pages_show():
+    """플랫폼 관리자는 레일에서 볼 테넌트를 고른다 — 머리글은 테넌트 관리 면에만 붙고, 보고 있다는 사실은
+    화면마다 배너로 보인다(쓰기도 그 테넌트에 들어가기 때문이다)."""
+    from app.main import TENANT_VIEW_HEADER
+
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    hook = source[source.index("function scopeHeaders(path)"):source.index("function viewedTenant")]
+    assert "state.viewTenant" in hook and "'/v1/admin/'" in hook
+    assert f"'{TENANT_VIEW_HEADER}'" in hook, "서버가 듣는 머리글 이름과 어긋났다"
+    scope = source[source.index("function tenantScope(s)"):source.index("function navGroup")]
+    assert "s.is_platform_admin" in scope and "el('select'" in scope and "setViewTenant(" in scope
+    start = source.index("function renderBanners(extra) {")
+    banners = source[start:source.index("\n}\n", start)]
+    assert "state.viewTenant" in banners and "'ui.tenant_view_banner'" in banners and "setViewTenant(null)" in banners
+    leave = source[source.index("function disconnect()"):source.index("async function boot()")]
+    assert "VIEW_TENANT_KEY" in leave and "state.viewTenant = null" in leave, "다음 사람이 앞사람이 고른 테넌트를 물려받는다"
+
+
 def test_the_drawer_and_toast_live_outside_the_view():
     """드로어의 폼과 발급된 토큰은 #view 밖에 있어야 자동 갱신이 지우지 않는다."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")

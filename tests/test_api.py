@@ -2050,3 +2050,79 @@ def test_the_series_bucket_is_a_whitelist(harness):
 
     with pytest.raises(StoreError):
         harness.store.usage_series(TenantScope("acme"), since=0, bucket="minute")
+
+
+# ── 플랫폼 관리자의 테넌트 보기 (X-LCC-Tenant) ─────────────────────────────
+#
+# 플랫폼 관리자는 슈퍼유저다 — 테넌트를 만들고 계정을 꽂을 수 있으니, 계정을 하나 더 만들어
+# 들어가던 일을 화면에서 바로 하게 한다. 대신 **들여다본 테넌트의 감사에 남는다.**
+
+
+def view(token: str, tenant: str) -> dict[str, str]:
+    return {**auth(token), "X-LCC-Tenant": tenant}
+
+
+def test_the_platform_admin_can_view_another_tenant(client, acme, globex):
+    client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "글로벡스 문서", "wait": 0},
+        headers=auth(globex["service"]),
+    )
+    seen = client.get("/v1/admin/jobs", headers=view(acme["platform_admin"], "globex"))
+    assert seen.status_code == 200, seen.text
+    assert [j["service_id"] for j in seen.json()["jobs"]] == ["globex-web"]
+    own = client.get("/v1/admin/jobs", headers=auth(acme["platform_admin"])).json()["jobs"]
+    assert own == [], "머리글이 없으면 자기 테넌트다"
+
+
+def test_a_platform_view_is_recorded_in_the_viewed_tenant(harness, client, acme, globex):
+    """그 테넌트도 플랫폼이 언제 봤는지 안다. 15초마다 갱신하는 콘솔의 읽기는 한 줄로 합친다."""
+    for _ in range(3):
+        assert client.get("/v1/admin/audit", headers=view(acme["platform_admin"], "globex")).status_code == 200
+    rows = [r for r in harness.store.list_audit(TenantScope("globex")) if r["action"] == "platform_view"]
+    assert len(rows) == 1, "읽기마다 한 줄씩 쌓으면 감사가 화면을 열어 둔 시간에 비례해 자란다"
+    assert json.loads(rows[0]["detail_json"])["repeats"] == 3
+    assert not [r for r in harness.store.list_audit(TenantScope("acme")) if r["action"] == "platform_view"]
+
+
+def test_only_the_platform_admin_can_view_another_tenant(client, acme, globex):
+    """테넌트 관리자가 머리글로 남의 테넌트를 보면 격리가 끝난다 — 조용히 무시하지도 않고 403 이다."""
+    tenant_admin = client.get("/v1/admin/jobs", headers=view(globex["tenant_admin"], "acme"))
+    assert tenant_admin.status_code == 403
+    assert tenant_admin.json()["code"] == "forbidden_platform_admin"
+    assert client.get("/v1/admin/jobs", headers=view(acme["service"], "globex")).status_code == 403
+
+
+def test_viewing_an_unknown_tenant_is_404(client, acme):
+    assert client.get("/v1/admin/jobs", headers=view(acme["platform_admin"], "ghost")).status_code == 404
+
+
+def test_the_own_tenant_in_the_header_changes_nothing(harness, client, acme):
+    assert client.get("/v1/admin/jobs", headers=view(acme["platform_admin"], "acme")).status_code == 200
+    assert not [r for r in harness.store.list_audit(TenantScope("acme")) if r["action"] == "platform_view"]
+
+
+def test_writes_through_the_view_land_in_the_viewed_tenant_on_the_record(harness, client, acme, globex):
+    issued = client.post(
+        "/v1/admin/tokens", json={"service_id": "globex-web"},
+        headers=view(acme["platform_admin"], "globex"),
+    )
+    assert issued.status_code == 201, issued.text
+    tokens = client.get("/v1/admin/tokens", headers=auth(globex["tenant_admin"])).json()["tokens"]
+    assert issued.json()["id"] in [tk["id"] for tk in tokens], "토큰이 고른 테넌트에 생겨야 한다"
+    audit = harness.store.list_audit(TenantScope("globex"))
+    assert "issue_token" in [r["action"] for r in audit]
+    write = next(r for r in audit if r["action"] == "platform_view")
+    assert json.loads(write["detail_json"])["method"] == "POST", "쓰기는 합치지 않고 무엇을 했는지 남긴다"
+
+
+def test_the_platform_admin_reads_a_raw_prompt_of_the_viewed_tenant_on_the_record(harness, client, acme, globex):
+    """원문 열람도 그 테넌트의 DEK 로 풀고, 그 테넌트의 감사에 남는다."""
+    job_id = client.post(
+        "/v1/generate", json={"role": "summarize", "prompt": "글로벡스 원문 hong@example.com", "wait": 0},
+        headers=auth(globex["service"]),
+    ).json()["job_id"]
+    raw = client.get(f"/v1/admin/jobs/{job_id}/raw", headers=view(acme["platform_admin"], "globex"))
+    assert raw.status_code == 200, raw.text
+    assert raw.json()["prompt"] == "글로벡스 원문 hong@example.com"
+    reads = [r for r in harness.store.list_audit(TenantScope("globex")) if r["action"] == "read_raw_prompt"]
+    assert len(reads) == 1 and reads[0]["target"] == job_id

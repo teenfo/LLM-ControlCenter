@@ -85,10 +85,15 @@ function el(tag, attrs, children) {
   return node;
 }
 
+/** 관제 UI 와 글자 그대로 같은 api() 를 쓰기 위한 자리. 클라이언트 페이지는 볼 테넌트를 바꾸지 않는다. */
+function scopeHeaders() {
+  return {};
+}
+
 async function api(path, options) {
   const opts = Object.assign({ headers: {} }, options || {});
   opts.headers = Object.assign(
-    { Authorization: 'Bearer ' + state.token }, opts.headers);
+    { Authorization: 'Bearer ' + state.token }, scopeHeaders(path), opts.headers);
   const binary = opts.body instanceof ArrayBuffer || ArrayBuffer.isView(opts.body);
   if (binary) {
     // 플러그인 번들은 raw body 로 올린다 — 멀티파트를 받으려면 서버에

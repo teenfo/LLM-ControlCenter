@@ -18,6 +18,8 @@
 'use strict';
 
 const TOKEN_KEY = 'llmcc.token';
+//: 플랫폼 관리자가 고른 테넌트. 토큰과 같은 수명이라 sessionStorage 다.
+const VIEW_TENANT_KEY = 'llmcc.view_tenant';
 //: 테마 선택. 토큰과 달리 기기에 남아도 되는 값이라 localStorage 다 — 이 키 하나뿐이다.
 const THEME_KEY = 'llmcc:theme';
 
@@ -31,6 +33,9 @@ const state = {
   platformBlocked: false,
   jobFilter: 'all',
   auditFilter: 'all',
+  // 플랫폼 관리자가 테넌트 면에서 보는 테넌트(null = 자기 테넌트)와 고를 수 있는 목록.
+  viewTenant: null,
+  tenantList: [],
   usageAxis: 'service_id',
   usageWindow: '30d',
   // 가드 미리보기의 입력과 결과 — 화면 밖(state)에 두어야 자동 갱신이 지우지 않는다.
@@ -550,7 +555,7 @@ function drawerClose() {
 async function api(path, options) {
   const opts = Object.assign({ headers: {} }, options || {});
   opts.headers = Object.assign(
-    { Authorization: 'Bearer ' + state.token }, opts.headers);
+    { Authorization: 'Bearer ' + state.token }, scopeHeaders(path), opts.headers);
   const binary = opts.body instanceof ArrayBuffer || ArrayBuffer.isView(opts.body);
   if (binary) {
     // 플러그인 번들은 raw body 로 올린다 — 멀티파트를 받으려면 서버에
@@ -615,12 +620,20 @@ function renderBanners(extra) {
   // 공개 진입점은 /v1/platform/* 를 404 로 막는다(topology §2). "표시할 항목이 없음" 으로
   // 보이면 사용자는 제품이 비었다고 읽는다 — 막힌 것은 막혔다고 말한다.
   if (state.platformBlocked) warnings.push([t('ui.platform_blocked'), 'bad']);
+  // 남의 테넌트를 보고 있다는 사실은 화면마다 보인다 — 쓰기도 그 테넌트에 들어가기 때문이다.
+  if (state.viewTenant) {
+    warnings.push([t('ui.tenant_view_banner', { name: viewedTenant().name }), 'info',
+      [t('ui.tenant_view_leave'), () => setViewTenant(null)]]);
+  }
   for (const line of extra || []) warnings.push(line);
 
   for (const [text, cls, action] of warnings) {
     box.appendChild(el('div', { class: 'banner' + (cls ? ' ' + cls : '') }, [
       el('div', { class: 'text', text }),
-      action ? el('button', { type: 'button', text: action[0], onclick: () => go(action[1]) }) : null,
+      action ? el('button', {
+        type: 'button', text: action[0],
+        onclick: () => (typeof action[1] === 'function' ? action[1]() : go(action[1])),
+      }) : null,
     ]));
   }
 }
@@ -680,12 +693,27 @@ function renderTabs() {
   const platform = pages.filter((p) => p.platform || (p.id === 'overview' && s.is_platform_admin));
   const tenant = pages.filter((p) => !platform.includes(p));
   if (platform.length) box.appendChild(navGroup(t('ui.nav_platform'), platform));
-  if (tenant.length) {
-    box.appendChild(navGroup(t('ui.nav_tenant'), tenant, el('div', { class: 'scope', title: t('ui.tenant_scope') }, [
+  if (tenant.length) box.appendChild(navGroup(t('ui.nav_tenant'), tenant, tenantScope(s)));
+}
+
+/** 테넌트 묶음 머리. 플랫폼 관리자는 여기서 볼 테넌트를 고른다 — 고른 순간부터 그 테넌트의 감사에 남는다. */
+function tenantScope(s) {
+  if (!s.is_platform_admin || !state.tenantList.length) {
+    return el('div', { class: 'scope', title: t('ui.tenant_scope') }, [
       el('span', { class: 'scope-name', text: s.tenant.name }),
       el('span', { class: 'mono', text: s.tenant.id }),
-    ])));
+    ]);
   }
+  const current = viewedTenant().id;
+  const own = { id: s.tenant.id, name: s.tenant.name };
+  const choices = [own].concat(state.tenantList.filter((tn) => tn.id !== own.id));
+  const select = el('select', { id: 'view-tenant', 'aria-label': t('ui.tenant_view_pick') }, choices.map((tn) => el('option', {
+    value: tn.id, selected: tn.id === current ? 'selected' : null, text: tn.name + ' (' + tn.id + ')',
+  })));
+  select.addEventListener('change', () => setViewTenant(select.value));
+  return el('label', { class: 'scope pick', title: t('ui.tenant_view_pick') }, [
+    el('span', { class: 'scope-name', text: t('ui.tenant_view_pick') }), select,
+  ]);
 }
 
 function navGroup(title, pages, scope) {
@@ -1688,10 +1716,11 @@ const AUDIT_ACTION_LABEL = {
   purge_end_user: 'ui.purge_end_user',
   create_tenant: 'ui.audit_act_create_tenant',
   cancel_job: 'ui.audit_act_cancel_job',
+  platform_view: 'ui.audit_act_platform_view',
 };
 
 const AUDIT_ACCESS = ['login', 'login_failed', 'logout', 'create_account', 'reset_password', 'change_password',
-  'enable_account', 'disable_account', 'move_account', 'issue_token', 'rotate_token', 'revoke_token'];
+  'enable_account', 'disable_account', 'move_account', 'issue_token', 'rotate_token', 'revoke_token', 'platform_view'];
 const AUDIT_POLICY = ['create_service', 'update_service', 'set_guard_rule', 'clear_guard_rule',
   'update_tenant_settings', 'set_role_override', 'clear_role_override'];
 
@@ -1709,8 +1738,9 @@ const CLASSIFIER_OK_RULE = '_classifier_ok';
 const VERDICT_LABEL = { true_positive: 'ui.true_positive', false_positive: 'ui.false_positive' };
 
 /** "누가". 감사의 actor 는 토큰 id 라서, 이 테넌트의 토큰 목록에서 사람이 읽는 이름을 찾는다 — 계정 세션은 아이디다.
- *  못 찾으면(플랫폼 토큰 · 운영 스크립트) 값을 그대로 보인다. */
-function auditActor(actor, tokens) {
+ *  플랫폼 토큰은 이 테넌트 목록에 없다 — 이 테넌트를 들여다본 기록(platform_view)에 나온 행위자면 플랫폼 관리자라고 말한다.
+ *  그 밖에 못 찾으면(운영 스크립트 등) 값을 그대로 보인다. */
+function auditActor(actor, tokens, platformActors) {
   const token = tokens.find((tk) => tk.id === actor);
   const note = token ? String(token.note || '') : '';
   if (note.startsWith('login:')) {
@@ -1718,6 +1748,9 @@ function auditActor(actor, tokens) {
   }
   if (token) {
     return el('div', { class: 'nowrap', title: note }, [el('span', { class: 'mono', text: token.prefix }), el('span', { class: 'sub', text: token.role })]);
+  }
+  if (platformActors.has(actor)) {
+    return el('div', { class: 'nowrap', title: actor }, [el('span', { text: t('ui.audit_platform_admin') }), el('span', { class: 'sub mono', text: actor.slice(0, 8) })]);
   }
   return el('span', { class: 'mono', text: actor });
 }
@@ -1748,6 +1781,7 @@ async function renderAudit() {
   const folded = every.length - events.length;
   const filter = AUDIT_FILTERS.find((f) => f.id === state.auditFilter) || AUDIT_FILTERS[0];
   const shown = rows.filter(filter.match);
+  const platformActors = new Set(rows.filter((r) => r.action === 'platform_view').map((r) => r.actor));
 
   const chips = el('div', { class: 'chips', role: 'group', 'aria-label': t('ui.action') }, AUDIT_FILTERS.map((f) => el('button', {
     type: 'button', class: 'chip' + (f.id === filter.id ? ' active' : ''),
@@ -1763,7 +1797,7 @@ async function renderAudit() {
         [t('ui.time'), t('ui.audit_actor'), t('ui.action'), t('ui.audit_target'), t('ui.audit_detail'), t('ui.audit_outcome')],
         shown.map((r) => [
           el('span', { class: 'mono', text: stamp(r.ts) }),
-          auditActor(r.actor, tokens),
+          auditActor(r.actor, tokens, platformActors),
           auditAction(r.action),
           quiet(r.target),
           quiet(r.detail_json && r.detail_json !== '{}' ? r.detail_json : '', 'clip muted'),
@@ -2593,6 +2627,39 @@ async function login(username, password) {
   return body;
 }
 
+/** 플랫폼 관리자가 고른 테넌트를 테넌트 관리 면(`/v1/admin/*`)에만 붙인다. 서버는 플랫폼 관리자에게만 이 머리글을 듣고,
+ *  들은 사실을 그 테넌트의 감사에 남긴다. 플랫폼 면·계약 경로에는 붙이지 않는다 — 그쪽은 언제나 자기 범위다. */
+function scopeHeaders(path) {
+  return state.viewTenant && path.startsWith('/v1/admin/') ? { 'X-LCC-Tenant': state.viewTenant } : {};
+}
+
+/** 지금 테넌트 면이 보여 주는 테넌트 — 고른 것이 없으면 세션의 테넌트. */
+function viewedTenant() {
+  const s = state.session;
+  if (!state.viewTenant) return { id: s.tenant.id, name: s.tenant.name };
+  const row = state.tenantList.find((tn) => tn.id === state.viewTenant);
+  return { id: state.viewTenant, name: row ? row.name : state.viewTenant };
+}
+
+async function loadTenantList() {
+  if (!state.session.is_platform_admin || state.platformBlocked) { state.tenantList = []; return; }
+  try { state.tenantList = (await api('/v1/platform/tenants')).tenants || []; } catch (_) { state.tenantList = []; }
+}
+
+function setViewTenant(id) {
+  state.viewTenant = id && id !== state.session.tenant.id ? id : null;
+  try {
+    if (state.viewTenant) sessionStorage.setItem(VIEW_TENANT_KEY, state.viewTenant);
+    else sessionStorage.removeItem(VIEW_TENANT_KEY);
+  } catch (_) { /* 사파리 프라이빗 등 */ }
+  // 앞 테넌트에서 고른 필터를 물려받지 않는다. 플랫폼 면에 있었다면 그 테넌트의 작업으로 간다.
+  state.jobFilter = 'all';
+  state.auditFilter = 'all';
+  const page = currentPage();
+  if (state.viewTenant && (!page || page.platform || page.id === 'overview')) { go('jobs'); return; }
+  refresh();
+}
+
 async function loadSession() {
   state.session = await api('/v1/session');
   state.strings = state.session.strings || {};
@@ -2600,6 +2667,11 @@ async function loadSession() {
   applyStaticStrings();
   applyTitleStrings();
   state.platformBlocked = await platformSurfaceBlocked();
+  await loadTenantList();
+  // 새로 고침해도 보던 테넌트에 남는다 — 목록에 없는 테넌트면(지워졌거나 남의 탭 값) 버린다.
+  let saved = null;
+  try { saved = sessionStorage.getItem(VIEW_TENANT_KEY); } catch (_) { /* 무시 */ }
+  state.viewTenant = saved && state.tenantList.some((tn) => tn.id === saved) && saved !== state.session.tenant.id ? saved : null;
 
   const s = state.session;
   // 누구로 들어왔는지: 이름(계정이 없으면 역할) 한 줄, 테넌트와 역할 한 줄. 가운뎃점으로 잇지 않는다.
@@ -2649,7 +2721,9 @@ function disconnect() {
   state.session = null;
   state.page = null;
   state.header = { nodes: null, pending: 0 };
-  try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) { /* 무시 */ }
+  state.viewTenant = null;
+  state.tenantList = [];
+  try { sessionStorage.removeItem(TOKEN_KEY); sessionStorage.removeItem(VIEW_TENANT_KEY); } catch (_) { /* 무시 */ }
   $('shell').hidden = true;
   $('login').hidden = false;
 }

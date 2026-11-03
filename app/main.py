@@ -97,11 +97,11 @@ from .pipeline import (
 )
 from .scheduler import Scheduler
 from .store import (
-    TERMINAL_STATUSES, AlreadyExists, PlatformScope, ScopeViolation, SqliteStore, StoreError,
-    TenantScope,
+    AUDIT_COALESCE_SECONDS, TERMINAL_STATUSES, AlreadyExists, PlatformScope, ScopeViolation,
+    SqliteStore, StoreError, TenantScope,
 )
 
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -129,6 +129,10 @@ POLL_LIMIT_PER_MIN = 600
 #: 인증된 토큰 하나로 컨트롤 플레인 CPU 를 태울 수 있다. 폴링보다 훨씬 낮게
 #: 잡는다 — 계약은 배포 때 한 번 읽는 것이지 루프에서 읽는 것이 아니다.
 CONTRACT_LIMIT_PER_MIN = 60
+
+#: 플랫폼 관리자가 테넌트 관리 면(`/v1/admin/*`)에서 볼 테넌트를 고르는 머리글.
+#: **플랫폼 관리자에게만 듣는다** — 다른 역할이 보내면 403 이다(`_tenant_admin`).
+TENANT_VIEW_HEADER = "X-LCC-Tenant"
 
 #: 메트릭 스크레이프 전용 토큰(환경 변수). 없으면 플랫폼 관리자 토큰만 통한다.
 #:
@@ -934,10 +938,40 @@ async def client_file(request: Request) -> Response:
 
 
 def _tenant_admin(request: Request) -> tuple[AppContext, Principal, TenantScope]:
+    """테넌트 관리 면의 단일 진입점. **플랫폼 관리자는 `X-LCC-Tenant` 로 다른 테넌트를 고른다.**
+
+    플랫폼 관리자는 원래 테넌트를 만들고 그 안에 관리자 계정을 꽂을 수 있다 — 그 권한으로
+    계정을 하나 더 만들어 들어가던 일을 화면에서 바로 하되, **고른 테넌트의 감사에 남긴다**
+    (`platform_view`, 읽기는 플랫폼의 다른 경계 넘기와 같은 5분 창으로 합친다). 그래서 그
+    테넌트도 플랫폼이 언제 들여다봤는지 안다. 쓰기는 각 핸들러가 원래대로 감사를 남기고
+    행위자는 플랫폼 토큰이다.
+
+    테넌트 관리자·서비스 토큰이 이 머리글을 보내면 403 이다 — 조용히 무시하면 자기 테넌트를
+    남의 테넌트로 착각한 화면이 생긴다. 이 함수를 지나는 핸들러는 전부 돌려받은 `scope` 만
+    쓴다(`principal.scope()` 를 직접 쓰지 않는다 — 그러면 범위가 반쯤만 바뀐다).
+    """
     ctx: AppContext = request.app.state.ctx
     principal = _principal(request)
     require_tenant_admin(principal)
-    return ctx, principal, principal.scope()
+    target = (request.headers.get(TENANT_VIEW_HEADER) or "").strip()
+    if not target or target == principal.tenant_id:
+        return ctx, principal, principal.scope()
+
+    require_platform_admin(principal)
+    tenant = ctx.store.get_tenant(target)
+    if tenant is None:
+        raise ApiError("not_found", status=404)
+    # 로케일 팩·한도·원문 복호화가 읽는 테넌트 행도 고른 테넌트의 것이어야 한다.
+    request.state.tenant = tenant
+    request.state.tenant_locale = tenant["locale"]
+    reading = request.method in ("GET", "HEAD")
+    ctx.store.audit(
+        principal.token_id, "platform_view", tenant_id=target, target=target,
+        detail={"reason": "platform console"} if reading
+        else {"reason": "platform console", "method": request.method, "path": request.url.path},
+        coalesce_seconds=AUDIT_COALESCE_SECONDS if reading else 0.0,
+    )
+    return ctx, principal, TenantScope(target)
 
 
 def _service_view(row: Any) -> dict[str, Any]:
