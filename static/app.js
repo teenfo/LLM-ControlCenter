@@ -518,6 +518,17 @@ function dollars(value) {
   return '$' + (Number(value) || 0).toFixed(2);
 }
 
+/** 한도가 걸려 있는가. **0 도 한도다** — 예산 $0 은 "유료 경로 금지" 이지 "한도 없음" 이 아니다.
+ *  참·거짓으로 읽으면 0 이 "없음" 으로 보이고, 그 폼을 저장하면 0 이 null(무제한)로 바뀐다. */
+function hasLimit(value) {
+  return value !== null && value !== undefined;
+}
+
+/** 한도 입력칸의 초깃값 — 없으면 빈칸, 0 이면 "0". */
+function limitValue(value) {
+  return hasLimit(value) ? String(value) : '';
+}
+
 // ── 토스트 · 드로어 ──────────────────────────────────────────────────────
 
 let toastTimer = null;
@@ -1093,10 +1104,14 @@ async function renderTenants() {
     ]),
     el('span', { class: 'mono', text: tenant.locale }),
     badge(tenant.status, tenant.status === 'active' ? 'healthy' : 'unhealthy'),
-    tenant.budget_usd_per_month ? el('span', { class: 'mono', text: dollars(tenant.budget_usd_per_month) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
-    tenant.rate_limit_per_min ? el('span', { class: 'mono', text: t('ui.rate_per_min', { n: tenant.rate_limit_per_min }) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
+    hasLimit(tenant.budget_usd_per_month) ? el('span', { class: 'mono', text: dollars(tenant.budget_usd_per_month) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
+    hasLimit(tenant.rate_limit_per_min) ? el('span', { class: 'mono', text: t('ui.rate_per_min', { n: tenant.rate_limit_per_min }) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
     tenant.has_dek ? badge('DEK', 'info') : badge(t('ui.none')),
     el('div', { class: 'row end' }, [
+      el('button', {
+        type: 'button', class: 'sm', text: t('ui.limits'),
+        onclick: () => openDrawer(t('ui.tenant_limits') + ' — ' + tenant.name, [tenantLimitsForm(tenant.id, tenant)]),
+      }),
       // 파기는 행에서는 중립 버튼이다 — 되돌릴 수 없다는 경고와 확인값 입력은 다음 단계가 맡는다.
       el('button', {
         type: 'button', class: 'sm', text: t('ui.purge_tenant'),
@@ -1391,6 +1406,9 @@ async function renderGuard() {
 
   const rules = data.rules || { effective: [], tenant_rules: [], locale_pack: null };
   const events = (data.events && data.events.events) || [];
+  const own = rules.tenant_rules || [];
+  // 지금 켜진 기본 규칙의 id — 이 id 로 "새 규칙" 을 저장하면 병합이 기본 패턴을 남겨 입력한 패턴이 안 듣는다.
+  const baselineIds = (rules.effective || []).filter((r) => r.locale_pack !== 'tenant').map((r) => r.id);
 
   return [
     // **미리보기가 맨 위다** — 규칙 표는 "무엇이 켜져 있나" 이고, 미리보기는 "그래서 이 문장은 어떻게 되나" 다.
@@ -1422,12 +1440,143 @@ async function renderGuard() {
           badge(r.action.external, r.action.external),
           el('span', { class: 'mono', text: r.locale_pack }),
           el('div', { class: 'row end' }, [
+            el('button', {
+              type: 'button', class: 'sm', text: t('ui.rule_raise'),
+              onclick: () => openDrawer(t('ui.rule_raise') + ' — ' + r.id, [guardGradeForm(r, own.find((x) => x.id === r.id))]),
+            }),
             el('button', { type: 'button', class: 'sm', text: t('ui.promote'), onclick: () => checkPromotion(r.id) }),
           ]),
         ])),
       cardFoot([el('span', { text: t('ui.masked_only') })]),
-    ], null, null, t('ui.count', { n: (rules.effective || []).length })),
+    ], null, [
+      el('button', { type: 'button', class: 'sm', text: t('ui.rule_add'), onclick: () => openDrawer(t('ui.rule_add'), [guardRuleForm(baselineIds)]) }),
+    ], t('ui.count', { n: (rules.effective || []).length })),
+
+    // 이 테넌트가 더하거나 올린 것 — 지우면 더한 규칙은 사라지고 올린 기본 규칙은 기본 등급으로 돌아간다.
+    card(t('ui.tenant_rules'), [
+      own.length ? table([t('ui.rule'), t('ui.kind'), t('ui.rule_content'), t('ui.boundary_internal'), t('ui.boundary_external'), t('ui.replacement_label'), ''],
+        own.map((r) => [
+          el('span', { class: 'mono', text: r.id }),
+          r.kind,
+          el('span', { class: 'clip mono muted', title: r.pattern || r.description || '', text: r.pattern || r.description || '' }),
+          badge(gradeOf(r.action, 'internal'), gradeOf(r.action, 'internal')),
+          badge(gradeOf(r.action, 'external'), gradeOf(r.action, 'external')),
+          r.label ? el('code', { class: 'token', text: r.label }) : el('span', { class: 'muted', text: t('ui.none') }),
+          el('div', { class: 'row end' }, [
+            el('button', { type: 'button', class: 'sm', text: t('ui.delete'), onclick: () => deleteGuardRule(r.id) }),
+          ]),
+        ])) : emptyState(t('ui.tenant_rules_none')),
+    ], null, null, t('ui.count', { n: own.length })),
   ];
+}
+
+//: 가드 등급 사다리. 서버의 ACTION_STRENGTH 와 같은 순서다(off 는 화면에서 고르지 않는다).
+const GRADES = ['audit', 'partial', 'full', 'block'];
+
+function gradeOf(action, boundary) {
+  return typeof action === 'string' ? action : ((action && action[boundary]) || 'audit');
+}
+
+/** 등급 고르기. `floor` 아래는 고를 수 없다 — 기본 규칙은 올리기만 된다(서버의 병합도 센 쪽만 채택한다). */
+function gradeSelect(id, current, floor) {
+  const min = Math.max(0, GRADES.indexOf(floor || 'audit'));
+  return el('select', { id }, GRADES.slice(min).map((g) => el('option', { value: g, selected: g === current ? 'selected' : null, text: g })));
+}
+
+async function saveGuardRule(body) {
+  try {
+    // block 은 서버가 승격 게이트를 본다(가리기는 게이트 밖이다) — 막히면 그 이유(오탐률·검토 수)가 오류로 온다.
+    await api('/v1/admin/guard/rules', { method: 'PUT', body });
+    toast(t('ui.saved'));
+    closeDrawer();
+    refresh();
+  } catch (err) { showError(err); }
+}
+
+async function deleteGuardRule(ruleId) {
+  if (!confirm(t('ui.rule_delete_confirm', { id: ruleId }))) return;
+  try {
+    await api('/v1/admin/guard/rules/' + encodeURIComponent(ruleId), { method: 'DELETE' });
+    toast(t('ui.saved'));
+    refresh();
+  } catch (err) { showError(err); }
+}
+
+/** 새 규칙. 패턴(정규식) 또는 문맥(2단 분류기가 문장으로 판정). 등급은 audit 로 시작하는 것이 운영 흐름이다.
+ *  **켜진 기본 규칙의 id 는 받지 않는다** — 서버는 저장하지만 병합(`_stronger_of`)이 기본 패턴을 남기므로
+ *  입력한 패턴은 듣지 않는다. 저장됐다고 보이는데 안 듣는 규칙보다 거절이 낫다. */
+function guardRuleForm(baselineIds) {
+  const id = el('input', { id: 'rule-id', type: 'text', autocomplete: 'off', spellcheck: 'false' });
+  const kind = el('select', { id: 'rule-kind' }, [
+    el('option', { value: 'pattern', text: t('ui.rule_kind_pattern') }),
+    el('option', { value: 'llm', text: t('ui.rule_kind_llm') }),
+  ]);
+  const pattern = el('input', { id: 'rule-pattern', type: 'text', autocomplete: 'off', spellcheck: 'false' });
+  const description = el('textarea', { id: 'rule-description', rows: 2 });
+  const label = el('input', { id: 'rule-label', type: 'text', autocomplete: 'off' });
+  const internal = gradeSelect('rule-internal', 'audit');
+  const external = gradeSelect('rule-external', 'audit');
+  const patternRow = el('div', {}, [el('label', { for: 'rule-pattern', text: t('ui.rule_pattern') }), pattern]);
+  const descriptionRow = el('div', { hidden: 'hidden' }, [el('label', { for: 'rule-description', text: t('ui.rule_description') }), description]);
+  kind.addEventListener('change', () => {
+    patternRow.hidden = kind.value === 'llm';
+    descriptionRow.hidden = kind.value !== 'llm';
+  });
+  return el('form', {
+    class: 'stack',
+    onsubmit: async (event) => {
+      event.preventDefault();
+      const ruleId = id.value.trim();
+      if (baselineIds.includes(ruleId)) {
+        showError(t('ui.rule_id_baseline', { id: ruleId }));
+        return;
+      }
+      const body = {
+        id: ruleId, kind: kind.value, label: label.value.trim(),
+        action: { internal: internal.value, external: external.value },
+      };
+      if (kind.value === 'llm') body.description = description.value.trim();
+      else body.pattern = pattern.value;
+      await saveGuardRule(body);
+    },
+  }, [
+    el('div', {}, [el('label', { for: 'rule-id', text: t('ui.rule_id') }), id]),
+    el('div', {}, [el('label', { for: 'rule-kind', text: t('ui.kind') }), kind]),
+    patternRow, descriptionRow,
+    el('div', {}, [el('label', { for: 'rule-label', text: t('ui.replacement_label') }), label]),
+    el('div', {}, [el('label', { for: 'rule-internal', text: t('ui.boundary_internal') }), internal]),
+    el('div', {}, [el('label', { for: 'rule-external', text: t('ui.boundary_external') }), external]),
+    el('p', { class: 'hint', text: t('ui.rule_add_hint') }),
+    el('button', { type: 'submit', class: 'primary', text: t('ui.save') }),
+  ]);
+}
+
+/** 등급 올리기. 기본 규칙이면 id 와 등급만 보낸다(패턴은 서버가 베이스라인 것을 쓴다). 이 테넌트가 더한 규칙이면
+ *  자기 패턴을 다시 실어 보내고, 바닥 없이 내릴 수도 있다 — 그 규칙의 주인이 이 테넌트이기 때문이다. */
+function guardGradeForm(rule, mine) {
+  const ownOnly = mine && mine.locale_pack === 'tenant';
+  const floorOf = (boundary) => (ownOnly ? 'audit' : rule.action[boundary]);
+  const internal = gradeSelect('grade-internal', rule.action.internal, floorOf('internal'));
+  const external = gradeSelect('grade-external', rule.action.external, floorOf('external'));
+  return el('form', {
+    class: 'stack',
+    onsubmit: async (event) => {
+      event.preventDefault();
+      const body = { id: rule.id, action: { internal: internal.value, external: external.value } };
+      if (ownOnly) {
+        Object.assign(body, {
+          kind: mine.kind, pattern: mine.pattern, description: mine.description,
+          label: mine.label, checksum: mine.checksum, keep_tail: mine.keep_tail, locale_pack: mine.locale_pack,
+        });
+      }
+      await saveGuardRule(body);
+    },
+  }, [
+    el('div', {}, [el('label', { for: 'grade-internal', text: t('ui.boundary_internal') }), internal]),
+    el('div', {}, [el('label', { for: 'grade-external', text: t('ui.boundary_external') }), external]),
+    el('p', { class: 'hint', text: t('ui.rule_raise_hint') }),
+    el('button', { type: 'submit', class: 'primary', text: t('ui.save') }),
+  ]);
 }
 
 async function review(eventId, verdict) {
@@ -2109,10 +2258,56 @@ async function renderSettings() {
 
 // ── 테넌트: 연결 정보 ─────────────────────────────────────────────────────
 
+/** 테넌트 전체 한도(월 예산 · 분당 요청) 폼. 플랫폼 관리자만 쓴다 — 서버도 그 둘은 플랫폼 관리자에게만 받는다.
+ *  고른 테넌트를 머리글로 명시한다: 테넌트 목록에서 열면 레일에서 고른 테넌트와 다를 수 있다. */
+function tenantLimitsForm(tenantId, current) {
+  const budget = el('input', { id: 'tenant-budget', type: 'number', min: '0', step: '0.01', value: limitValue(current.budget_usd_per_month) });
+  const rate = el('input', { id: 'tenant-rate', type: 'number', min: '1', step: '1', value: limitValue(current.rate_limit_per_min) });
+  const numberOrNull = (input) => (input.value.trim() === '' ? null : Number(input.value));
+  return el('form', {
+    class: 'stack',
+    onsubmit: async (event) => {
+      event.preventDefault();
+      try {
+        await api('/v1/admin/settings', {
+          method: 'PUT', headers: { 'X-LCC-Tenant': tenantId },
+          body: { budget_usd_per_month: numberOrNull(budget), rate_limit_per_min: numberOrNull(rate) },
+        });
+        toast(t('ui.saved'));
+        closeDrawer();
+        refresh();
+      } catch (err) { showError(err); }
+    },
+  }, [
+    el('div', {}, [el('label', { for: 'tenant-budget', text: t('ui.tenant_budget') }), budget]),
+    el('div', {}, [el('label', { for: 'tenant-rate', text: t('ui.tenant_rate') }), rate]),
+    el('p', { class: 'hint', text: t('ui.tenant_limits_hint') }),
+    el('button', { type: 'submit', class: 'primary', text: t('ui.save') }),
+  ]);
+}
+
+/** 연결 화면 맨 위 — 테넌트 전체 한도. 서비스별 한도는 그 아래 서비스 표에 있다(둘 다 걸린다). */
+function tenantLimitsCard(settings) {
+  if (!settings) return null;
+  const s = state.session;
+  const tenant = viewedTenant();
+  return card(t('ui.tenant_limits'), [
+    kv([
+      [t('ui.tenant_budget'), hasLimit(settings.budget_usd_per_month) ? dollars(settings.budget_usd_per_month) : t('ui.no_limit')],
+      [t('ui.tenant_rate'), hasLimit(settings.rate_limit_per_min) ? t('ui.rate_per_min', { n: settings.rate_limit_per_min }) : t('ui.no_limit')],
+    ]),
+    el('p', { class: 'hint', text: s.is_platform_admin ? t('ui.tenant_limits_hint') : t('ui.tenant_limits_readonly') }),
+  ], null, s.is_platform_admin ? [el('button', {
+    type: 'button', class: 'sm', text: t('ui.edit'),
+    onclick: () => openDrawer(t('ui.tenant_limits') + ' — ' + tenant.name, [tenantLimitsForm(tenant.id, settings)]),
+  })] : null);
+}
+
 async function renderConnections() {
   const data = await fetchAll({
     services: '/v1/admin/services',
     tokens: '/v1/admin/tokens',
+    settings: '/v1/admin/settings',
   });
   renderBanners();
 
@@ -2122,12 +2317,13 @@ async function renderConnections() {
   const tokens = (data.tokens && data.tokens.tokens) || [];
 
   return [
+    tenantLimitsCard(data.settings),
     card(t('ui.services'), [table(
       [t('ui.services'), t('ui.role'), t('ui.rate_limit'), t('ui.budget'), t('ui.end_users'), t('ui.status'), ''],
       services.map((s) => [
         el('span', { class: 'mono', text: s.id }), s.allow_roles.join(', '),
-        s.rate_limit_per_min ? el('span', { class: 'mono', text: t('ui.rate_per_min', { n: s.rate_limit_per_min }) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
-        s.budget_usd_per_month ? el('span', { class: 'mono', text: dollars(s.budget_usd_per_month) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
+        hasLimit(s.rate_limit_per_min) ? el('span', { class: 'mono', text: t('ui.rate_per_min', { n: s.rate_limit_per_min }) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
+        hasLimit(s.budget_usd_per_month) ? el('span', { class: 'mono', text: dollars(s.budget_usd_per_month) }) : el('span', { class: 'muted', text: t('ui.no_limit') }),
         s.require_end_user ? badge(t('ui.required'), 'info') : el('span', { class: 'muted', text: t('ui.optional') }),
         badge(s.status, s.status === 'active' ? 'healthy' : 'unhealthy'),
         el('div', { class: 'row end' }, [
@@ -2208,9 +2404,9 @@ function serviceForm(existing, roleCatalog) {
     }));
   };
   drawMode();
-  const rate = el('input', { id: 'service-rate', type: 'number', min: '1', step: '1', value: editing && existing.rate_limit_per_min ? String(existing.rate_limit_per_min) : '' });
+  const rate = el('input', { id: 'service-rate', type: 'number', min: '1', step: '1', value: editing ? limitValue(existing.rate_limit_per_min) : '' });
   const endUserRate = el('input', { id: 'service-end-user-rate', type: 'number', min: '1', step: '1', value: editing && existing.end_user_rate_limit ? String(existing.end_user_rate_limit) : '' });
-  const budget = el('input', { id: 'service-budget', type: 'number', min: '0', step: '0.01', value: editing && existing.budget_usd_per_month ? String(existing.budget_usd_per_month) : '' });
+  const budget = el('input', { id: 'service-budget', type: 'number', min: '0', step: '0.01', value: editing ? limitValue(existing.budget_usd_per_month) : '' });
   let requireEndUser = editing ? !!existing.require_end_user : false;
   const switchHost = el('div', {});
   const drawSwitch = () => {

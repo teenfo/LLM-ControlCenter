@@ -1169,6 +1169,25 @@ def test_a_new_rule_cannot_start_at_block(client, acme):
     assert response.json()["code"] == "promotion_blocked"
 
 
+def test_a_block_refused_for_lack_of_reviews_says_so(client, acme):
+    """검토 0건으로 막혔을 때 "오탐률 0.000 이 임계 0.020 을 넘어" 라고 하면 거짓말이다.
+
+    메시지 키는 코드마다 하나라 이유 둘(`insufficient_reviews` · `false_positive_rate_too_high`)에 다 맞게
+    두 조건을 숫자로 적는다 — 검토한 건수와 그 최소, 오탐률과 그 기준.
+    """
+    from app.evals import MIN_REVIEWS_FOR_PROMOTION
+
+    body = client.put(
+        "/v1/admin/guard/rules",
+        json={"id": "새규칙", "action": "block", "pattern": r"X-\d+"},
+        headers={**auth(acme["tenant_admin"]), "Accept-Language": "ko-KR"},
+    ).json()
+    assert body["reason"] == "insufficient_reviews"
+    assert body["min_reviews"] == str(MIN_REVIEWS_FOR_PROMOTION)
+    assert f"검토한 탐지 0건(최소 {MIN_REVIEWS_FOR_PROMOTION}건)" in body["message"], body["message"]
+    assert "넘어" not in body["message"]
+
+
 def test_a_new_rule_can_start_at_a_masking_grade(client, acme):
     """마스킹은 요청을 멈추지 않는다 — 막으면 규칙을 켤 방법 자체가 없어진다."""
     response = client.put(
@@ -2126,3 +2145,122 @@ def test_the_platform_admin_reads_a_raw_prompt_of_the_viewed_tenant_on_the_recor
     assert raw.json()["prompt"] == "글로벡스 원문 hong@example.com"
     reads = [r for r in harness.store.list_audit(TenantScope("globex")) if r["action"] == "read_raw_prompt"]
     assert len(reads) == 1 and reads[0]["target"] == job_id
+
+
+# ── 테넌트 한도 · 가드 등급 (0.7.6) ─────────────────────────────────────────
+
+
+def test_the_platform_admin_sets_tenant_limits(client, acme, globex):
+    """테넌트 전체 한도는 플랫폼이 정한다 — 테넌트 설정 경로에 두 칸, 플랫폼 관리자만."""
+    saved = client.put(
+        "/v1/admin/settings", json={"budget_usd_per_month": 50, "rate_limit_per_min": 30},
+        headers=view(acme["platform_admin"], "globex"),
+    )
+    assert saved.status_code == 200, saved.text
+    settings = client.get("/v1/admin/settings", headers=auth(globex["tenant_admin"])).json()
+    assert (settings["budget_usd_per_month"], settings["rate_limit_per_min"]) == (50.0, 30)
+    cleared = client.put(
+        "/v1/admin/settings", json={"rate_limit_per_min": None},
+        headers=view(acme["platform_admin"], "globex"),
+    )
+    assert cleared.status_code == 200
+    assert client.get("/v1/admin/settings", headers=auth(globex["tenant_admin"])).json()["rate_limit_per_min"] is None
+
+
+def test_a_tenant_admin_cannot_raise_its_own_limits(client, globex):
+    """자기 한도를 올릴 수 있으면 한도가 아니다. 한도 칸이 섞인 요청은 다른 칸도 쓰지 않는다."""
+    refused = client.put(
+        "/v1/admin/settings", json={"locale": "ko-KR", "rate_limit_per_min": 1000},
+        headers=auth(globex["tenant_admin"]),
+    )
+    assert refused.status_code == 403
+    assert refused.json()["code"] == "forbidden_platform_admin"
+    after = client.get("/v1/admin/settings", headers=auth(globex["tenant_admin"])).json()
+    assert after["locale"] == "en-US" and after["rate_limit_per_min"] is None
+
+
+@pytest.mark.parametrize("body", [
+    {"rate_limit_per_min": 0}, {"rate_limit_per_min": "10"}, {"rate_limit_per_min": True},
+    {"budget_usd_per_month": -1}, {"budget_usd_per_month": "5"},
+])
+def test_tenant_limit_values_are_validated(client, acme, body):
+    """문자열·불·음수·0 은 거절한다 — 조용히 고치면 "없음" 이 "0" 이 된다."""
+    response = client.put("/v1/admin/settings", json=body, headers=auth(acme["platform_admin"]))
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+def test_a_refused_settings_request_changes_nothing(client, acme):
+    """칸 하나가 거절되면 앞의 칸도 안 바뀐다 — 실패로 읽히는데 로케일만 바뀌어 있고 감사도 없던 길."""
+    headers = auth(acme["platform_admin"])
+    before = client.get("/v1/admin/settings", headers=headers).json()
+    audit_before = client.get("/v1/admin/audit", headers=headers).json()
+    refused = client.put(
+        "/v1/admin/settings",
+        json={"locale": "en-US", "rate_limit_per_min": 50, "raw_prompt_retention_days": -1},
+        headers=headers,
+    )
+    assert refused.status_code == 400
+    assert refused.json()["field"] == "raw_prompt_retention_days"
+    after = client.get("/v1/admin/settings", headers=headers).json()
+    assert after["locale"] == before["locale"] == "ko-KR"
+    assert after["rate_limit_per_min"] == before["rate_limit_per_min"]
+    assert client.get("/v1/admin/audit", headers=headers).json() == audit_before
+
+
+@pytest.mark.parametrize("word", ["NaN", "Infinity"])
+def test_a_budget_of_nan_or_infinity_is_refused(client, acme, word):
+    """파이썬 JSON 파서는 `NaN`·`Infinity` 를 숫자로 받는다 — 저장되면 다시 JSON 으로 못 나간다."""
+    response = client.put(
+        "/v1/admin/settings", content=f'{{"budget_usd_per_month": {word}}}',
+        headers={**auth(acme["platform_admin"]), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+    after = client.get("/v1/admin/settings", headers=auth(acme["platform_admin"])).json()
+    assert after["budget_usd_per_month"] is None
+
+
+def test_a_new_tenant_rate_limit_applies_from_the_next_request(client, acme):
+    saved = client.put("/v1/admin/settings", json={"rate_limit_per_min": 2}, headers=auth(acme["platform_admin"]))
+    assert saved.status_code == 200
+    for _ in range(2):
+        client.post("/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0}, headers=auth(acme["service"]))
+    limited = client.post("/v1/generate", json={"role": "summarize", "prompt": "안녕", "wait": 0}, headers=auth(acme["service"]))
+    assert limited.status_code == 429
+    assert limited.json()["scope"] == "tenant"
+
+
+def test_a_baseline_rule_grade_is_raised_with_its_id_and_grade_only(client, acme):
+    """기본 규칙의 등급만 올릴 때 패턴을 다시 보내지 않는다 — 서버가 베이스라인 것을 쓴다(화면이 패턴을 몰라도 된다)."""
+    headers = auth(acme["tenant_admin"])
+    raised = client.put(
+        "/v1/admin/guard/rules", json={"id": "email", "action": {"internal": "full", "external": "full"}},
+        headers=headers,
+    )
+    assert raised.status_code == 201, raised.text
+    rules = client.get("/v1/admin/guard/rules", headers=headers).json()
+    email = next(r for r in rules["effective"] if r["id"] == "email")
+    assert email["action"] == {"internal": "full", "external": "full"}
+    mine = next(r for r in rules["tenant_rules"] if r["id"] == "email")
+    assert mine["pattern"] and mine["locale_pack"] == "common"
+
+    # 차단은 여전히 승격 게이트를 지난다 — 패턴이 없다는 400 이 아니라 게이트의 409 다.
+    blocked = client.put(
+        "/v1/admin/guard/rules", json={"id": "card", "action": "block"}, headers=headers,
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["code"] == "promotion_blocked"
+
+
+def test_a_different_kind_under_a_baseline_id_gets_no_baseline_pattern(client, acme):
+    """종류를 바꿔 보내면 베이스라인을 채우지 않는다 — 판정 모델 규칙에 정규식이 끼면 안 된다."""
+    headers = auth(acme["tenant_admin"])
+    saved = client.put(
+        "/v1/admin/guard/rules",
+        json={"id": "email", "kind": "llm", "description": "업무 메일 주소를 적었는가", "action": "audit"},
+        headers=headers,
+    )
+    assert saved.status_code == 201, saved.text
+    mine = next(r for r in client.get("/v1/admin/guard/rules", headers=headers).json()["tenant_rules"] if r["id"] == "email")
+    assert mine["kind"] == "llm" and not mine["pattern"]

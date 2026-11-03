@@ -1057,6 +1057,28 @@ class SqliteStore:
         self._conn.commit()
         return tenant_id
 
+    #: 테넌트 행에서 한도로 바꿀 수 있는 칸. 이름을 받아 SQL 에 끼우므로 화이트리스트다.
+    TENANT_LIMIT_FIELDS = ("budget_usd_per_month", "rate_limit_per_min")
+
+    def update_tenant_limits(self, scope: TenantScope, **changes: Any) -> bool:
+        """테넌트 전체 한도(월 예산 · 분당 요청)를 바꾼다. `None` 은 한도 없음이다.
+
+        요청마다 테넌트 행을 다시 읽으므로(인증이 그 행을 싣는다) 다음 요청부터 바로 듣는다.
+        """
+        if not isinstance(scope, TenantScope):
+            raise ScopeViolation(f"TenantScope 가 필요하다 (받은 값: {type(scope).__name__})")
+        unknown = set(changes) - set(self.TENANT_LIMIT_FIELDS)
+        if unknown:
+            raise StoreError(f"테넌트 한도가 아닌 칸: {sorted(unknown)}")
+        if not changes:
+            return False
+        assignments = ", ".join(f"{field} = ?" for field in changes)
+        cursor = self._conn.execute(
+            f"UPDATE tenants SET {assignments} WHERE id = ?", [*changes.values(), scope.tenant_id]
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
     def get_tenant(self, tenant_id: str) -> sqlite3.Row | None:
         return self._conn.execute(
             "SELECT * FROM tenants WHERE id = ? AND purged_at IS NULL", (tenant_id,)

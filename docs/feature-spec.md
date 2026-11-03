@@ -61,16 +61,31 @@
 상태   구현됨
 
 ### AUTH-3  3단 레이트리밋
-정의   테넌트 → 서비스 → 엔드유저 세 단계로 초당 요청 수를 제한한다. 각 단계는 독립이다.
+정의   테넌트 → 서비스 → 엔드유저 세 단계로 분당 요청 수를 제한한다(1초 버킷을 합산하는 60초 슬라이딩 윈도). 각 단계는 독립이다.
 표면   모든 소비자 라우트 · `config/thresholds.yaml` · `PUT /v1/admin/settings`
 구현   `app/auth.py:RateLimits` `RateLimiter` `limits_for`
 계약   카운터는 프로세스 메모리가 아니라 스토어에 있다 — 워커를 N개 띄워도 실효 한도가 N배가 되지 않는다
        테넌트 상한은 서비스를 더 만들어 우회할 수 없다 · 거부된 요청은 할당량을 소비하지 않는다
        오류 응답이 어느 단계에서 걸렸는지와 언제 다시 오라는지를 말한다
+       **테넌트 전체 한도는 플랫폼이 정한다(0.7.6)** — `PUT /v1/admin/settings` 의 `rate_limit_per_min`(분당 요청) ·
+       `budget_usd_per_month`(월 예산, CLUSTER-6) 는 플랫폼 관리자에게만 듣는다(다른 테넌트는 `X-LCC-Tenant`, AUTH-4).
+       테넌트 관리자가 그 칸을 보내면 403 `forbidden_platform_admin` 이다 — 자기 한도를 올릴 수 있으면 한도가 아니다 · 설정 PUT 은
+       전부 검증한 뒤 쓴다(칸 하나가 거절되면 로케일·보존 기간·한도 어느 것도 바뀌지 않는다)
+       · `null` 은 한도 없음 · 분당 요청은 1 이상의 정수, 예산은 0 이상의 숫자(문자열·불·NaN 은 400)
+       · **예산 0 은 "유료 경로 금지" 지 "없음" 이 아니다** · 요청마다 테넌트 행을 다시 읽으므로 다음 요청부터 듣는다
+       · 관제 UI: 설정 → 「연결 정보」 맨 위 「테넌트 한도」 카드(플랫폼 관리자에게만 편집), 플랫폼 「테넌트」 표의 「한도」
 고정   `test_auth.py::test_counter_lives_in_the_store_not_process_memory`
        `test_auth.py::test_tenant_ceiling_cannot_be_bypassed_with_more_services`
        `test_auth.py::test_rejected_request_does_not_consume_quota`
        `test_auth.py::test_a_rate_limited_reply_says_when_to_come_back`
+       `test_api.py::test_the_platform_admin_sets_tenant_limits`
+       `test_api.py::test_a_tenant_admin_cannot_raise_its_own_limits`
+       `test_api.py::test_tenant_limit_values_are_validated`
+       `test_api.py::test_a_budget_of_nan_or_infinity_is_refused`
+       `test_api.py::test_a_refused_settings_request_changes_nothing`
+       `test_api.py::test_a_new_tenant_rate_limit_applies_from_the_next_request`
+       `test_ui.py::test_tenant_limits_and_guard_rules_have_screens`
+       `test_ui.py::test_a_zero_limit_is_a_limit_on_screen`
 상태   구현됨
 
 ### AUTH-4  권한 등급
@@ -364,7 +379,7 @@
 
 ### GUARD-3  2단 LLM 맥락 분류
 정의   "환자 진료 기록" 처럼 형식이 없는 것을 관리자가 문장으로 정의하면 내부 노드 분류기가 판정한다.
-표면   `config/guard.yaml` `context_rules` · `POST /v1/admin/guard/rules`
+표면   `config/guard.yaml` `context_rules` · `PUT /v1/admin/guard/rules`
 구현   `app/guard.py:Guard.set_classifier` `_apply_classifier_failure` · `app/pipeline.py:make_classifier` `_classify_on_cluster`
 계약   분류기는 **internal 경계 노드에서만** 돈다 · 분류기는 마스킹본을 보지 원문을 안 본다
        인증(GUARD-13)을 통과한 모델만 쓴다 · 규칙이 없으면 분류기를 호출하지 않는다
@@ -377,7 +392,7 @@
 
 ### GUARD-4  등급 사다리
 정의   `audit` → `partial` → `full` → `block` 네 단계. 기록만 → 일부 가리기 → 전부 가리기 → 차단.
-표면   `config/guard.yaml` 규칙의 `grade` · `POST /v1/admin/guard/rules`
+표면   `config/guard.yaml` 규칙의 `grade` · `PUT /v1/admin/guard/rules`
 구현   `app/guard.py:Guard.rules_for` `soften` · `app/guard.py:GuardResult`
 계약   `audit` 는 통과시키되 기록한다 · `partial` 은 꼬리만 남긴다(전체를 남길 수 없다)
        `block` 은 모든 경계에서 차단이면 요청 자체를 막는다
@@ -409,13 +424,23 @@
 
 ### GUARD-7  테넌트 규칙 — 강화만
 정의   테넌트가 자기 규칙을 추가하거나 베이스라인을 더 세게 만들 수 있다. 느슨하게는 못 한다.
-표면   `GET/POST /v1/admin/guard/rules` · `DELETE /v1/admin/guard/rules/{rule_id}`
+표면   `GET/PUT /v1/admin/guard/rules` · `DELETE /v1/admin/guard/rules/{rule_id}` · 관제 UI 「가드」
 구현   `app/guard.py:Guard.rules_for` `validate_rule` · `app/store.py` `tenant_guard_rules`
 계약   베이스라인 완화 시도는 거부된다 · 강화는 경계별로 따로 걸린다
        테넌트가 더한 규칙이 실제로 마스킹한다 · 규칙은 테넌트를 가로지르지 않는다
+       **등급만 올리기(0.7.6)** — 베이스라인 id 와 등급만 보내면 서버가 그 규칙의 종류·패턴·체크섬·이름표·팩을 채운다.
+       병합은 어차피 베이스라인 패턴을 남기고 등급만 센 쪽을 고르므로, 화면은 패턴을 몰라도 된다(조회 API 는 베이스라인 패턴을
+       내지 않는다). 저장본은 패턴을 실어 홀로 선다 — 테넌트 규칙 조회에 그 사본이 보이고, 로케일이 바뀌어 그 팩이 꺼져도 올린
+       규칙은 남는다 · 종류를 바꿔 보내면 채우지 않는다 · `block` 은 그대로 승격 게이트(GUARD-12)를 지나고, 막히면 검토한 건수와
+       그 최소 · 오탐률과 그 기준을 함께 말한다 · 지우면 더한 규칙은 사라지고 올린 베이스라인은 기본 등급으로 돌아간다
+       관제 UI 「가드」: 규칙 표의 「등급 올리기」(바닥은 지금 등급 — 내리기는 지우기로), 「규칙 추가」(패턴 · 문맥, 켜진 베이스라인
+       id 는 받지 않는다 — 저장돼도 패턴이 안 듣는다), 「이 테넌트가 더하거나 올린 규칙」 표의 지우기
 고정   `test_guard.py::test_tenant_cannot_loosen_a_baseline_rule`
        `test_guard.py::test_tiered_tightening_is_per_boundary`
        `test_guard.py::test_tenant_added_rule_actually_masks`
+       `test_api.py::test_a_baseline_rule_grade_is_raised_with_its_id_and_grade_only`
+       `test_api.py::test_a_different_kind_under_a_baseline_id_gets_no_baseline_pattern`
+       `test_ui.py::test_tenant_limits_and_guard_rules_have_screens`
 상태   구현됨
 
 ### GUARD-8  시크릿 탐지
@@ -476,10 +501,13 @@
 계약   검토 수가 모자라면 승격이 막힌다 · 오탐률이 높아도 막힌다
        검토는 판정만 저장하고 내용은 저장하지 않는다 · 등급을 낮추는 것은 승격이 아니다
        마스킹 등급은 게이트 대상이 아니다(차단만 게이트한다)
+       막힌 저장(409 `promotion_blocked`)의 메시지는 이유 둘 모두에 맞게 두 조건을 숫자로 적는다 — 검토한 건수와 그 최소
+       (`min_reviews`), 오탐률과 그 기준. 이유 자체는 `reason` 으로 나간다(0.7.6 전에는 검토 0건에도 "오탐률이 임계를 넘어" 라고 했다)
 고정   `test_evals.py::test_promotion_blocked_without_enough_reviews`
        `test_evals.py::test_promotion_blocked_when_false_positive_rate_is_high`
        `test_evals.py::test_review_stores_verdict_not_content`
        `test_evals.py::test_masking_grades_are_not_gated`
+       `test_api.py::test_a_block_refused_for_lack_of_reviews_says_so`
 상태   구현됨
 
 ### GUARD-13  분류기 인증
@@ -1718,13 +1746,13 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `tenant_tokens` | `GET/POST /v1/admin/tokens` | AUTH-1 |
 | `tenant_token_rotate` | `POST /v1/admin/tokens/{id}/rotate` | AUTH-2 |
 | `tenant_token_revoke` | `DELETE /v1/admin/tokens/{id}` | AUTH-2 |
-| `tenant_guard_rules` | `GET/POST /v1/admin/guard/rules` | GUARD-7 |
+| `tenant_guard_rules` | `GET/PUT /v1/admin/guard/rules` | GUARD-7 |
 | `tenant_guard_rule_delete` | `DELETE /v1/admin/guard/rules/{id}` | GUARD-7 |
 | `tenant_guard_events` | `GET /v1/admin/guard/events` | GUARD-12 |
 | `tenant_guard_review` | `POST /v1/admin/guard/events/{id}/review` | GUARD-12 |
 | `tenant_guard_promote` | `GET /v1/admin/guard/rules/{id}/promotion` | GUARD-12 |
 | `tenant_guard_preview` | `POST /v1/admin/guard/preview` | GUARD-14 |
-| `tenant_settings` | `GET/PUT /v1/admin/settings` | AUTH-3 DATA-2 CLUSTER-7 |
+| `tenant_settings` | `GET/PUT /v1/admin/settings` | AUTH-3 DATA-2 CLUSTER-6 CLUSTER-7 |
 | `tenant_overrides` | `GET/POST/DELETE /v1/admin/overrides` | AUTH-7 |
 | `tenant_jobs` | `GET /v1/admin/jobs` | OPS-9 |
 | `tenant_job_raw` | `GET /v1/admin/jobs/{id}/raw` | CRYPTO-6 |

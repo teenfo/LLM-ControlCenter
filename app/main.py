@@ -80,7 +80,7 @@ from .crypto import (
     prompt_aad,
     response_aad,
 )
-from .evals import Evaluator
+from .evals import MIN_REVIEWS_FOR_PROMOTION, Evaluator
 from .guard import Guard
 from .i18n import ApiError, Translator, guard_pack_for, negotiate_locale
 from .identity import hash_end_user, new_salt
@@ -101,7 +101,7 @@ from .store import (
     SqliteStore, StoreError, TenantScope,
 )
 
-VERSION = "0.7.5"
+VERSION = "0.7.6"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -1285,6 +1285,27 @@ async def tenant_guard_rules(request: Request) -> Response:
         "description": body.get("description"),
         "locale_pack": str(body.get("locale_pack") or "tenant"),
     }
+    baseline = next((r for r in ctx.config.guard_rules if r.id == rule["id"]), None)
+    if baseline is not None:
+        # **등급만 올리기.** 기존 규칙과 같은 id 로 등급만 보내면 나머지는 베이스라인 것을 쓴다.
+        # 베이스라인 패턴은 어느 조회 API 로도 나가지 않아(긴 정규식이다) 화면은 그것을 모르고, 병합
+        # (`rules_for` → `_stronger_of`)은 어차피 베이스라인의 패턴을 남기고 등급만 강한 쪽을 고르므로
+        # 다시 보내라고 할 까닭이 없다. 저장은 패턴을 실은 채로 한다 — 테넌트 규칙 조회에는 그 사본이
+        # 보이고, 로케일이 바뀌어 그 팩이 꺼져도 올린 규칙이 홀로 선다(`rules_from_rows` 는 팩을 거르지 않는다).
+        if "kind" not in body:
+            rule["kind"] = baseline.kind
+        if rule["kind"] == baseline.kind:
+            # 종류를 바꿔 보냈으면 채우지 않는다 — 판정 모델 규칙에 베이스라인의 정규식을
+            # 끼워 넣으면 보낸 사람이 의도하지 않은 규칙이 저장된다.
+            for field in ("pattern", "checksum", "description"):
+                if not rule[field]:
+                    rule[field] = getattr(baseline, field)
+            if "keep_tail" not in body:
+                rule["keep_tail"] = baseline.keep_tail
+        if not rule["label"]:
+            rule["label"] = baseline.label
+        if "locale_pack" not in body:
+            rule["locale_pack"] = baseline.locale_pack
     if rule["kind"] == "pattern" and not rule["pattern"]:
         raise ApiError("missing_field", status=400, params={"field": "pattern"})
     ctx.guard.validate_rule(rule)
@@ -1306,10 +1327,12 @@ async def tenant_guard_rules(request: Request) -> Response:
         if not verdict.allowed:
             raise ApiError(
                 "promotion_blocked", status=409,
+                # 메시지는 이유 둘(`insufficient_reviews` · `false_positive_rate_too_high`)에 모두 맞게 두 조건을
+                # 숫자로 적는다 — "오탐률 0.000 이 임계 0.020 을 넘어" 는 검토 0건일 때 거짓말이었다.
                 params={
                     "rule": rule["id"], "reason": verdict.reason,
                     "rate": f"{verdict.rate:.3f}", "reviewed": str(verdict.reviewed),
-                    "limit": f"{verdict.limit:.3f}",
+                    "limit": f"{verdict.limit:.3f}", "min_reviews": str(MIN_REVIEWS_FOR_PROMOTION),
                 },
             )
 
@@ -1414,10 +1437,16 @@ async def tenant_settings(request: Request) -> Response:
         })
 
     body = await _body(request)
-    if "locale" in body:
-        if body["locale"] not in ctx.translator.available:
-            raise ApiError("invalid_field", status=400, params={"field": "locale"})
-        ctx.store.set_tenant_locale(scope, str(body["locale"]))
+    # **먼저 전부 검증하고, 그다음에 쓴다.** 칸 하나가 거절된 요청이 앞의 칸만 바꿔 놓으면 관리자는 실패로
+    # 읽는데 일부가 저장돼 있고, 감사도 안 남는다(감사는 맨 끝에 한 번 쓴다) — 로케일이 그렇게 바뀌었다.
+    #
+    # **테넌트 전체 한도는 플랫폼이 정한다** — 테넌트가 자기 한도를 올릴 수 있으면 한도가 아니다.
+    limits = _tenant_limit_changes(body)
+    if limits:
+        require_platform_admin(principal)
+    if "locale" in body and body["locale"] not in ctx.translator.available:
+        raise ApiError("invalid_field", status=400, params={"field": "locale"})
+    days: int | None = None
     if "raw_prompt_retention_days" in body:
         # 여기서는 **자르지 않고 거절한다.** 음수 보관 기간은 오타이지 의도가
         # 아니고, 조용히 0 으로 자르면 관리자는 설정했다고 믿는 채로 원문이
@@ -1425,12 +1454,45 @@ async def tenant_settings(request: Request) -> Response:
         days = _int(body["raw_prompt_retention_days"], "raw_prompt_retention_days")
         if days < 0:
             raise ApiError("invalid_field", status=400, params={"field": "raw_prompt_retention_days"})
+
+    if "locale" in body:
+        ctx.store.set_tenant_locale(scope, str(body["locale"]))
+    if limits:
+        ctx.store.update_tenant_limits(scope, **limits)
+    if days is not None:
         ctx.store.set_tenant_setting(scope, ctx.store.RAW_RETENTION_KEY, days)
     ctx.store.audit(
         principal.token_id, "update_tenant_settings", tenant_id=scope.tenant_id,
-        detail={k: body[k] for k in ("locale", "raw_prompt_retention_days") if k in body},
+        detail={**{k: body[k] for k in ("locale", "raw_prompt_retention_days") if k in body}, **limits},
     )
     return _ok(request, {"updated": True})
+
+
+def _tenant_limit_changes(body: Mapping[str, Any]) -> dict[str, Any]:
+    """설정 본문에서 테넌트 한도 칸만 골라 검증한다. `null` 은 한도 없음이다.
+
+    서비스 정책 수정(`tenant_service_update`)과 같은 규칙이다 — 분당 요청은 1 이상의 정수,
+    예산은 0 이상의 숫자. 문자열·불·음수는 거절한다(조용히 자르면 "없음" 이 "0" 이 된다).
+    """
+    changes: dict[str, Any] = {}
+    if "rate_limit_per_min" in body:
+        raw = body["rate_limit_per_min"]
+        if raw is None:
+            changes["rate_limit_per_min"] = None
+        elif isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+            raise ApiError("invalid_field", status=400, params={"field": "rate_limit_per_min"})
+        else:
+            changes["rate_limit_per_min"] = raw
+    if "budget_usd_per_month" in body:
+        raw = body["budget_usd_per_month"]
+        if raw is None:
+            changes["budget_usd_per_month"] = None
+        elif isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+            raise ApiError("invalid_field", status=400, params={"field": "budget_usd_per_month"})
+        else:
+            # `_float` 이 NaN·Infinity 도 거절한다 — JSON 파서가 그 낱말을 숫자로 받아 준다.
+            changes["budget_usd_per_month"] = _float(raw, "budget_usd_per_month")
+    return changes
 
 
 async def tenant_overrides(request: Request) -> Response:

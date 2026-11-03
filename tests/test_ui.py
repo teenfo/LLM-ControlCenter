@@ -143,6 +143,45 @@ def test_the_platform_admin_picks_which_tenant_the_tenant_pages_show():
     assert "VIEW_TENANT_KEY" in leave and "state.viewTenant = null" in leave, "다음 사람이 앞사람이 고른 테넌트를 물려받는다"
 
 
+def test_tenant_limits_and_guard_rules_have_screens():
+    """테넌트 한도(예산 · 분당 요청)와 가드 규칙(추가 · 등급 올리기 · 삭제)은 화면에서 바꾼다 — API 만 있으면 없는 기능이다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    form = source[source.index("function tenantLimitsForm"):source.index("function tenantLimitsCard")]
+    assert "'/v1/admin/settings'" in form and "method: 'PUT'" in form
+    assert "'X-LCC-Tenant': tenantId" in form, "테넌트 목록에서 열면 레일에서 고른 테넌트와 다를 수 있다 — 대상을 명시한다"
+    assert "budget_usd_per_month" in form and "rate_limit_per_min" in form
+    connections = source[source.index("async function renderConnections"):source.index("function issueTokenForm")]
+    assert "tenantLimitsCard(data.settings)" in connections and "'/v1/admin/settings'" in connections
+    tenants = source[source.index("async function renderTenants"):source.index("function createTenantForm")]
+    assert "tenantLimitsForm(tenant.id, tenant)" in tenants
+    guard = source[source.index("async function renderGuard"):source.index("async function review(")]
+    assert "guardRuleForm(baselineIds)" in guard and "guardGradeForm(r," in guard and "deleteGuardRule(r.id)" in guard
+    add = source[source.index("function guardRuleForm"):source.index("function guardGradeForm")]
+    assert "baselineIds.includes(" in add and "'ui.rule_id_baseline'" in add, (
+        "켜진 기본 규칙의 id 로 새 규칙을 저장하면 병합이 기본 패턴을 남긴다 — 안 듣는 규칙을 저장하게 두지 않는다"
+    )
+    assert "'ui.tenant_rules'" in guard
+    save = source[source.index("async function saveGuardRule"):source.index("async function deleteGuardRule")]
+    assert "'/v1/admin/guard/rules'" in save and "method: 'PUT'" in save, "서버의 규칙 저장은 PUT 이다"
+    grades = source[source.index("function gradeSelect"):source.index("async function saveGuardRule")]
+    assert "floor" in grades, "기본 규칙은 올리기만 된다 — 바닥 아래 등급은 고를 수 없어야 한다"
+
+
+def test_a_zero_limit_is_a_limit_on_screen():
+    """**예산 $0 은 "유료 경로 금지" 다**(`can_afford`: `limit is None or …`) — "한도 없음" 이 아니다.
+
+    값의 참·거짓으로 읽으면 0 이 "없음" 으로 보이고, 그 값을 채운 폼을 저장하면 빈칸이
+    null 로 나가 0 이 **무제한**이 된다. 한도는 `hasLimit` · `limitValue` 로만 읽는다.
+    """
+    # 주석을 벗기지 않는다 — 문자열 속 `/*` 를 주석으로 읽으면 그 뒤를 통째로 못 본다(놓치는 쪽으로 틀린다).
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "function hasLimit" in source and "function limitValue" in source
+    truthy = re.findall(r"[\w.]+\.(?:budget_usd_per_month|rate_limit_per_min)\s*\?", source)
+    assert not truthy, f"한도를 참·거짓으로 읽는다: {truthy}"
+    guarded = re.findall(r"&&\s*[\w.]+\.(?:budget_usd_per_month|rate_limit_per_min)\b", source)
+    assert not guarded, f"한도를 참·거짓으로 읽는다: {guarded}"
+
+
 def test_the_drawer_and_toast_live_outside_the_view():
     """드로어의 폼과 발급된 토큰은 #view 밖에 있어야 자동 갱신이 지우지 않는다."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")
