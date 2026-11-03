@@ -334,7 +334,10 @@ function chatRole() {
 }
 
 const PAGES = [
-  { id: 'ask', label: 'client.tab_ask', show: () => askRoles().length > 0, render: renderAsk },
+  // 요청 탭은 **할 수 있는 일이 하나도 없을 때도** 남아서 이유와 할 일을 말한다(renderNoRoles).
+  // 말없이 숨기면 기록·계정 탭만 남아 "이 페이지로는 아무것도 못 한다" 로 읽힌다 — 역할이 비어
+  // 있는 플랫폼 콘솔 서비스에 묶인 계정이 실제로 그 화면을 봤다. 대화 역할만 있으면 예전처럼 대화 탭이 첫 화면이다.
+  { id: 'ask', label: 'client.tab_ask', show: () => askRoles().length > 0 || !chatRole(), render: renderAsk },
   // API 뒷받침이 없으면 그리지 않는다 — chat 역할이 없는 서비스에는 대화 탭이 없다.
   { id: 'chat', label: 'client.tab_chat', show: () => !!chatRole(), render: renderChat },
   { id: 'history', label: 'client.tab_history', show: () => true, render: renderHistory },
@@ -387,8 +390,22 @@ function roleLimits(r) {
   });
 }
 
+/** 이 계정으로 보낼 수 있는 요청이 없다 — 이유와 할 일을 말한다. 빈 화면은 "고장" 으로 읽힌다. */
+function renderNoRoles() {
+  const s = state.session;
+  // 플랫폼 계정(관리자든, 플랫폼 테넌트에 잘못 만든 사용자든)은 콘솔 서비스에 묶이고, 그 서비스는 역할이 비어 있다.
+  const platform = s.is_platform_admin || s.tenant.id === '_platform';
+  return [el('section', { class: 'card' }, [
+    el('div', { class: 'card-head' }, [el('h2', { text: t('client.no_roles_title') })]),
+    el('div', { class: 'card-body' }, [
+      el('p', { text: platform ? t('client.no_roles_platform') : t('client.no_roles_service', { service: s.service.id }) }),
+    ]),
+  ])];
+}
+
 function renderAsk() {
   const roles = askRoles();
+  if (!roles.length) return renderNoRoles();
   if (!state.ask.role || !roles.some((r) => r.name === state.ask.role)) {
     state.ask.role = roles.length ? roles[0].name : null;
   }

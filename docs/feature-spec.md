@@ -143,6 +143,7 @@
        `python -m app account create --role user` · 관제 UI 설정 → 사용자 계정 탭 · 클라이언트 페이지 로그인(OPS-11)
 구현   `app/auth.py:ROLE_USER` `token_role_for_account` `account_row` · `app/main.py:tenant_accounts` `tenant_account_password` `tenant_account_disable` `_tenant_user` · `app/pipeline.py:_effective_end_user`
 계약   `user` 세션은 관리 면(`/v1/admin/*` · `/v1/platform/*`)에 닿지 않는다 · 계정은 `service_id` 없이 만들 수 없고 그 서비스는 같은 테넌트에 실재해야 한다
+       `user` 계정은 플랫폼 테넌트(`_platform`)에 만들 수 없다(400 `user_account_needs_tenant`, 0.7.3) — 그 테넌트의 서비스는 역할이 빈 콘솔 하나라 거기 묶인 사람은 클라이언트 페이지에서 아무것도 못 한다
        테넌트 관리자는 자기 테넌트의 `user` 계정만 본다 — 남의 테넌트 것과 관리자 계정은 404(존재를 흘리지 않는다)
        **모든 계정 세션의 `end_user` 는 파이프라인이 아이디로 강제한다** (본문 값 무시 · generate·embed·chat 공통 · `_authorize` 보다 앞) — 사칭이 불가능하고 레이트리밋·사용량·파기가 사람 단위로 귀속된다
        생성·재설정·정지는 감사에 남는다(AUTH-9 와 같은 액션 이름)
@@ -152,6 +153,7 @@
        `test_accounts.py::test_a_user_account_needs_a_service_id_and_a_real_service`
        `test_accounts.py::test_user_account_management_is_tenant_admin_only`
        `test_accounts.py::test_user_account_actions_leave_an_audit_trail`
+       `test_accounts.py::test_a_user_account_cannot_live_in_the_platform_tenant`
        `test_api.py::test_an_account_session_cannot_choose_its_end_user`
        `test_api.py::test_the_forced_end_user_applies_to_embed_too`
        `test_api.py::test_the_forced_end_user_applies_to_chat_too`
@@ -1247,6 +1249,7 @@
 정의   사람이 브라우저에서 역할을 골라 요청하고, 가드가 무엇을 가렸는지 보고, 자기 이력을 다시 열고, 대화를 이어 가는 화면. 관제 UI 와 같은 앱이 `/client/` 로 서빙한다.
 표면   `GET /client` (308 → `/client/`) · `/client/*` 정적 자산 · `static/client/{index.html, client.js, client.css}`
        로그인은 사용자 계정(AUTH-10, 기본) 또는 서비스 토큰 붙여넣기(이름 필수) · 탭: 요청 · 대화(`chat` 역할이 보일 때만) · 기록(PIPE-9) · 계정
+       요청 탭은 쓸 수 있는 역할이 하나도 없을 때도 남아 **이유와 할 일**을 말한다(0.7.3) — 플랫폼 계정이면 "테넌트 사용자 계정으로", 아니면 "서비스 '<id>'에 역할이 없다 — 관리자에게". 대화 역할만 있으면 대화 탭이 첫 화면이다
 구현   `app/main.py:_serve_index` `client_page` · `VersionedStaticFiles` · `static/client/client.js` · `config/roles.yaml` 의 `chat` 역할
 계약   관제 UI 와 같은 규칙 — 빌드 단계·프레임워크·CDN·외부 웹폰트 없음 · `innerHTML` 없음 · 토큰은 `sessionStorage` 만(키는 콘솔과 다르다) · 화면은 마스킹본만 · API 에 없는 기능은 그리지 않는다
        공용 헬퍼(`t` `applyStaticStrings` `el` `api` `login`)와 테마 토큰은 콘솔에서 글자 그대로 복제하고 테스트가 동일성을 본다 — 공용 모듈은 콘솔의 핀(`import` 금지·함수 순서)이 막는다
@@ -1263,6 +1266,7 @@
        `test_client_page.py::test_history_renders_chat_transcripts_only_from_the_masked_copy`
        `test_client_page.py::test_client_calls_only_routes_that_exist`
        `test_client_page.py::test_history_shows_masked_prompts_only`
+       `test_client_page.py::test_the_ask_tab_explains_itself_when_the_account_has_no_role`
        `test_client_page.py::test_answers_are_rendered_as_markdown_built_from_nodes`
        `test_client_page.py::test_the_markdown_parser_reads_the_shapes_models_actually_produce`
        `test_config.py::test_shipped_config_has_a_chat_role_the_client_page_can_use`

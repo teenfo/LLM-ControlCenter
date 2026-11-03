@@ -283,6 +283,25 @@ def test_the_chat_tab_is_only_offered_when_a_chat_role_exists():
     assert "chatRole()" in pages
 
 
+def test_the_ask_tab_explains_itself_when_the_account_has_no_role():
+    """역할이 없는 계정에게 요청 탭을 말없이 숨기면 기록·계정 탭만 남는다 — 이유와 할 일을 말한다.
+
+    플랫폼 콘솔 서비스(허용 역할 없음)에 묶인 계정이 실제로 그 빈 화면을 봤다(2026-11-03).
+    대화 역할만 있는 서비스는 예전처럼 대화 탭이 첫 화면이다.
+    """
+    # 주석을 걷지 않는다 — renderAsk 의 accept 문자열(`text/*,…`)을 strip_comments 가 주석 시작으로 읽는다.
+    code = (CLIENT / "client.js").read_text(encoding="utf-8")
+    pages = code[code.index("const PAGES = ["):code.index("function visiblePages")]
+    ask = next(line for line in pages.splitlines() if "id: 'ask'" in line)
+    assert "askRoles().length > 0 || !chatRole()" in ask
+    assert "return renderNoRoles();" in block(code, "function renderAsk() {")
+    empty = block(code, "function renderNoRoles() {")
+    for key in ("client.no_roles_title", "client.no_roles_platform", "client.no_roles_service"):
+        assert key in empty, key
+    assert "is_platform_admin" in empty and "'_platform'" in empty
+    assert "s.service.id" in empty, "어느 서비스에 역할이 없는지 말해야 관리자에게 물을 수 있다"
+
+
 def test_history_shows_masked_prompts_only():
     code = (CLIENT / "client.js").read_text(encoding="utf-8")
     assert "prompt_masked" in code

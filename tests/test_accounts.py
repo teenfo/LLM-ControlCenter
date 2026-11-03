@@ -637,6 +637,35 @@ def test_platform_can_create_a_user_account_with_tenant_and_service(client, acme
     assert logged.json()["role"] == "user"
 
 
+def test_a_user_account_cannot_live_in_the_platform_tenant(client, acme, harness):
+    """플랫폼 테넌트의 서비스는 콘솔 하나이고 허용 역할이 비어 있다 — 거기 묶인 사용자 계정은
+    클라이언트 페이지에서 아무것도 못 한다. 실제로 그렇게 만든 계정이 기록·계정 탭만 있는 빈
+    화면을 봤다(2026-11-03). API·CLI 가 모두 `create_account` 를 지나므로 거기서 막는다."""
+    response = client.post(
+        "/v1/platform/accounts",
+        json={"username": "pam", "password": PASSWORD, "role": "user", "tenant_id": "_platform"},
+        headers=auth(acme["platform_admin"]),
+    )
+    assert response.status_code == 400
+    assert error_code(response) == "user_account_needs_tenant"
+    assert client.post("/v1/login", json={"username": "pam", "password": PASSWORD}).status_code == 401
+
+    with pytest.raises(ApiError) as caught:
+        create_account(
+            harness.store, "pam", PASSWORD, role=ROLE_USER, tenant_id="_platform",
+            service_id="console", actor="test",
+        )
+    assert caught.value.code == "user_account_needs_tenant"
+
+
+def test_the_platform_tenant_id_matches_bootstrap():
+    """auth 는 bootstrap 을 import 할 수 없어(순환) 같은 값을 다시 적었다 — 어긋나면 위 검사가 빈다."""
+    from app.auth import PLATFORM_TENANT_ID
+    from app.bootstrap import PLATFORM_TENANT
+
+    assert PLATFORM_TENANT_ID == PLATFORM_TENANT
+
+
 def test_the_cli_offers_the_user_role():
     from app.cli import build_parser
 

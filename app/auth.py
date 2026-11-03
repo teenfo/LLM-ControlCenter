@@ -409,6 +409,9 @@ MAX_PASSWORD_LENGTH = 256
 #: `service` 토큰을 받는다(`token_role_for_account`). 사람은 새 권한 모델이 아니라 토큰을 받는 앞문이다.
 ROLE_USER = "user"
 ACCOUNT_ROLES = (ROLE_PLATFORM_ADMIN, ROLE_TENANT_ADMIN, ROLE_USER)
+#: 플랫폼 테넌트 id. `bootstrap.PLATFORM_TENANT` 와 같은 값이다 — bootstrap 이 이 모듈을
+#: import 하므로 거꾸로 가져올 수 없어 다시 적는다(같은지는 테스트가 본다).
+PLATFORM_TENANT_ID = "_platform"
 
 _USERNAME = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
 #: log2(N), r, p — 16MB·수십 ms. 로그인 한 번에 맞는 비용이고 노트북급 호스트에서도 돈다.
@@ -607,6 +610,11 @@ def create_account(
     name = validate_username(username)
     if role not in ACCOUNT_ROLES:
         raise ApiError("invalid_field", status=400, params={"field": "role"})
+    if role == ROLE_USER and tenant_id == PLATFORM_TENANT_ID:
+        # 플랫폼 테넌트의 서비스는 콘솔 하나이고 허용 역할이 비어 있다(사용량은 테넌트에 잡혀야
+        # 한다). 거기 묶인 사용자 계정은 클라이언트 페이지에서 아무것도 못 한다 — 실제로 그렇게
+        # 만든 계정이 기록·계정 탭만 있는 빈 화면을 봤다(2026-11-03).
+        raise ApiError("user_account_needs_tenant", status=400)
     check_password_policy(password, name)
     scope = TenantScope(tenant_id)
     if store.get_tenant(tenant_id) is None or store.get_service(scope, service_id) is None:
