@@ -30,6 +30,7 @@ const state = {
   refreshTimer: null,
   platformBlocked: false,
   jobFilter: 'all',
+  auditFilter: 'all',
   usageAxis: 'service_id',
   usageWindow: '30d',
   // 가드 미리보기의 입력과 결과 — 화면 밖(state)에 두어야 자동 갱신이 지우지 않는다.
@@ -108,6 +109,7 @@ const ICONS = {
   models: [['path', { d: 'M12 2 3 7v10l9 5 9-5V7z' }], ['path', { d: 'M3 7l9 5 9-5M12 12v10' }]],
   rules: [['path', { d: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z' }], ['path', { d: 'M9 12l2 2 4-4' }]],
   jobs: [['circle', { cx: 12, cy: 12, r: 9 }], ['path', { d: 'M12 7v5l3 2' }]],
+  audit: [['path', { d: 'M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z' }], ['path', { d: 'M14 3v6h6M8 13h8M8 17h5' }]],
   usage: [['path', { d: 'M4 20V10M10 20V4M16 20v-7M22 20H2' }]],
   alerts: [['path', { d: 'M6 16V11a6 6 0 0 1 12 0v5l2 2H4z' }], ['path', { d: 'M10 21h4' }]],
   settings: [['circle', { cx: 12, cy: 12, r: 3 }],
@@ -640,6 +642,8 @@ const PAGES = [
     show: (s) => s.is_tenant_admin, render: () => renderRules() },
   { id: 'jobs', icon: 'jobs', label: 'ui.jobs', desc: 'ui.desc_jobs',
     show: (s) => s.is_tenant_admin, render: () => renderJobs() },
+  { id: 'audit', icon: 'audit', label: 'ui.audit', desc: 'ui.desc_audit',
+    show: (s) => s.is_tenant_admin, render: () => renderAudit() },
   { id: 'usage', icon: 'usage', label: 'ui.usage', desc: 'ui.desc_usage',
     show: (s) => s.is_tenant_admin, render: () => renderUsage() },
   { id: 'alerts', icon: 'alerts', label: 'ui.notifications', desc: 'ui.desc_alerts', platform: true,
@@ -1653,6 +1657,142 @@ async function viewRaw(jobId) {
     ]));
     box.scrollTop = box.scrollHeight;
   } catch (err) { showError(err); }
+}
+
+// ── 테넌트: 감사 ──────────────────────────────────────────────────────────
+
+/* 감사 기록의 "무엇을". 키를 조립하지 않는다 — 표에 없는 동작은 코드 그대로 보인다(숨기지 않는다). */
+const AUDIT_ACTION_LABEL = {
+  read_raw_prompt: 'ui.view_raw',
+  raw_prompt_undecryptable: 'ui.audit_act_raw_undecryptable',
+  login: 'ui.audit_act_login',
+  login_failed: 'ui.audit_act_login_failed',
+  logout: 'ui.audit_act_logout',
+  create_account: 'ui.audit_act_create_account',
+  reset_password: 'ui.audit_act_reset_password',
+  change_password: 'ui.audit_act_change_password',
+  enable_account: 'ui.audit_act_enable_account',
+  disable_account: 'ui.audit_act_disable_account',
+  move_account: 'ui.audit_act_move_account',
+  issue_token: 'ui.audit_act_issue_token',
+  rotate_token: 'ui.audit_act_rotate_token',
+  revoke_token: 'ui.audit_act_revoke_token',
+  create_service: 'ui.audit_act_create_service',
+  update_service: 'ui.audit_act_update_service',
+  set_guard_rule: 'ui.audit_act_set_guard_rule',
+  clear_guard_rule: 'ui.audit_act_clear_guard_rule',
+  update_tenant_settings: 'ui.audit_act_update_settings',
+  set_role_override: 'ui.audit_act_set_role_override',
+  clear_role_override: 'ui.audit_act_clear_role_override',
+  export_tenant: 'ui.export',
+  purge_end_user: 'ui.purge_end_user',
+  create_tenant: 'ui.audit_act_create_tenant',
+  cancel_job: 'ui.audit_act_cancel_job',
+};
+
+const AUDIT_ACCESS = ['login', 'login_failed', 'logout', 'create_account', 'reset_password', 'change_password',
+  'enable_account', 'disable_account', 'move_account', 'issue_token', 'rotate_token', 'revoke_token'];
+const AUDIT_POLICY = ['create_service', 'update_service', 'set_guard_rule', 'clear_guard_rule',
+  'update_tenant_settings', 'set_role_override', 'clear_role_override'];
+
+const AUDIT_FILTERS = [
+  { id: 'all', label: 'ui.filter_all', match: () => true },
+  // 이 화면의 첫 질문 — "누가 가리기 전의 프롬프트를 봤나".
+  { id: 'raw', label: 'ui.view_raw', match: (r) => r.action === 'read_raw_prompt' || r.action === 'raw_prompt_undecryptable' },
+  { id: 'access', label: 'ui.audit_filter_access', match: (r) => AUDIT_ACCESS.includes(r.action) },
+  { id: 'policy', label: 'ui.audit_filter_policy', match: (r) => AUDIT_POLICY.includes(r.action) },
+];
+
+//: 2단 분류기가 매 요청 남기는 "정상으로 돌았다" 표지. 이력을 덮으므로 접고 수만 말한다 — 실패(_classifier_failed)는 그대로 보인다.
+const CLASSIFIER_OK_RULE = '_classifier_ok';
+
+const VERDICT_LABEL = { true_positive: 'ui.true_positive', false_positive: 'ui.false_positive' };
+
+/** "누가". 감사의 actor 는 토큰 id 라서, 이 테넌트의 토큰 목록에서 사람이 읽는 이름을 찾는다 — 계정 세션은 아이디다.
+ *  못 찾으면(플랫폼 토큰 · 운영 스크립트) 값을 그대로 보인다. */
+function auditActor(actor, tokens) {
+  const token = tokens.find((tk) => tk.id === actor);
+  const note = token ? String(token.note || '') : '';
+  if (note.startsWith('login:')) {
+    return el('div', { class: 'nowrap' }, [el('span', { text: note.slice(6) }), el('span', { class: 'sub', text: t('ui.audit_session') })]);
+  }
+  if (token) {
+    return el('div', { class: 'nowrap', title: note }, [el('span', { class: 'mono', text: token.prefix }), el('span', { class: 'sub', text: token.role })]);
+  }
+  return el('span', { class: 'mono', text: actor });
+}
+
+function auditAction(action) {
+  const key = AUDIT_ACTION_LABEL[action];
+  return el('div', { class: 'nowrap' }, [
+    el('span', { text: key ? t(key) : action }),
+    key ? el('span', { class: 'sub mono', text: action }) : null,
+  ]);
+}
+
+function quiet(value, cls) {
+  return value ? el('span', { class: cls || 'mono', title: value, text: value }) : el('span', { class: 'muted', text: t('ui.none') });
+}
+
+async function renderAudit() {
+  const data = await fetchAll({
+    audit: '/v1/admin/audit?limit=200',
+    events: '/v1/admin/guard/events?limit=200',
+    tokens: '/v1/admin/tokens',
+  });
+  renderBanners();
+  const rows = (data.audit && data.audit.audit) || [];
+  const tokens = (data.tokens && data.tokens.tokens) || [];
+  const every = (data.events && data.events.events) || [];
+  const events = every.filter((e) => e.rule_id !== CLASSIFIER_OK_RULE);
+  const folded = every.length - events.length;
+  const filter = AUDIT_FILTERS.find((f) => f.id === state.auditFilter) || AUDIT_FILTERS[0];
+  const shown = rows.filter(filter.match);
+
+  const chips = el('div', { class: 'chips', role: 'group', 'aria-label': t('ui.action') }, AUDIT_FILTERS.map((f) => el('button', {
+    type: 'button', class: 'chip' + (f.id === filter.id ? ' active' : ''),
+    'aria-pressed': f.id === filter.id ? 'true' : 'false',
+    onclick: () => { state.auditFilter = f.id; refresh(); },
+  }, [t(f.label), el('span', { class: 'n', text: String(rows.filter(f.match).length) })])));
+
+  return [
+    // 원문은 여기서도 열지 않는다 — 열람 사실만 보인다. 열람은 작업 상세의 단건 경로 하나뿐이다.
+    pageHead(t('ui.desc_audit'), [chips]),
+    card(t('ui.audit_admin'), [
+      table(
+        [t('ui.time'), t('ui.audit_actor'), t('ui.action'), t('ui.audit_target'), t('ui.audit_detail'), t('ui.audit_outcome')],
+        shown.map((r) => [
+          el('span', { class: 'mono', text: stamp(r.ts) }),
+          auditActor(r.actor, tokens),
+          auditAction(r.action),
+          quiet(r.target),
+          quiet(r.detail_json && r.detail_json !== '{}' ? r.detail_json : '', 'clip muted'),
+          badge(r.outcome, r.outcome),
+        ]), 'pin'),
+      cardFoot([el('span', { text: t('ui.audit_chain_note') })]),
+    ], null, null, t('ui.count', { n: shown.length })),
+    card(t('ui.audit_detections'), [
+      table(
+        [t('ui.time'), t('ui.rule'), t('ui.stage'), t('ui.action'), t('ui.boundary'), { label: t('ui.hits'), num: true }, t('ui.job'), t('ui.service'), t('ui.audit_review')],
+        events.map((e) => [
+          el('span', { class: 'mono', text: stamp(e.ts) }),
+          el('span', { class: 'mono', text: e.rule_id }),
+          e.stage,
+          badge(e.action, e.action),
+          e.boundary ? boundaryBadge(e.boundary) : quiet(''),
+          String(e.match_count ?? 0),
+          e.job_id ? el('span', { class: 'mono', title: e.job_id, text: e.job_id.slice(0, 8) }) : quiet(''),
+          quiet(e.service_id),
+          e.reviewed && VERDICT_LABEL[e.verdict]
+            ? badge(t(VERDICT_LABEL[e.verdict]), e.verdict === 'false_positive' ? 'warn' : 'ok')
+            : quiet(''),
+        ]), 'pin'),
+      cardFoot([
+        el('span', { text: t('ui.masked_only') }),
+        folded ? el('span', { text: t('ui.audit_classifier_folded', { n: folded }) }) : null,
+      ]),
+    ], null, null, t('ui.count', { n: events.length })),
+  ];
 }
 
 // ── 테넌트: 사용량 ────────────────────────────────────────────────────────

@@ -100,6 +100,31 @@ def test_the_rail_offers_only_the_pages_the_role_can_use():
     assert "s.account" in settings, "내 계정 탭이 계정 세션 조건 없이 열린다"
 
 
+def test_the_audit_page_shows_who_did_what_and_what_the_guard_caught():
+    """감사 화면 — 관리 감사(원문 열람·계정·토큰·규칙)와 가드 탐지 전체 이력. 테넌트 관리자 면이다.
+
+    "프롬프트 감사 자료는 어디서 보나" 에 화면이 답하지 못했다 — 관리 감사는 API 로만, 탐지는
+    검토 대기 건만 보였다(2026-11-03).
+    """
+    from app.pipeline import CLASSIFIER_OK_RULE
+
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    pages = source[source.index("const PAGES = ["):source.index("function pagesFor")]
+    entry = pages[pages.index("'audit'"):]
+    entry = entry[:entry.index("}")]
+    assert "is_tenant_admin" in entry and "renderAudit()" in entry
+    view = source[source.index("async function renderAudit"):source.index("// ── 테넌트: 사용량")]
+    assert "'/v1/admin/audit?limit=200'" in view
+    assert "'/v1/admin/guard/events?limit=200'" in view and "unreviewed" not in view, "검토 대기만이 아니라 전체 이력이다"
+    assert "CLASSIFIER_OK_RULE" in view, "매 요청 남는 분류기 정상 표지가 이력을 덮는다"
+    assert f"const CLASSIFIER_OK_RULE = '{CLASSIFIER_OK_RULE}';" in source, "서버의 표지 이름과 어긋났다"
+    assert "/raw'" not in view, "감사 화면은 열람 사실만 보인다 — 원문을 열지 않는다"
+    filters = source[source.index("const AUDIT_FILTERS = ["):source.index("const CLASSIFIER_OK_RULE")]
+    assert "read_raw_prompt" in filters, "원문 열람만 골라 보는 필터가 있어야 한다"
+    actor = source[source.index("function auditActor"):source.index("function auditAction")]
+    assert "'login:'" in actor, "계정 세션은 토큰 id 대신 아이디로 보여야 '누가' 가 읽힌다"
+
+
 def test_the_drawer_and_toast_live_outside_the_view():
     """드로어의 폼과 발급된 토큰은 #view 밖에 있어야 자동 갱신이 지우지 않는다."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")

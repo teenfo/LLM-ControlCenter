@@ -1202,6 +1202,9 @@
        화면이 쓰는 모든 문자열이 모든 로케일에 있고, 안 쓰는 문자열은 없다
        사이드바(`#rail`)는 역할이 쓸 수 있는 페이지만 내놓는다 · 드로어·토스트는 `#view` 밖에 살아 자동 갱신에 지워지지 않는다
        1회 표시 값(발급 토큰)은 드로어에서만 보여 주고 목록에는 남기지 않는다
+       「감사」 화면(0.7.4, 테넌트 관리자): 관리 감사 기록(`GET /v1/admin/audit` — 원문 열람 · 계정 · 토큰 · 규칙 · 설정, "원문 열람" 필터,
+       "누가" 는 토큰 목록으로 풀어 계정 세션이면 아이디)과 가드 탐지 전체 이력(`GET /v1/admin/guard/events` — 검토 대기만이 아니다).
+       매 요청 남는 2단 분류기 정상 표지(`_classifier_ok`)는 접고 수만 말한다(실패 표지는 보인다) · 원문은 여기서 열지 않는다 — 열람 사실만 보인다
 고정   `test_ui.py::test_the_ui_is_served_without_a_build_step`
        `test_ui.py::test_no_external_assets`
        `test_ui.py::test_server_data_is_never_written_as_html`
@@ -1210,6 +1213,9 @@
        `test_ui.py::test_no_dead_ui_strings`
        `test_ui.py::test_the_rail_offers_only_the_pages_the_role_can_use`
        `test_ui.py::test_the_drawer_and_toast_live_outside_the_view`
+       `test_ui.py::test_the_audit_page_shows_who_did_what_and_what_the_guard_caught`
+       `test_api.py::test_admin_audit_and_usage_never_cross_tenants`
+       `test_api.py::test_raw_prompt_read_is_audited`
 상태   구현됨
 
 ### OPS-9  클러스터 상태 조회
