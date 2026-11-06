@@ -773,6 +773,38 @@ def test_the_account_command_manages_console_accounts(tmp_path):
     assert missing.returncode == 1 and "Traceback" not in missing.stderr
 
 
+def test_the_account_command_moves_an_account_between_tenants(tmp_path):
+    """콘솔 없이 계정을 옮기는 길 — 2026-11-03 에는 이 명령이 없어 컨테이너 안에서 행을 직접 고쳤다."""
+    base_env = {k: v for k, v in os.environ.items() if k != "LCC_ACCOUNT_PASSWORD"}
+    base_env["PYTHONPATH"] = str(ROOT)
+    prefix = [sys.executable, "-m", "app", "--data", str(tmp_path / "data"), "--keys", str(tmp_path / "keys")]
+
+    def run(*more: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*prefix, *more], cwd=ROOT, capture_output=True, text=True, timeout=60,
+            env={**base_env, **env}, stdin=subprocess.DEVNULL,
+        )
+
+    assert run("bootstrap").returncode == 0
+    assert run("account", "create", "ops", "--tenant", "default",
+               LCC_ACCOUNT_PASSWORD="correct horse battery").returncode == 0
+    assert run("account", "create", "kim", "--role", "user", "--tenant", "default",
+               LCC_ACCOUNT_PASSWORD="correct horse battery").returncode == 0
+
+    moved = run("account", "move", "ops", "--tenant", "_platform")
+    assert moved.returncode == 0 and "default/default-app → _platform/console" in moved.stdout, moved.stderr
+    ops_line = next(line for line in run("account", "list").stdout.splitlines() if line.strip().startswith("ops"))
+    assert "_platform" in ops_line
+
+    same = run("account", "move", "ops", "--tenant", "_platform")
+    assert same.returncode == 0 and "바꾼 것이 없습니다" in same.stdout
+
+    # 사용자 계정은 플랫폼 테넌트로 옮길 수 없다 — 만들 때와 같은 규칙.
+    refused = run("account", "move", "kim", "--tenant", "_platform")
+    assert refused.returncode == 1 and "Traceback" not in refused.stderr, refused.stderr
+    assert run("account", "move", "ops", "--tenant", "default").returncode == 0
+
+
 def test_doctor_reports_grace_mode_as_a_warning_not_a_failure(tmp_path):
     """**설치 직후 doctor 가 항상 실패하면 아무도 그 종료 코드를 안 본다.**"""
     env = {**os.environ, "PYTHONPATH": str(ROOT)}

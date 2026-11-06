@@ -2649,6 +2649,15 @@ class SqliteStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def set_account_place(self, username: str, *, tenant_id: str, service_id: str) -> bool:
+        """계정의 테넌트·서비스를 바꾼다. 검증과 세션 정리는 `auth.move_account` 의 일이다."""
+        cur = self._conn.execute(
+            "UPDATE accounts SET tenant_id = ?, service_id = ? WHERE username = ?",
+            (tenant_id, service_id, username),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def set_account_disabled(self, username: str, disabled: bool) -> bool:
         cur = self._conn.execute(
             "UPDATE accounts SET disabled_at = ? WHERE username = ?",

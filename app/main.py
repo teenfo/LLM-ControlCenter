@@ -53,6 +53,7 @@ from .auth import (
     limits_for,
     login as account_login,
     logout as account_logout,
+    move_account,
     normalize_username,
     require_can_issue,
     require_platform_admin,
@@ -101,7 +102,7 @@ from .store import (
     SqliteStore, StoreError, TenantScope,
 )
 
-VERSION = "0.7.6"
+VERSION = "0.8.0"
 
 #: 요청 본문의 절대 상한(바이트).
 #:
@@ -2481,22 +2482,45 @@ async def session_password(request: Request) -> Response:
     return _ok(request, {"changed": True, "sessions_revoked": revoked})
 
 
+def _default_account_service(tenant_id: str) -> str:
+    """세션 토큰이 걸릴 서비스를 비워 보냈을 때. 플랫폼은 bootstrap 이 만든 console, 테넌트는
+    온보딩(`platform_tenants`)이 만드는 <테넌트>-app 이다. 없으면 `_require_place` 가 404 로 말한다."""
+    return "console" if tenant_id == PLATFORM_TENANT else f"{tenant_id}-app"
+
+
+def _account_choices(ctx: AppContext, principal: Principal) -> list[dict[str, Any]]:
+    """계정 폼의 선택지 — 테넌트와 그 서비스. 목록 응답에 같이 싣는다(서비스 폼이 역할 카탈로그를
+    같이 받는 것과 같다). 콘솔이 테넌트마다 `X-LCC-Tenant` 로 서비스를 읽으면 고르는 동안 그 테넌트들의
+    감사에 `platform_view` 가 쌓인다. 허용 역할을 같이 주는 것은 역할 없는 서비스에 사용자 계정을
+    거는 실수(2026-11-03 의 빈 클라이언트 화면)를 폼이 미리 말하게 하려는 것이다."""
+    scope = PlatformScope(principal.token_id, "account form choices")
+    return [
+        {
+            "id": row["id"], "name": row["name"], "status": row["status"],
+            "services": [
+                {"id": svc["id"], "status": svc["status"], "allow_roles": json.loads(svc["allow_roles_json"])}
+                for svc in ctx.store.list_services(TenantScope(row["id"]))
+            ],
+        }
+        for row in ctx.store.list_tenants(scope)
+    ]
+
+
 async def platform_accounts(request: Request) -> Response:
     """계정 목록·생성. **해시는 목록에 없다** — 스토어가 애초에 안 내준다."""
     ctx, principal = _platform_admin(request)
     if request.method == "GET":
-        return _ok(request, {"accounts": [dict(row) for row in ctx.store.list_accounts()]})
+        return _ok(request, {
+            "accounts": [dict(row) for row in ctx.store.list_accounts()],
+            "tenants": _account_choices(ctx, principal),
+        })
 
     body = await _body(request)
     role = str(body.get("role") or ROLE_TENANT_ADMIN)
     tenant_id = str(body.get("tenant_id") or (PLATFORM_TENANT if role == ROLE_PLATFORM_ADMIN else ""))
     if not tenant_id:
         raise ApiError("missing_field", status=400, params={"field": "tenant_id"})
-    # 세션 토큰이 걸릴 서비스. 플랫폼은 bootstrap 이 만든 console, 테넌트는 관행상 <테넌트>-app.
-    service_id = str(
-        body.get("service_id")
-        or ("console" if tenant_id == PLATFORM_TENANT else f"{tenant_id}-app")
-    )
+    service_id = str(body.get("service_id") or _default_account_service(tenant_id))
     name = create_account(
         ctx.store, _need(body, "username"), _need(body, "password"),
         role=role, tenant_id=tenant_id, service_id=service_id, actor=principal.token_id,
@@ -2514,6 +2538,23 @@ async def platform_account_password(request: Request) -> Response:
         actor=principal.token_id,
     )
     return _ok(request, {"reset": True, "sessions_revoked": revoked})
+
+
+async def platform_account_move(request: Request) -> Response:
+    """계정을 다른 테넌트(또는 같은 테넌트의 다른 서비스)로 옮긴다. 아이디·비밀번호·역할은 그대로다.
+
+    테넌트를 가로지르므로 플랫폼 관리자만 한다 — 테넌트 관리자가 자기 사용자를 남의 테넌트로
+    보낼 수 있으면 받는 쪽은 모르는 사람이 들어온다. 판단(규칙·세션·감사)은 `auth.move_account` 에 있다.
+    """
+    ctx, principal = _platform_admin(request)
+    body = await _body(request)
+    tenant_id = str(_need(body, "tenant_id"))
+    service_id = str(body.get("service_id") or _default_account_service(tenant_id))
+    result = move_account(
+        ctx.store, request.path_params["username"],
+        tenant_id=tenant_id, service_id=service_id, actor=principal.token_id,
+    )
+    return _ok(request, {"username": normalize_username(request.path_params["username"]), **result})
 
 
 async def platform_account_disable(request: Request) -> Response:
@@ -2690,6 +2731,8 @@ def _routes(ctx: AppContext) -> list[Any]:
               methods=["POST"], name="platform_account_password"),
         Route(f"{v}/platform/accounts/{{username}}/disable", platform_account_disable,
               methods=["POST"], name="platform_account_disable"),
+        Route(f"{v}/platform/accounts/{{username}}/move", platform_account_move,
+              methods=["POST"], name="platform_account_move"),
         Route(f"{v}/platform/plugins", platform_plugins,
               methods=["GET", "POST"], name="platform_plugins"),
         # 고정 경로는 `{plugin_id}` 앞에 — 뒤에 두면 "inspect" 라는 플러그인을 찾는다.

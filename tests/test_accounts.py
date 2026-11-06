@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.auth import (
@@ -507,6 +509,117 @@ def test_account_actions_leave_an_audit_trail(client, acme, harness):
     actions = [row["action"] for row in harness.store.list_audit(ACME, limit=50)]
     for expected in ("create_account", "login", "logout"):
         assert expected in actions, actions
+
+
+# ── 계정 옮기기 — 테넌트 변경 (feature-spec AUTH-10) ──────────────────────────
+
+
+def move_via_api(client, acme, username: str, **body):
+    return client.post(
+        f"/v1/platform/accounts/{username}/move", json=body, headers=auth(acme["platform_admin"]),
+    )
+
+
+def test_the_platform_moves_an_account_to_another_tenant(client, acme, globex):
+    """아이디·비밀번호·역할은 그대로, 자리만 바뀐다. 옛 테넌트의 세션은 그 자리에서 끊긴다."""
+    assert create_via_api(client, acme, "kim", role=ROLE_USER).status_code == 201
+    old_session = login_via_api(client, "kim").json()["token"]
+
+    moved = move_via_api(client, acme, "kim", tenant_id="globex", service_id=globex["service_id"])
+    assert moved.status_code == 200, moved.text
+    body = moved.json()
+    assert body["moved"] is True and body["username"] == "kim"
+    assert body["from"] == {"tenant_id": "acme", "service_id": acme["service_id"]}
+    assert body["to"] == {"tenant_id": "globex", "service_id": globex["service_id"]}
+    assert body["sessions_revoked"] == 1
+
+    # 옛 세션은 끊겼다 — 남겨 두면 만료까지 옛 테넌트에서 그대로 통한다.
+    assert client.get("/v1/session", headers=auth(old_session)).status_code == 401
+    again = login_via_api(client, "kim")
+    assert again.status_code == 200 and again.json()["tenant"] == "globex"
+    assert again.json()["role"] == ROLE_USER
+
+    listed = client.get("/v1/platform/accounts", headers=auth(acme["platform_admin"])).json()["accounts"]
+    kim = next(row for row in listed if row["username"] == "kim")
+    assert (kim["tenant_id"], kim["service_id"]) == ("globex", globex["service_id"])
+    # 테넌트 쪽 사용자 목록도 따라간다.
+    assert [a["username"] for a in client.get("/v1/admin/accounts", headers=auth(acme["tenant_admin"])).json()["accounts"]] == []
+    assert [a["username"] for a in client.get("/v1/admin/accounts", headers=auth(globex["tenant_admin"])).json()["accounts"]] == ["kim"]
+
+
+def test_a_move_is_recorded_in_both_tenants(client, acme, globex, harness):
+    """나간 쪽 관리자도 목록에서 계정이 사라진 까닭을 자기 감사에서 봐야 한다."""
+    create_via_api(client, acme, "kim", role=ROLE_USER)
+    move_via_api(client, acme, "kim", tenant_id="globex", service_id=globex["service_id"])
+
+    for tenant in ("acme", "globex"):
+        rows = [row for row in harness.store.list_audit(TenantScope(tenant), limit=50) if row["action"] == "move_account"]
+        assert len(rows) == 1, tenant
+        assert rows[0]["target"] == "kim"
+        detail = json.loads(rows[0]["detail_json"])
+        assert detail["from"]["tenant_id"] == "acme" and detail["to"]["tenant_id"] == "globex"
+
+
+def test_a_move_follows_the_creation_rules(client, acme, globex):
+    """놓일 자리의 규칙은 만들 때와 같다. 거절된 이동은 아무것도 안 바꾼다(세션도 그대로)."""
+    create_via_api(client, acme, "kim", role=ROLE_USER)
+    session = login_via_api(client, "kim").json()["token"]
+
+    refused = move_via_api(client, acme, "kim", tenant_id="_platform", service_id="console")
+    assert refused.status_code == 400 and error_code(refused) == "user_account_needs_tenant"
+    # 남의 테넌트 서비스 · 없는 테넌트 · 없는 계정은 404, 테넌트를 안 적으면 400.
+    assert move_via_api(client, acme, "kim", tenant_id="globex", service_id=acme["service_id"]).status_code == 404
+    assert move_via_api(client, acme, "kim", tenant_id="ghost", service_id="ghost-app").status_code == 404
+    assert move_via_api(client, acme, "nobody", tenant_id="globex", service_id=globex["service_id"]).status_code == 404
+    missing = move_via_api(client, acme, "kim", service_id=globex["service_id"])
+    assert missing.status_code == 400 and error_code(missing) == "missing_field"
+
+    assert client.get("/v1/session", headers=auth(session)).status_code == 200
+    assert login_via_api(client, "kim").json()["tenant"] == "acme"
+
+
+def test_moving_to_the_same_place_changes_nothing(client, acme, harness):
+    create_via_api(client, acme, "kim", role=ROLE_USER)
+    session = login_via_api(client, "kim").json()["token"]
+
+    same = move_via_api(client, acme, "kim", tenant_id="acme", service_id=acme["service_id"])
+    assert same.status_code == 200
+    assert same.json()["moved"] is False and same.json()["sessions_revoked"] == 0
+    assert client.get("/v1/session", headers=auth(session)).status_code == 200
+    assert "move_account" not in [row["action"] for row in harness.store.list_audit(ACME, limit=50)]
+
+
+def test_a_move_without_a_service_takes_the_tenants_onboarding_service(client, acme):
+    """서비스를 비우면 만들 때와 같은 관행(<테넌트>-app) — 콘솔에서 만든 테넌트는 그것을 갖고 태어난다."""
+    created = client.post("/v1/platform/tenants", json={"id": "newco"}, headers=auth(acme["platform_admin"]))
+    assert created.status_code == 201
+    create_via_api(client, acme, "kim", role=ROLE_USER)
+
+    moved = move_via_api(client, acme, "kim", tenant_id="newco")
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["to"] == {"tenant_id": "newco", "service_id": "newco-app"}
+
+
+def test_only_the_platform_moves_accounts(client, acme, globex):
+    """테넌트 관리자가 자기 사용자를 남의 테넌트로 보낼 수 있으면 받는 쪽은 모르는 사람이 들어온다."""
+    create_via_api(client, acme, "kim", role=ROLE_USER)
+    refused = client.post(
+        "/v1/platform/accounts/kim/move", json={"tenant_id": "globex", "service_id": globex["service_id"]},
+        headers=auth(acme["tenant_admin"]),
+    )
+    assert refused.status_code == 403
+    assert login_via_api(client, "kim").json()["tenant"] == "acme"
+
+
+def test_the_account_list_carries_the_tenant_and_service_choices(client, acme, globex):
+    """계정 폼의 선택지 — 콘솔이 테넌트마다 머리글로 서비스를 읽으면 그 테넌트들의 감사에 열람이 쌓인다."""
+    body = client.get("/v1/platform/accounts", headers=auth(acme["platform_admin"])).json()
+    tenants = {row["id"]: row for row in body["tenants"]}
+    assert {"acme", "globex"} <= set(tenants)
+    assert [svc["id"] for svc in tenants["acme"]["services"]] == [acme["service_id"]]
+    # 허용 역할을 같이 준다 — 역할 없는 서비스에 사용자를 거는 실수를 폼이 미리 말하게.
+    assert tenants["acme"]["services"][0]["allow_roles"] == ["*"]
+    assert tenants["acme"]["name"] == "Acme"
 
 
 # ── 사용자 계정(user) — 클라이언트 페이지의 앞문 (feature-spec AUTH-10) ──────────

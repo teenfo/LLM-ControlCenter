@@ -2625,23 +2625,30 @@ async function renderAccount() {
   ];
 }
 
-/** 관리자 계정 — 목록·만들기·정지·비밀번호 재설정. 해시는 서버가 애초에 안 내준다. */
-/** 계정 표·정지 스위치·재설정 폼. 플랫폼(관리자 계정)과 테넌트(사용자 계정)가 base path 만 바꿔 같이 쓴다.
- *  목록에 해시는 없다 — 서버가 애초에 내주지 않는다. */
+/** 계정 표·정지 스위치·재설정 폼. 플랫폼(전체 계정)과 테넌트(사용자 계정)가 base path 만 바꿔 같이 쓴다.
+ *  목록에 해시는 없다 — 서버가 애초에 내주지 않는다. `options.onMove` 가 있으면(플랫폼 관리자) 행마다
+ *  「테넌트 변경」을 단다 — 자기 계정은 빼고: 옮기면 지금 이 세션이 끊긴다. */
 function accountsPanel(basePath, accounts, options) {
   const rows = accounts.map((a) => [
     el('span', { class: 'mono', text: a.username }),
     pill(a.role, a.role === 'platform_admin' ? 'accent' : (a.role === 'user' ? 'info' : '')),
-    el('span', { class: 'mono', text: options.showTenant ? a.tenant_id : a.service_id }),
+    options.showTenant
+      ? el('div', { class: 'nowrap' }, [el('span', { class: 'mono', text: a.tenant_id }), el('span', { class: 'sub mono', text: a.service_id })])
+      : el('span', { class: 'mono', text: a.service_id }),
     el('span', { class: 'mono muted', text: stamp(a.last_login_at) }),
     a.disabled_at ? pill(t('ui.disabled'), 'danger') : pill(t('ui.plugin_active'), 'ok'),
-    switchControl(!a.disabled_at, async () => {
-      try {
-        await api(basePath + '/' + encodeURIComponent(a.username) + '/disable',
-          { method: 'POST', body: { disabled: !a.disabled_at } });
-        refresh();
-      } catch (err) { showError(err); }
-    }, a.disabled_at ? t('ui.account_enable') : t('ui.account_disable')),
+    el('div', { class: 'row end' }, [
+      options.onMove && a.username !== state.session.account ? el('button', {
+        type: 'button', class: 'sm', text: t('ui.account_move'), onclick: () => options.onMove(a),
+      }) : null,
+      switchControl(!a.disabled_at, async () => {
+        try {
+          await api(basePath + '/' + encodeURIComponent(a.username) + '/disable',
+            { method: 'POST', body: { disabled: !a.disabled_at } });
+          refresh();
+        } catch (err) { showError(err); }
+      }, a.disabled_at ? t('ui.account_enable') : t('ui.account_disable')),
+    ]),
   ]);
 
   const target = el('select', { id: 'reset-target' }, accounts.map((a) => el('option', { value: a.username, text: a.username })));
@@ -2678,26 +2685,48 @@ function accountsPanel(basePath, accounts, options) {
   ];
 }
 
+/** 플랫폼 테넌트 id — 서버의 `auth.PLATFORM_TENANT_ID` 와 같은 값이다. 사용자 계정은 여기 둘 수 없다. */
+const PLATFORM_TENANT_ID = '_platform';
+
+/** 전체 계정(플랫폼) — 관리자와 사용자 모두. 폼 선택지(테넌트와 그 서비스)는 같은 응답의 tenants 다. */
 async function renderAccounts() {
   const data = await api('/v1/platform/accounts');
   renderBanners();
+  const choices = data.tenants || [];
   return accountsPanel('/v1/platform/accounts', data.accounts || [], {
-    title: t('ui.accounts'), showTenant: true, createForm: createAccountForm,
+    title: t('ui.accounts'), showTenant: true,
+    createForm: () => createAccountForm(choices, {}),
+    onMove: (a) => openDrawer(t('ui.account_move') + ' — ' + a.username, [moveAccountForm(a, choices)]),
   });
 }
 
-/** 테넌트 관리자의 사용자 계정 — 클라이언트 페이지(/client/)로 들어오는 사람들. 역할은 user 로 고정이다. */
+/** 사용자 계정 — 클라이언트 페이지(/client/)로 들어오는 사람들. 역할은 user 로 고정이다.
+ *  테넌트 관리자는 자기 테넌트에 만든다(고정으로 보인다). 플랫폼 관리자는 테넌트를 골라 만들고 옮긴다 —
+ *  「볼 테넌트」를 먼저 바꿔야 하는 줄 모르면 테넌트를 고를 방법이 없었다. */
 async function renderUserAccounts() {
-  const data = await fetchAll({ accounts: '/v1/admin/accounts', services: '/v1/admin/services' });
+  const s = state.session;
+  const data = await fetchAll(Object.assign(
+    { accounts: '/v1/admin/accounts', services: '/v1/admin/services' },
+    s.is_platform_admin ? { platform: '/v1/platform/accounts' } : {},
+  ));
   renderBanners();
   const services = (data.services && data.services.services) || [];
+  const choices = data.platform ? (data.platform.tenants || []) : null;
+  const here = viewedTenant();
   return [el('p', { class: 'hint', text: t('ui.user_hint') })].concat(
     accountsPanel('/v1/admin/accounts', (data.accounts && data.accounts.accounts) || [], {
-      title: t('ui.user_accounts'), showTenant: false, createForm: () => createUserForm(services),
+      title: t('ui.user_accounts'), showTenant: false,
+      createForm: choices
+        ? () => createAccountForm(choices, { roles: ['user'], tenantId: here.id })
+        : () => createUserForm(services, here),
+      onMove: choices
+        ? (a) => openDrawer(t('ui.account_move') + ' — ' + a.username, [moveAccountForm(a, choices)])
+        : null,
     }));
 }
 
-function createUserForm(services) {
+/** 테넌트 관리자의 사용자 계정 만들기 — 자기 테넌트뿐이라 테넌트는 고르지 않고 보여만 준다. */
+function createUserForm(services, tenant) {
   const username = el('input', { id: 'user-username', type: 'text', autocomplete: 'off', spellcheck: 'false' });
   const password = el('input', { id: 'user-password', type: 'password', autocomplete: 'new-password' });
   // 서비스는 고른다 — 허용 역할·한도·예산이 거기 걸린다. 서버도 추측하지 않는다.
@@ -2717,6 +2746,8 @@ function createUserForm(services) {
       } catch (err) { showError(err); }
     },
   }, [
+    kv([[t('ui.account_tenant'), tenant.name + ' (' + tenant.id + ')']]),
+    el('p', { class: 'hint', text: t('ui.account_tenant_fixed') }),
     el('div', {}, [el('label', { for: 'user-username', text: t('ui.username') }), username]),
     el('div', {}, [el('label', { for: 'user-password', text: t('ui.password') }), password]),
     el('div', {}, [el('label', { for: 'user-service', text: t('ui.service') }), service]),
@@ -2725,17 +2756,20 @@ function createUserForm(services) {
   ]);
 }
 
-function createAccountForm() {
+/** 계정 만들기(플랫폼 관리자). 역할 → 테넌트 → 서비스를 **실재하는 것 중에서** 고른다 — 전에는 테넌트와
+ *  서비스를 글자로 적었고 틀리면 404 였다. `opts.roles` 로 역할을 좁히고(사용자 계정 탭은 user 뿐)
+ *  `opts.tenantId` 로 처음 고를 테넌트를 정한다. 사용자가 가장 흔하므로 user 가 맨 앞이다. */
+function createAccountForm(choices, opts) {
   const username = el('input', { id: 'acct-username', type: 'text', autocomplete: 'off', spellcheck: 'false' });
   const password = el('input', { id: 'acct-password', type: 'password', autocomplete: 'new-password' });
   const role = el('select', { id: 'acct-role' }, [
-    el('option', { value: 'platform_admin', text: 'platform_admin' }),
-    el('option', { value: 'tenant_admin', text: 'tenant_admin' }),
     el('option', { value: 'user', text: 'user' }),
-  ]);
-  const tenant = el('input', { id: 'acct-tenant', type: 'text', autocomplete: 'off', spellcheck: 'false' });
-  // 세션이 걸릴 서비스. 비우면 서버 관행(<테넌트>-app)을 따른다 — user 는 여기 걸린 한도·역할을 받는다.
-  const service = el('input', { id: 'acct-service', type: 'text', autocomplete: 'off', spellcheck: 'false' });
+    el('option', { value: 'tenant_admin', text: 'tenant_admin' }),
+    el('option', { value: 'platform_admin', text: 'platform_admin' }),
+  ].filter((option) => !opts.roles || opts.roles.includes(option.value)));
+  const place = placePicker(choices, 'acct', opts.tenantId, null);
+  role.addEventListener('change', () => place.setRole(role.value, false));
+  place.setRole(role.value, false);
   return el('form', {
     class: 'stack',
     onsubmit: async (event) => {
@@ -2745,11 +2779,10 @@ function createAccountForm() {
           method: 'POST',
           body: {
             username: username.value.trim(), password: password.value, role: role.value,
-            tenant_id: tenant.value.trim() || undefined,
-            service_id: service.value.trim() || undefined,
+            tenant_id: place.tenant.value, service_id: place.service.value,
           },
         });
-        toast(t('ui.account_created'));
+        toast(t('ui.account_created_in', { tenant: place.tenant.value }));
         closeDrawer();
         refresh();
       } catch (err) { showError(err); }
@@ -2757,11 +2790,91 @@ function createAccountForm() {
   }, [
     el('div', {}, [el('label', { for: 'acct-username', text: t('ui.username') }), username]),
     el('div', {}, [el('label', { for: 'acct-password', text: t('ui.password') }), password]),
-    el('div', {}, [el('label', { for: 'acct-role', text: t('ui.role') }), role]),
-    el('div', {}, [el('label', { for: 'acct-tenant', text: t('ui.tenants') }), tenant]),
-    el('div', {}, [el('label', { for: 'acct-service', text: t('ui.service') }), service]),
+    // 고를 역할이 하나뿐이면(사용자 계정 탭) 칸을 숨기고 값만 보낸다.
+    el('div', { hidden: role.options.length > 1 ? null : 'hidden' }, [el('label', { for: 'acct-role', text: t('ui.role') }), role]),
+  ].concat(place.rows, [
     el('button', { type: 'submit', class: 'primary', text: t('ui.account_create') }),
-  ]);
+  ]));
+}
+
+/** 테넌트 → 서비스 고르기. 선택지는 `GET /v1/platform/accounts` 의 tenants(테넌트별 서비스와 허용 역할)다.
+ *  테넌트를 바꾸면 서비스 목록이 그 테넌트의 것으로 바뀌고, 처음 고르는 서비스는 원하는 값 → <테넌트>-app
+ *  (온보딩이 만든 기본) → 첫 번째 순이다. user 는 플랫폼 테넌트를 고를 수 없고(서버도 400), 허용 역할이 빈
+ *  서비스에 user 를 걸려 하면 미리 말한다 — 2026-11-03 의 빈 클라이언트 화면이 정확히 그 경우였다. */
+function placePicker(choices, prefix, tenantId, serviceId) {
+  const tenant = el('select', { id: prefix + '-tenant' },
+    choices.map((c) => el('option', { value: c.id, text: c.name + ' (' + c.id + ')' })));
+  const service = el('select', { id: prefix + '-service' });
+  const warn = el('p', { class: 'hint warn', hidden: 'hidden', text: t('ui.service_no_roles') });
+  let currentRole = null;
+  const servicesOf = (id) => ((choices.find((c) => c.id === id) || {}).services) || [];
+  const checkRoles = () => {
+    const chosen = servicesOf(tenant.value).find((x) => x.id === service.value);
+    warn.hidden = !(currentRole === 'user' && chosen && chosen.allow_roles.length === 0);
+  };
+  const fillServices = (wanted) => {
+    const list = servicesOf(tenant.value);
+    service.replaceChildren(...list.map((x) => el('option', { value: x.id, text: x.id })));
+    const pick = list.find((x) => x.id === wanted) || list.find((x) => x.id === tenant.value + '-app') || list[0];
+    if (pick) service.value = pick.id;
+    checkRoles();
+  };
+  const choose = (id, wanted) => {
+    if (choices.some((c) => c.id === id)) tenant.value = id;
+    fillServices(wanted);
+  };
+  tenant.addEventListener('change', () => fillServices(null));
+  service.addEventListener('change', checkRoles);
+  choose(tenantId, serviceId);
+  return {
+    tenant, service,
+    rows: [
+      el('div', {}, [el('label', { for: prefix + '-tenant', text: t('ui.account_tenant') }), tenant]),
+      el('div', {}, [el('label', { for: prefix + '-service', text: t('ui.service') }), service]),
+      warn,
+    ],
+    /** 역할에 따라 고를 수 있는 테넌트가 다르다. `keep` 이면(옮기기) 지금 고른 테넌트를 그대로 둔다. */
+    setRole(roleName, keep) {
+      currentRole = roleName;
+      for (const option of tenant.options) option.disabled = roleName === 'user' && option.value === PLATFORM_TENANT_ID;
+      if (roleName === 'user' && tenant.value === PLATFORM_TENANT_ID) {
+        const first = choices.find((c) => c.id !== PLATFORM_TENANT_ID);
+        if (first) choose(first.id, null);
+      } else if (roleName === 'platform_admin' && !keep) {
+        choose(PLATFORM_TENANT_ID, null);
+      }
+      checkRoles();
+    },
+  };
+}
+
+/** 테넌트 변경(옮기기). 아이디·비밀번호·역할은 그대로이고 옛 자리의 세션은 끊긴다 — 판단은 서버
+ *  `auth.move_account` 에 있다. 같은 자리를 고르면 서버가 아무것도 하지 않고 그렇다고 답한다. */
+function moveAccountForm(account, choices) {
+  const place = placePicker(choices, 'move', account.tenant_id, account.service_id);
+  place.setRole(account.role, true);
+  return el('form', {
+    class: 'stack',
+    onsubmit: async (event) => {
+      event.preventDefault();
+      try {
+        const result = await api('/v1/platform/accounts/' + encodeURIComponent(account.username) + '/move', {
+          method: 'POST', body: { tenant_id: place.tenant.value, service_id: place.service.value },
+        });
+        toast(result.moved ? t('ui.account_moved', { n: result.sessions_revoked }) : t('ui.account_not_moved'));
+        closeDrawer();
+        refresh();
+      } catch (err) { showError(err); }
+    },
+  }, [
+    kv([
+      [t('ui.role'), account.role],
+      [t('ui.account_place'), account.tenant_id + ' / ' + account.service_id],
+    ]),
+  ].concat(place.rows, [
+    el('p', { class: 'hint', text: t('ui.account_move_hint') }),
+    el('button', { type: 'submit', class: 'primary', text: t('ui.account_move') }),
+  ]));
 }
 
 function initialOf(session) {

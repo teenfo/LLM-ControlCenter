@@ -602,6 +602,26 @@ def change_password(store: SqliteStore, principal: Principal, current: Any, new:
     return revoked
 
 
+def _refuse_user_on_platform(role: str, tenant_id: str) -> None:
+    """사용자 계정은 플랫폼 테넌트에 둘 수 없다 — 만들 때도, 옮길 때도.
+
+    플랫폼 테넌트의 서비스는 콘솔 하나이고 허용 역할이 비어 있다(사용량은 테넌트에 잡혀야
+    한다). 거기 묶인 사용자 계정은 클라이언트 페이지에서 아무것도 못 한다 — 실제로 그렇게
+    만든 계정이 기록·계정 탭만 있는 빈 화면을 봤다(2026-11-03).
+    """
+    if role == ROLE_USER and tenant_id == PLATFORM_TENANT_ID:
+        raise ApiError("user_account_needs_tenant", status=400)
+
+
+def _require_place(store: SqliteStore, tenant_id: str, service_id: str) -> None:
+    """계정이 놓일 테넌트와 서비스가 실재해야 한다 — 세션 토큰이 거기 걸린다.
+
+    서비스는 그 테넌트의 스코프로 찾는다. 남의 테넌트 서비스 id 를 적으면 없는 것과 같다(404).
+    """
+    if store.get_tenant(tenant_id) is None or store.get_service(TenantScope(tenant_id), service_id) is None:
+        raise ApiError("not_found", status=404)
+
+
 def create_account(
     store: SqliteStore, username: Any, password: Any, *,
     role: str, tenant_id: str, service_id: str, actor: str,
@@ -610,15 +630,9 @@ def create_account(
     name = validate_username(username)
     if role not in ACCOUNT_ROLES:
         raise ApiError("invalid_field", status=400, params={"field": "role"})
-    if role == ROLE_USER and tenant_id == PLATFORM_TENANT_ID:
-        # 플랫폼 테넌트의 서비스는 콘솔 하나이고 허용 역할이 비어 있다(사용량은 테넌트에 잡혀야
-        # 한다). 거기 묶인 사용자 계정은 클라이언트 페이지에서 아무것도 못 한다 — 실제로 그렇게
-        # 만든 계정이 기록·계정 탭만 있는 빈 화면을 봤다(2026-11-03).
-        raise ApiError("user_account_needs_tenant", status=400)
+    _refuse_user_on_platform(role, tenant_id)
     check_password_policy(password, name)
-    scope = TenantScope(tenant_id)
-    if store.get_tenant(tenant_id) is None or store.get_service(scope, service_id) is None:
-        raise ApiError("not_found", status=404)
+    _require_place(store, tenant_id, service_id)
     created = store.create_account(
         name, role=role, tenant_id=tenant_id, service_id=service_id,
         password_hash=hash_password(str(password)), created_by=actor,
@@ -627,6 +641,41 @@ def create_account(
         raise ApiError("already_exists", status=409, params={"id": name})
     store.audit(actor, "create_account", tenant_id=tenant_id, target=name, detail={"role": role})
     return name
+
+
+def move_account(
+    store: SqliteStore, username: Any, *, tenant_id: str, service_id: str, actor: str,
+) -> dict[str, Any]:
+    """계정을 다른 테넌트(또는 같은 테넌트의 다른 서비스)로 옮긴다. 아이디·비밀번호·역할은 그대로다.
+
+    놓일 자리의 규칙은 만들 때와 같다(`_refuse_user_on_platform` · `_require_place`).
+
+    **옛 자리의 세션은 전부 끊는다.** 세션은 계정이 아니라 테넌트·서비스에 걸린 토큰이라, 남겨
+    두면 옮긴 뒤에도 만료(12시간)까지 옛 테넌트에서 그대로 통한다. 순서는 행을 먼저 바꾸고 그다음에
+    끊는다 — 거꾸로 하면 그 사이에 로그인한 세션이 옛 테넌트에 살아남는다(로그인은 행의 테넌트로 발급한다).
+
+    옛 테넌트에 쌓인 것(작업·사용량·탐지·감사)은 옮기지 않는다 — 그 테넌트의 키로 잠긴 그 테넌트의
+    기록이다. 감사는 **두 테넌트에 모두** 남긴다: 나간 쪽 관리자도 목록에서 계정이 사라진 까닭을
+    자기 감사에서 봐야 한다. 같은 자리로 옮기면 아무것도 하지 않는다(세션도 그대로).
+    """
+    account = store.get_account(normalize_username(username))
+    if account is None:
+        raise ApiError("not_found", status=404)
+    _refuse_user_on_platform(account["role"], tenant_id)
+    _require_place(store, tenant_id, service_id)
+
+    before = {"tenant_id": account["tenant_id"], "service_id": account["service_id"]}
+    after = {"tenant_id": tenant_id, "service_id": service_id}
+    if before == after:
+        return {"moved": False, "from": before, "to": after, "sessions_revoked": 0}
+
+    store.set_account_place(account["username"], tenant_id=tenant_id, service_id=service_id)
+    # `account` 는 옮기기 전의 행이다 — 그 테넌트에서 그 계정의 세션을 찾아 끊는다.
+    revoked = revoke_sessions(store, account)
+    detail = {"from": before, "to": after, "sessions_revoked": revoked}
+    for tenant in dict.fromkeys((before["tenant_id"], tenant_id)):
+        store.audit(actor, "move_account", tenant_id=tenant, target=account["username"], detail=detail)
+    return {"moved": True, **detail}
 
 
 def reset_password(store: SqliteStore, username: Any, new: Any, *, actor: str) -> int:

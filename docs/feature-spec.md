@@ -147,7 +147,7 @@
 ### AUTH-9  로컬 관리자 계정
 정의   관제 UI 는 아이디·비밀번호로 로그인한다. 비밀번호가 맞으면 만료 12시간의 관리자 토큰(세션)을 발급하고, 그 뒤는 토큰과 같은 인증 경로를 지난다.
 표면   `POST /v1/login` · `POST /v1/logout` · `POST /v1/session/password` · `GET/POST /v1/platform/accounts` · `POST /v1/platform/accounts/{username}/password` · `POST /v1/platform/accounts/{username}/disable`
-       `python -m app account` · 관제 UI 로그인 화면 · 내 계정 탭 · 관리자 계정 탭
+       `python -m app account` · 관제 UI 로그인 화면 · 내 계정 탭 · 전체 계정 탭(0.8.0 전 이름은 「관리자 계정」 — 사용자 계정도 여기 나온다)
 구현   `app/auth.py:login` `logout` `change_password` `create_account` `reset_password` `set_account_enabled` `hash_password` · `app/cli.py:cmd_account` · `app/bootstrap.py:bootstrap` 이 `admin` 계정을 만든다
 계약   비밀번호는 scrypt 해시만 저장된다 · 세션은 `note = login:<아이디>` 인 토큰이라 강제 지점이 하나다(`authenticate`)
        실패 이유를 가르지 않는다(없는 아이디·틀린 비밀번호·정지 계정·정지 테넌트가 같은 401) · 아이디 단위 5회/15분 잠금은 없는 아이디도 센다
@@ -164,13 +164,25 @@
 ### AUTH-10  사용자 계정
 정의   테넌트 관리자가 자기 테넌트의 사람에게 아이디·비밀번호 계정을 만들어 준다. 계정은 서비스 하나에 귀속되고, 로그인하면 그 서비스의 `service` 역할 세션(12시간)을 받는다 — 새 권한 등급이 아니라 서비스 토큰의 앞문이다.
 표면   `GET/POST /v1/admin/accounts` · `POST /v1/admin/accounts/{username}/password` · `POST /v1/admin/accounts/{username}/disable` · `POST /v1/platform/accounts` 의 `role: user`
-       `python -m app account create --role user` · 관제 UI 설정 → 사용자 계정 탭 · 클라이언트 페이지 로그인(OPS-11)
-구현   `app/auth.py:ROLE_USER` `token_role_for_account` `account_row` · `app/main.py:tenant_accounts` `tenant_account_password` `tenant_account_disable` `_tenant_user` · `app/pipeline.py:_effective_end_user`
+       `POST /v1/platform/accounts/{username}/move`(0.8.0)
+       `python -m app account create --role user` · `python -m app account move` · 관제 UI 설정 → 사용자 계정 탭 · 전체 계정 탭의 「테넌트 변경」 · 클라이언트 페이지 로그인(OPS-11)
+구현   `app/auth.py:ROLE_USER` `token_role_for_account` `account_row` `move_account` · `app/main.py:tenant_accounts` `tenant_account_password` `tenant_account_disable` `_tenant_user` `platform_account_move` `_account_choices` · `app/pipeline.py:_effective_end_user`
 계약   `user` 세션은 관리 면(`/v1/admin/*` · `/v1/platform/*`)에 닿지 않는다 · 계정은 `service_id` 없이 만들 수 없고 그 서비스는 같은 테넌트에 실재해야 한다
        `user` 계정은 플랫폼 테넌트(`_platform`)에 만들 수 없다(400 `user_account_needs_tenant`, 0.7.3) — 그 테넌트의 서비스는 역할이 빈 콘솔 하나라 거기 묶인 사람은 클라이언트 페이지에서 아무것도 못 한다
        테넌트 관리자는 자기 테넌트의 `user` 계정만 본다 — 남의 테넌트 것과 관리자 계정은 404(존재를 흘리지 않는다)
        **모든 계정 세션의 `end_user` 는 파이프라인이 아이디로 강제한다** (본문 값 무시 · generate·embed·chat 공통 · `_authorize` 보다 앞) — 사칭이 불가능하고 레이트리밋·사용량·파기가 사람 단위로 귀속된다
        생성·재설정·정지는 감사에 남는다(AUTH-9 와 같은 액션 이름)
+       **테넌트를 고른다(0.8.0)** — 플랫폼 관리자는 계정을 만들 때 테넌트·서비스를 글자가 아니라 실재하는 것 중에서 고른다.
+       선택지는 `GET /v1/platform/accounts` 의 `tenants`(테넌트별 서비스와 허용 역할)다 — 테넌트마다 `X-LCC-Tenant` 로 서비스를
+       읽으면 고르는 동안 그 테넌트들의 감사에 열람이 쌓인다. 허용 역할이 빈 서비스에 `user` 를 걸려 하면 폼이 미리 말한다.
+       사용자 계정 탭: 테넌트 관리자에게는 만들 테넌트가 고정으로 보이고, 플랫폼 관리자는 테넌트를 고른다(「볼 테넌트」와 무관)
+       **옮기기(0.8.0)** — `POST /v1/platform/accounts/{username}/move` 는 플랫폼 관리자만 한다(테넌트를 가로지른다 — 테넌트
+       관리자가 자기 사용자를 남의 테넌트로 보낼 수 있으면 받는 쪽은 모르는 사람이 들어온다). 아이디·비밀번호·역할은 그대로,
+       놓일 자리의 규칙은 만들 때와 같다(`user` 는 `_platform` 불가 · 테넌트와 그 테넌트의 서비스가 실재) · 서비스를 비우면
+       만들 때와 같은 관행(`<테넌트>-app`) · **행을 먼저 바꾸고 옛 테넌트의 세션을 끊는다** — 거꾸로면 그 사이 로그인이 옛
+       테넌트에 살아남는다 · 감사 `move_account` 는 **두 테넌트에 모두**(나간 쪽도 계정이 사라진 까닭을 본다) · 같은 자리면
+       아무것도 하지 않는다(`moved: false`, 세션도 그대로) · 옛 테넌트의 작업·사용량·탐지는 옮기지 않는다(그 테넌트의 키로 잠긴
+       그 테넌트의 기록이다) · 콘솔은 자기 계정에는 「테넌트 변경」을 달지 않는다(지금 세션이 끊긴다)
 고정   `test_accounts.py::test_a_user_account_logs_in_as_a_service_session_bound_to_its_tenant_and_service`
        `test_accounts.py::test_a_user_session_cannot_reach_admin_or_platform_routes`
        `test_accounts.py::test_tenant_admin_manages_only_user_accounts_of_its_own_tenant`
@@ -182,6 +194,16 @@
        `test_api.py::test_the_forced_end_user_applies_to_embed_too`
        `test_api.py::test_the_forced_end_user_applies_to_chat_too`
        `test_architecture.py::test_both_submit_paths_force_the_account_end_user`
+       `test_accounts.py::test_the_platform_moves_an_account_to_another_tenant`
+       `test_accounts.py::test_a_move_is_recorded_in_both_tenants`
+       `test_accounts.py::test_a_move_follows_the_creation_rules`
+       `test_accounts.py::test_moving_to_the_same_place_changes_nothing`
+       `test_accounts.py::test_a_move_without_a_service_takes_the_tenants_onboarding_service`
+       `test_accounts.py::test_only_the_platform_moves_accounts`
+       `test_accounts.py::test_the_account_list_carries_the_tenant_and_service_choices`
+       `test_packaging.py::test_the_account_command_moves_an_account_between_tenants`
+       `test_ui.py::test_accounts_are_placed_in_a_tenant_picked_from_real_ones`
+       `test_ui.py::test_an_account_can_change_its_tenant_from_the_console`
 상태   구현됨
 
 ### AUTH-11  서비스 정책 수정
@@ -1771,6 +1793,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `platform_accounts` | `GET/POST /v1/platform/accounts` | AUTH-9 |
 | `platform_account_password` | `POST /v1/platform/accounts/{username}/password` | AUTH-9 |
 | `platform_account_disable` | `POST /v1/platform/accounts/{username}/disable` | AUTH-9 |
+| `platform_account_move` | `POST /v1/platform/accounts/{username}/move` | AUTH-10 |
 | `platform_nodes` | `GET/POST /v1/platform/nodes` | CLUSTER-1 |
 | `platform_node_drain` | `POST /v1/platform/nodes/{node}/drain` | CLUSTER-8 |
 | `jobs_list` | `GET /v1/jobs` | PIPE-9 |
@@ -1822,7 +1845,7 @@ ID 를 주는 이유는 고도화 논의에서 가리킬 이름이 있어야 하
 | `doctor` | OPS-5 CRYPTO-2 CRYPTO-4 |
 | `rotate-kek` | CRYPTO-2 |
 | `audit-export` | CRYPTO-5 |
-| `account` | AUTH-9 AUTH-10 (`create` · `list` · `reset-password` · `disable` · `enable` — `--role user` 가 AUTH-10) |
+| `account` | AUTH-9 AUTH-10 (`create` · `list` · `move` · `reset-password` · `disable` · `enable` — `--role user` 와 `move` 가 AUTH-10) |
 | (호스트 CLI 아님) `clients/lccp.py` | PLUGIN-10 — 플러그인 패키징 (`keygen` · `init` · `check` · `build` · `sign` · `verify` · `inspect`). `GET /v1/client/lccp.py` 로 내려받는 단일 파일 |
 
 ---

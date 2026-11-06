@@ -95,6 +95,7 @@ code, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums slash
 .mono { white-space: nowrap; }
 .muted { color: var(--muted); }
 .hint { color: var(--muted); font-size: var(--text-sm); }
+.hint.warn { color: var(--warn); }
 .grow { flex: 1; }
 .nowrap { white-space: nowrap; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

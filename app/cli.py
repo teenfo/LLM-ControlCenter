@@ -27,6 +27,7 @@ from .auth import (
     ROLE_TENANT_ADMIN,
     ROLE_USER,
     create_account,
+    move_account,
     reset_password,
     set_account_enabled,
 )
@@ -629,7 +630,7 @@ def _no_password_message(args: argparse.Namespace) -> str:
 
 
 def cmd_account(args: argparse.Namespace) -> int:
-    """관제 UI 계정 관리 — 생성 · 목록 · 비밀번호 재설정 · 정지 · 해제."""
+    """관제 UI 계정 관리 — 생성 · 목록 · 옮기기 · 비밀번호 재설정 · 정지 · 해제."""
     data_dir = Path(args.data or DEFAULT_DATA_DIR)
     db_path = data_dir / "controlcenter.db"
     if not db_path.exists():
@@ -667,10 +668,7 @@ def cmd_account(args: argparse.Namespace) -> int:
             if not tenant_id:
                 print("tenant_admin·user 계정에는 --tenant 가 필요합니다.", file=sys.stderr)
                 return 2
-            # 세션 토큰이 걸릴 서비스. 플랫폼은 bootstrap 이 만든 console, 테넌트는 관행상 <테넌트>-app.
-            service_id = args.service or (
-                "console" if tenant_id == PLATFORM_TENANT else f"{tenant_id}-app"
-            )
+            service_id = args.service or _default_service(tenant_id)
             name = create_account(
                 store, args.username, password,
                 role=role, tenant_id=tenant_id, service_id=service_id, actor=actor,
@@ -678,6 +676,22 @@ def cmd_account(args: argparse.Namespace) -> int:
             print(f"  계정 {name} 을(를) 만들었습니다 — 역할 {role} · 테넌트 {tenant_id} · 서비스 {service_id}")
             if args.generate:
                 _print_generated(password)
+            return 0
+
+        if args.action == "move":
+            # 아이디·비밀번호·역할은 그대로 두고 자리만 바꾼다. 옛 자리의 세션은 끊긴다(`auth.move_account`).
+            service_id = args.service or _default_service(args.tenant)
+            result = move_account(
+                store, args.username, tenant_id=args.tenant, service_id=service_id, actor=actor,
+            )
+            if not result["moved"]:
+                print(f"  {args.username} 은(는) 이미 테넌트 {args.tenant} · 서비스 {service_id} 에 있습니다. 바꾼 것이 없습니다.")
+            else:
+                before = result["from"]
+                print(
+                    f"  {args.username} 을(를) 옮겼습니다 — {before['tenant_id']}/{before['service_id']} → "
+                    f"{args.tenant}/{service_id}. 끊은 세션 {result['sessions_revoked']}개."
+                )
             return 0
 
         if args.action == "reset-password":
@@ -705,6 +719,12 @@ def cmd_account(args: argparse.Namespace) -> int:
         return 1
     finally:
         store.close()
+
+
+def _default_service(tenant_id: str) -> str:
+    """세션 토큰이 걸릴 서비스를 생략했을 때. 플랫폼은 bootstrap 이 만든 console, 테넌트는 관행상
+    <테넌트>-app(콘솔 온보딩이 그 이름으로 만든다). HTTP 쪽 `main._default_account_service` 와 같은 관행이다."""
+    return "console" if tenant_id == PLATFORM_TENANT else f"{tenant_id}-app"
 
 
 def _print_generated(password: str) -> None:
@@ -931,7 +951,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     account = sub.add_parser(
         "account",
-        help="관제 UI 계정 — 생성·목록·비밀번호 재설정·정지·해제",
+        help="관제 UI 계정 — 생성·목록·옮기기·비밀번호 재설정·정지·해제",
         description=(
             "관제 UI 는 아이디·비밀번호로 로그인합니다. 부트스트랩이 admin 계정을 만들지만, "
             "비밀번호를 잃었거나 관리자를 전부 정지했거나 계정 기능 이전에 설치한 "
@@ -970,6 +990,16 @@ def build_parser() -> argparse.ArgumentParser:
     reset = actions.add_parser("reset-password", help="비밀번호를 재설정하고 그 계정의 세션을 전부 끊는다")
     reset.add_argument("username")
     password_options(reset)
+
+    move = actions.add_parser(
+        "move", help="계정을 다른 테넌트(서비스)로 옮긴다 — 아이디·비밀번호는 그대로, 옛 자리의 세션은 끊긴다",
+    )
+    move.add_argument("username")
+    move.add_argument("--tenant", required=True, help="옮겨 갈 테넌트")
+    move.add_argument(
+        "--service",
+        help="세션 토큰이 걸릴 서비스(허용 역할·한도·예산이 여기 걸린다). 기본은 console(플랫폼) 또는 <테넌트>-app",
+    )
 
     disable = actions.add_parser("disable", help="계정을 정지한다 — 로그인이 막히고 세션이 끊긴다")
     disable.add_argument("username")

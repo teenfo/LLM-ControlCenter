@@ -747,6 +747,42 @@ def test_the_platform_account_form_offers_the_user_role_with_a_service():
     assert "service_id" in form
 
 
+def test_accounts_are_placed_in_a_tenant_picked_from_real_ones():
+    """사용자 계정을 만들 때 테넌트를 고를 수 없었다 — 사용자 계정 탭은 「볼 테넌트」에 조용히 만들었고,
+    전체 계정 탭은 테넌트·서비스를 글자로 적게 했다(틀리면 404). 이제 둘 다 실재하는 것 중에서 고른다."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    create = source[source.index("function createAccountForm"):source.index("function placePicker")]
+    assert "placePicker(choices, 'acct'" in create
+    assert "tenant_id: place.tenant.value, service_id: place.service.value" in create
+    assert "type: 'text'" not in create.replace("id: 'acct-username', type: 'text'", ""), "테넌트·서비스를 글자로 적게 하지 않는다"
+
+    picker = source[source.index("function placePicker"):source.index("function moveAccountForm")]
+    assert "roleName === 'user' && option.value === PLATFORM_TENANT_ID" in picker, "user 는 플랫폼 테넌트를 고를 수 없다"
+    assert "tenant.value + '-app'" in picker, "처음 고르는 서비스는 온보딩이 만든 기본"
+    assert "allow_roles.length === 0" in picker and "'ui.service_no_roles'" in picker
+
+    users = source[source.index("async function renderUserAccounts"):source.index("function createUserForm")]
+    assert "is_platform_admin ? { platform: '/v1/platform/accounts' }" in users
+    assert "createAccountForm(choices, { roles: ['user'], tenantId: here.id })" in users
+    assert "createUserForm(services, here)" in users
+    fixed = source[source.index("function createUserForm"):source.index("function createAccountForm")]
+    assert "'ui.account_tenant_fixed'" in fixed, "테넌트 관리자에게는 만들 테넌트를 보여 준다"
+
+
+def test_an_account_can_change_its_tenant_from_the_console():
+    """사용자 계정의 테넌트를 바꿀 수 있어야 한다 — 플랫폼 관리자가 행마다 「테넌트 변경」으로, 자기 계정은 빼고."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    move = source[source.index("function moveAccountForm"):source.index("function initialOf")]
+    assert "'/v1/platform/accounts/' + encodeURIComponent(account.username) + '/move'" in move
+    assert "method: 'POST'" in move and "place.setRole(account.role, true)" in move
+    assert "'ui.account_move_hint'" in move
+
+    panel = source[source.index("function accountsPanel"):source.index("async function renderAccounts")]
+    assert "options.onMove && a.username !== state.session.account" in panel, "자기 계정을 옮기면 지금 세션이 끊긴다"
+    platform = source[source.index("async function renderAccounts"):source.index("async function renderUserAccounts")]
+    assert "onMove:" in platform and "moveAccountForm(a, choices)" in platform
+
+
 def test_the_job_views_render_chat_transcripts():
     """kind 가 chat 인 잡의 마스킹본은 턴 배열 JSON 이다 — 표와 드로어가 그것을 턴으로 그린다(원문은 여전히 단건 API)."""
     source = (STATIC / "app.js").read_text(encoding="utf-8")
