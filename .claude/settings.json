@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/check-read-size.py\"",
+            "timeout": 10,
+            "statusMessage": "큰 파일 통째 읽기 검사"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/check-bash-read.py\"",
+            "timeout": 10,
+            "statusMessage": "cat/less/more 큰 파일 검사"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,214 @@
+# 1차 배포 체크리스트
+
+이 문서는 **순서표**다. 설명은 [deployment.md](deployment.md) · [README](../README.md) ·
+런북에 있고, 여기서는 그것을 언제 어떤 순서로 하는지만 적는다. 같은 내용을 두 곳에 적으면
+둘은 어긋나므로, 문장이 길어질 것 같으면 여기가 아니라 저쪽에 쓰고 여기서는 가리킨다.
+
+판은 `pyproject.toml` 의 `version` 이다. 다섯 곳(pyproject · `app.__version__` ·
+`main.VERSION` · `compose.yml` 기본 태그 · `bundle.sh` 기본값)이 같은 값인지는
+`test_every_version_string_agrees` 가 본다 — 한 곳만 올리면 이미지 태그와 `/healthz` 가
+서로 다른 판을 말한다.
+
+---
+
+## 0. 이번 판의 범위 — 먼저 읽을 것
+
+| 무엇 | 어디 |
+|---|---|
+| 되는 것 (기능마다 계약·고정 테스트·상태) | [feature-spec.md](feature-spec.md) |
+| 하기로 했지만 아직 없는 것 | feature-spec §13 · [README 부채 표](../README.md#열어두는-부채) 첫 절 |
+| 하지 않기로 한 것과 그 근거 | [README 부채 표](../README.md#열어두는-부채) 둘째 절 · [design-decisions.md](design-decisions.md) |
+| 배포 프로파일 (Starter · Standard) | [deployment.md §2](deployment.md) — Scale(Postgres·Helm)은 이 판에 없다 |
+| 서버 대수 · 사양 | [README](../README.md#서버는-몇-대인가) · [capacity.md](capacity.md) |
+
+`--demo` 는 배포가 아니다 — 시드 테넌트 둘과 목 노드로 뜨는 시연 프로파일이다. 실사용
+설치는 `bootstrap` 이 만드는 첫 테넌트에서 시작한다.
+
+---
+
+## 1. 출하 전 — 만드는 쪽에서
+
+- [ ] `.venv/bin/pytest -q` 전부 통과 · `.venv/bin/python -m pyflakes app/ tests/` 클린
+- [x] **도커 데몬이 있는 곳에서** `docker build` 한 번. 0.1.0 은 2026-09-10 hosub 에서 빌드해
+      (이미지 228MB) 컨테이너가 uid 10001 로 뜨고 `/healthz` 가 응답하는 것까지 봤다. 이 판의
+      첫 리허설은 데몬이 없는 환경이라 의존성 레이어가 깨진 것을 시뮬레이션으로 먼저 잡았다(§5)
+- [ ] **버전을 올렸다.** 같은 버전으로 두 번 배포하지 않는다 — 이미지 태그·번들 이름·`/healthz` 가 판을
+  가르는 유일한 값이다. 화면 자산(`app.js`·`style.css`·`client/*`)의 캐시 키는 버전에 **내용 해시**를 붙여
+  만들므로 같은 버전을 다시 올려도 브라우저는 새 자산을 받지만, 그것은 사고 대비이지 절차가 아니다.
+  설치처의 `.env` 가 `LCC_VERSION` 을 박아 두었으면 그 값도 함께 올린다(compose 의 이미지 태그가 그것을 따른다).
+  0.2.0 은 2026-09-10 에 그렇게 올렸다 — 0.1.0 을 하루에 세 번 재배포하면서 브라우저 캐시를 의심하게 된 뒤다
+  0.3.0 은 같은 날 관제 UI 를 디자인 핸드오프 구조로 갈아 끼운 판이다 — 자산 세 파일이 통째로 바뀌었으니
+  마이너를 올렸고, 캐시 키(`버전-내용해시`)도 전부 바뀐다
+  0.4.0 은 클라이언트 페이지(`/client/`) · `GET /v1/jobs` · 계정 역할 `user` 를 더한 판이다 — 새 표면·새 API·새 계정
+  역할이라 마이너다. 캐시 키 하나를 관제 UI 와 클라이언트 페이지가 나눠 쓰므로 어느 쪽 자산이 바뀌어도 함께 바뀐다
+  0.5.0 은 대화 API(`POST /v1/chat` · 역할 `kind: chat`)와 서비스 정책 수정(`PUT /v1/admin/services/{id}`)을 더한 판이다 —
+  새 소비자 라우트·새 역할 종류·새 관리 라우트라 마이너다. **사이트 `roles.yaml` 의 `chat` 이 `kind: chat` 으로 바뀌어야
+  대화 탭이 살고, 0.4.0 으로 되돌릴 때는 그 파일도 함께 되돌린다**(0.4.0 은 `kind: chat` 을 모른다)
+  0.6.0 은 플러그인 개발 키트를 더한 판이다 — 플랫폼 라우트 둘(`POST /v1/platform/plugins/inspect` · `…/{id}/rotate-token`) ·
+  `POST /v1/plugin/events` 의 `limit: 0`(ack 만) · 번들 클라이언트 두 파일(`plugin.py` 런타임 · `lccp.py` 패키징) · 데모
+  `--plugin-dev` 라 마이너다. **스키마 변경이 없다** — `.env` 한 줄로 0.5.0 되돌리기가 그대로 성립한다. 신뢰 키(`keys/plugin-trust/*.pub`)는
+  키 볼륨에 두므로 되돌려도 남는다
+  0.6.1 은 테넌트 온보딩 빈틈을 메운 패치다 — `POST /v1/platform/tenants` 가 기본 서비스 `<id>-app` 과 1회용 테넌트 관리자 토큰을 함께
+  만든다(DATA-9). 새 라우트도 스키마 변경도 없고 응답에 칸 둘이 늘었을 뿐이라 패치다. 플러그인의 `>=0.6,<0.7` 범위도 그대로 맞는다
+  0.7.0 은 발표 준비 판이다 — 가드 미리보기(GUARD-14, 새 라우트 `POST /v1/admin/guard/preview`) · 사용량 추이와 차트(OPS-10) ·
+  클라이언트 답변 서식과 복사(OPS-11) · 시연 시나리오와 발표 대본(OPS-12). 새 라우트가 있어 마이너다. **스키마 변경은 없다** —
+  `.env` 한 줄로 0.6.1 되돌리기가 그대로 성립한다. 예제 플러그인의 `requires_host` 는 `>=0.6,<0.8` 로 넓혔다 — 범위는 **설치(사전 검사)
+  때만** 보므로 0.6.0 때 `<0.7` 로 서명해 이미 설치한 번들은 그대로 켜지지만, 새로 설치하려면 `<0.8` 로 다시 빌드·서명한다
+  0.7.1 은 관제 UI 개편 판이다 — 라벨 사이드바(플랫폼·테넌트 두 묶음과 테넌트 범위) · 상태 칩 상단 바 · 레인 보드 · 폰 서랍 메뉴,
+  글꼴 셋을 `static/fonts` 에 동봉했다(OFL-1.1). **라우트·API·스키마가 그대로라 패치다** — `.env` 한 줄로 0.7.0 되돌리기가 그대로
+  성립하고 예제 플러그인의 `>=0.6,<0.8` 범위도 그대로 맞는다. 색 토큰은 클라이언트 페이지와 나눠 쓰므로 `/client/` 의 강조색도 함께 바뀐다
+  0.7.2 는 가드 보강 패치다 — 카드 규칙에 문맥 단서를 더해, Luhn 이 틀린 번호도 "카드번호" 같은 말 바로 뒤라면 `credit_card:context`(full)로
+  가린다(GUARD-2). 규칙 키가 셋(`context` · `context_window` · `context_action`) 늘었을 뿐 라우트·API·스키마가 그대로라 패치다. **사이트
+  `config/` 는 업그레이드가 보존하므로 번들의 새 `guard.yaml` 이 저절로 들어가지 않는다** — 사이트 파일의 `credit_card` 에 그 세 줄을 옮겨
+  적는다(손댄 적 없는 파일이면 배포본으로 바꿔도 된다). 0.7.1 은 그 키를 모른 채 무시하므로 `.env` 한 줄 되돌리기도 그대로 성립한다
+  0.7.3 은 클라이언트 페이지 빈 화면 패치다 — 쓸 수 있는 역할이 없는 계정에게 「요청」 탭을 숨기지 않고 이유와 할 일을 보이며(OPS-11),
+  플랫폼 테넌트에 `user` 계정을 만드는 요청을 400 `user_account_needs_tenant` 로 거절한다(AUTH-10). 라우트·스키마·설정 변경이 없어
+  패치다 — `.env` 한 줄로 0.7.2 되돌리기가 그대로 성립한다. **이미 만들어진** 플랫폼 테넌트의 사용자 계정은 그대로 남는다(새 화면이
+  그 계정에게 이유를 말할 뿐이다) — 정리는 운영자가 테넌트 쪽에 다시 만들고 옛 계정을 끈다
+  0.7.4 는 콘솔 「감사」 화면 패치다 — 테넌트 관리자에게 관리 감사 기록(원문 열람 필터 포함)과 가드 탐지 전체 이력을 보인다(OPS-8).
+  이미 있던 API(`GET /v1/admin/audit` · `GET /v1/admin/guard/events` · `GET /v1/admin/tokens`)만 쓰고 라우트·스키마·설정 변경이 없어
+  패치다 — `.env` 한 줄로 0.7.3 되돌리기가 그대로 성립한다
+  0.7.5 는 플랫폼 관리자 테넌트 보기 패치다 — 플랫폼 관리자가 `/v1/admin/*` 에 `X-LCC-Tenant` 를 보내면 그 테넌트의 관리 면을 본다·바꾼다
+  (AUTH-4 · 콘솔의 「볼 테넌트」). 들여다본 테넌트의 감사에 `platform_view` 가 남는다. 새 라우트·스키마·설정 변경이 없고 머리글은
+  선택이라 패치다 — 0.7.4 로 되돌리면 머리글이 무시되고(플랫폼 관리자는 다시 자기 테넌트만 본다) 그 밖에 바뀌는 것은 없다
+  0.7.6 은 테넌트 한도·가드 규칙 화면 패치다 — 플랫폼 관리자가 테넌트 전체 한도(월 예산 · 분당 요청)를 `PUT /v1/admin/settings` 로
+  정하고(AUTH-3 — 테넌트 관리자가 그 칸을 보내면 403), 테넌트 관리자는 「가드」에서 규칙을 더하고 · 기본 규칙의 등급을 올리고 · 지운다
+  (GUARD-7 — 기본 규칙은 id 와 등급만 보내면 서버가 패턴을 채운다). 곁들여 막힌 차단 저장의 메시지가 검토 0건에도 "오탐률이 임계를
+  넘어" 라고 하던 것을 두 조건(검토한 건수와 최소 · 오탐률과 기준)으로 고쳤다(GUARD-12 — 코드는 그대로 `promotion_blocked`, 값 `min_reviews`
+  가 늘었다). 라우트·스키마·설정 변경이 없고 두 요청 모두 받는 것이 늘었을 뿐이라
+  패치다 — 0.7.5 로 되돌리면 설정의 한도 칸이 무시되고(이미 정한 한도는 테넌트 행에 남아 그대로 듣는다) 등급만 보내는 규칙 저장이 400 이
+  될 뿐, 저장된 규칙은 패턴을 실은 채라 그대로 읽힌다
+  0.8.0 은 계정의 테넌트 고르기·옮기기다 — 플랫폼 관리자가 계정을 만들 때 테넌트·서비스를 실재하는 것 중에서 고르고(`GET /v1/platform/accounts`
+  가 선택지를 같이 준다), 계정을 다른 테넌트로 옮긴다(`POST /v1/platform/accounts/{username}/move` · `python -m app account move`, AUTH-10).
+  **새 관리 라우트라 마이너다.** 스키마 변경은 없다(계정 행의 `tenant_id` · `service_id` 를 바꿀 뿐) — `.env` 한 줄로 0.7.6 되돌리기가 그대로
+  성립하고, 되돌려도 옮겨 둔 계정은 옮긴 자리에 그대로 있다. 예제 플러그인의 `requires_host` 는 `>=0.6,<0.9` 로 넓혔다 — 0.7.0 때와 같이
+  범위는 설치(사전 검사) 때만 보므로 `<0.8` 로 서명해 이미 설치한 번들은 그대로 켜져 돌고, 새로 설치하려면 `<0.9` 로 다시 빌드·서명한다.
+  콘솔의 「관리자 계정」 탭은 「전체 계정」이 됐다(사용자 계정도 거기 나온다)
+  **마이너를 올리면 플러그인의 `requires_host` 범위를 본다** — `>=0.1,<0.2` 로 선언한 플러그인은 0.2.0 호스트에
+  설치되지 않는다(그것이 그 필드의 뜻이다). 0.2.0 을 올릴 때 테스트 번들이 정확히 그렇게 거절됐다
+- [ ] `./bundle.sh` — 같은 이유로 도커 데몬이 있는 곳에서. 없으면 `image.tar` 없이
+      소스만 담기고, 설치처는 `docker compose up -d --build` 로 직접 빌드해야 한다
+- [ ] 번들을 빈 디렉터리에 풀어 `./preflight.sh` 가 도는지 (스크립트 실행 권한이 tar 를 지났는지)
+- [ ] 태그 — `v<version>`. 태그는 되돌리기 어려우니 사람이 붙인다
+
+---
+
+## 2. 설치 당일 — 설치처에서
+
+순서가 계약이다. 특히 **5번의 값은 그 자리에서 딱 한 번 보인다.**
+
+1. **호스트 준비** — [deployment §2.2 체크리스트](deployment.md): 절전·뚜껑 억제, 부팅 시
+   자동 기동, LUKS. 데모 노트북이라도 5번(디스크 암호화)은 넘어가지 않는다
+2. **번들 풀기 + 점검**
+   ```sh
+   tar xzf llm-controlcenter-airgap-<ver>-<날짜>.tgz && cd llm-controlcenter
+   ./preflight.sh        # 고장 0건이어야 한다. 경고는 읽고 넘어간다
+   ```
+   `./keys` 소유권 경고가 나오면 preflight 가 알려 주는 `chown` 을 **먼저** 한다 — 안 하면
+   컨테이너가 마스터 KEK 를 못 써서 `restart: unless-stopped` 아래에서 조용히 크래시 루프가 된다
+3. **에어갭이면** `docker load -i image.tar` (+ `image-nginx.tar`) 뒤 `LCC_AIRGAP=1`
+4. **기동** — 신뢰 네트워크 안이 아니면 반드시 tls 프로파일이다. 없으면 플랫폼 관리 면이 그대로 열린다
+   ```sh
+   docker compose --profile tls up -d      # 인증서는 ./tls/ 에 미리
+   ```
+5. **최초 기동 값 회수** — `docker compose logs controlcenter`
+   - 마스터 KEK → **백업과 다른 곳**에. 잃으면 기존 암호문은 영구히 못 연다
+   - 관제 UI 계정 `admin` 의 비밀번호 — 관제 UI 로그인은 이것으로 한다. 첫 로그인 뒤 **내 계정** 탭에서 바꾼다
+   - 플랫폼 관리자 토큰 · 첫 테넌트의 관리자 토큰 · 서비스 토큰 — API·자동화용. 화면 로그인에는 쓰지 않는다
+   - 유예 모드 안내가 찍힌다 — 차단 규칙이 마스킹으로 낮춰져 도는 상태다(§3)
+6. **노드 등록** — 관제 UI 에서 URL · `data_boundary` · 용량 ([deployment §3.2](deployment.md)).
+   등록 즉시 프로브가 돌고, 실패하면 그 화면에서 안다. `internal` 노드는 사설망 전제,
+   `external` 은 TLS·인증 필수 ([deployment §7](deployment.md))
+7. **첫 소비자 연결** — `GET /v1/integration` 이 그 토큰 기준의 통합 가이드를 준다.
+   노드도 토큰도 없이 먼저 붙여 보려면 `/v1/client/` 의 단일 파일 클라이언트와 목 서버
+8. **진단** — `./doctor.sh --probe`. 갓 설치한 시스템에서 "확인이 필요한 항목" 둘은 정상이다:
+   유예 모드가 켜져 있다는 것과 감사를 아직 내보낸 적이 없다는 것
+
+---
+
+## 3. 첫 주
+
+- [ ] **유예 모드 해제** — 관제 UI 가드 탭에서 며칠 오탐률을 본 뒤. 유예 중에는 화면·API·`doctor`
+      가 계속 알린다 ([README](../README.md#도입-첫날에-막히지-않습니다))
+- [ ] **백업 주기** — `./backup.sh /mnt/<nas>/llmcc` 를 cron 에. 백업에는 원문 암호문도 KEK 도
+      없다 ([deployment §8](deployment.md)). **복원 리허설을 한 번 한다** — 절차가 없으면 백업은 없는 것과 같다
+      ```sh
+      ./restore.sh /mnt/<nas>/llmcc/llmcc-backup-<stamp>.tgz    # 스키마 게이트 → "restore" 입력
+      ```
+- [x] **감사 내보내기** — `python -m app audit-export --out <다른 저장소>/audit.jsonl` 을 정기 실행.
+      체인은 조작을 드러낼 뿐 막지 못하고, 재계산은 밖의 사본과 대조할 때만 걸린다
+      ([runbook-audit-integrity.md](runbook-audit-integrity.md)). `.62` 는 2026-09-11 부터 hosub 의 systemd 타이머
+      (04:40 KST · Persistent)가 컨테이너 안 증분 내보내기를 `/backup/llmcc-audit/`(날짜별 사본 + `latest` · 접두 검사 ·
+      180일 보관)로 당겨 간다 — 첫 실행 440행, `doctor` 경고 0
+- [ ] **알림 채널** — `LCC_NOTIFY_WEBHOOK` 또는 `LCC_SMTP_*` 를 넣고 관제 UI 에서 테스트 발송.
+      없으면 "사람이 모르면 조용히 멈추는 지점" 이 전부 조용하다
+- [ ] **메트릭** — `GET /metrics` 를 기존 Prometheus 에 물린다. 테넌트 이름은 라벨에 없다
+
+---
+
+## 4. 되돌리기
+
+| 상황 | 방법 | 근거 |
+|---|---|---|
+| 새 판이 문제 | 이미지 태그를 이전 판으로. 스키마가 ADD COLUMN 전용이라 구버전이 신버전 DB 를 읽는다 | [deployment §5](deployment.md) |
+| 데이터가 문제 | `./restore.sh <백업>` — 역할 오버라이드가 백업 시점으로 되돌아간다는 경고를 읽는다 | [deployment §8](deployment.md) |
+| KEK 유출 | `python -m app rotate-kek` — 암호문 재암호화 없음 | [runbook-key-compromise.md](runbook-key-compromise.md) |
+| 감사 체인 어긋남 | `doctor` 가 자리를 지목한다 | [runbook-audit-integrity.md](runbook-audit-integrity.md) |
+
+---
+
+## 5. 이 판(0.1.0)에서 실제로 돌려 본 것 — 2026-09-09 리허설
+
+측정 > 추정. 아래는 테스트가 아니라 **번들을 풀고 스크립트를 순서대로 돌린** 기록이다.
+도커 데몬이 없는 환경이라 컨테이너 경로는 못 돌렸고, 그 자리는 시뮬레이션으로 대신했다.
+
+| 항목 | 결과 |
+|---|---|
+| `./bundle.sh` → 빈 디렉터리에 풀기 → `python -m app bootstrap` | 통과. `data/`·`keys/` 가 번들 루트에 생기고 `master.key` 는 600 |
+| `./backup.sh` → DB 삭제 → `./restore.sh` → `doctor` | 통과. 백업에 암호문 0건·KEK 없음. 복원이 설정 7개를 되돌리고 `.before-restore` 사본을 남김 |
+| 살아 있는 서버(`serve --demo`)에 앞문으로: `/healthz` · UI · `/v1/meta` · `/v1/generate`(목 노드) · 플러그인 설치→켜기→이벤트 풀→끄기 | 통과. 끈 플러그인은 401, 켠 직후 밀림 0, 종결 1건이 도착 |
+| `doctor --bundle` | 토큰 유출 없음 |
+| 스케줄 트리거 판에서 만든 DB 를 현재 코드로 열기 | 마이그레이션 자동. 이벤트 표·트리거가 생기고 옛 플러그인 행이 그대로 읽힘 |
+| **Dockerfile 의존성 레이어** (pyproject 만 있는 상태에서 `pip install .`) | **깨져 있었다** — `package directory 'app/providers' does not exist`. 휠 검증은 전체 트리에서 빌드해 이 실패를 못 봤다. pyproject 에서 목록만 읽어 설치하도록 고쳤고 `test_the_dockerfile_dependency_layer_does_not_build_the_package` 가 지킨다 |
+| 유예 모드 배너 | **거짓말을 하고 있었다** — "audit 로 낮춰집니다" 라고 찍혔는데 코드는 마스킹이다. 고쳤고 배너 검사에 못박았다 |
+| 번들 이름 | README·deployment 가 `llm-controlcenter-<ver>.tgz` 라고 적었지만 `bundle.sh` 는 `llm-controlcenter-airgap-<ver>-<날짜>.tgz` 를 만든다. 문서를 고쳤다 |
+| 빌드 컨텍스트 | `.dockerignore` 가 없어 `.venv`·`keys`·`data` 가 데몬에 올라가는 구조였다. 추가했다 |
+| `./preflight.sh` | 이 환경에서는 "도커 데몬에 연결할 수 없습니다" 로 실패하는 것이 **맞다** |
+| **hosub 에서 실제 빌드 → `.62` 에 설치** (2026-09-10) | 번들(73MB, 이미지 포함) 전송 → `docker load` → `preflight` 통과 → `compose up` → 4초 만에 `/healthz` → `doctor` 통과. 유예 모드 배너가 고친 문구로 찍혔다 |
+| **계정 로그인 판으로 `.62` 업그레이드** (2026-09-10, 같은 날 두 번째 판) | 새 번들 sha 검증 → `backup.sh` → 옛 이미지를 `0.1.0-pre-accounts` 로 태그(되돌리기용) → `docker load` → 파일 교체(`.env`·`keys/`·데이터 볼륨은 그대로) → `compose up --force-recreate` → 4초 만에 `/healthz` → `doctor` 통과. **이미 부트스트랩된 설치라 admin 계정이 안 생긴다** — `account create admin --role platform_admin --generate` 로 만들었고 API 로그인·로그아웃이 200. 첫 설치의 관리자 토큰 둘은 회전으로 폐기해(옛 값 401) 회전 경로도 실물에서 확인했다 |
+| **공개 진입점** (2026-09-10) | 번들 nginx 대신 같은 망의 hosub 에 이미 있던 Caddy 에 사이트 하나를 얹었다 — DuckDNS 가 `*.hosub.duckdns.org` 를 같은 IP 로 돌려줘 새 도메인·토큰·포트포워딩이 없었고, 인증서는 Caddy 가 HTTP-01 로 30초 만에 받았다. `/v1/platform/*` 404 와 본문 4MB 규칙을 [deployment §3](deployment.md) 의 Caddy 블록대로 옮겼고 `/healthz` 200 · 플랫폼 면 404 · 관리 면 401 을 확인했다 |
+| **공개 첫 접속이 빈 화면** (2026-09-10) | 사용자가 `/ui` 를 쳤고 아무것도 안 나왔다. index.html 의 자산 참조가 상대 경로라 슬래시 없이 서빙되면 `/style.css` 가 404 다 — 스크립트가 안 돌아 로그인 폼이 숨겨진 채로 남는다. 프록시에 `redir /ui /ui/ 308` 을 먼저 넣어 그 자리에서 풀고, 앱에도 같은 리다이렉트를 넣어(`6b0843f`, `test_the_index_without_a_trailing_slash_redirects_to_one`) 재배포했다. 리허설은 늘 `/ui/` 로만 쳤기 때문에 못 봤다 |
+| **공개 주소에서 관제가 비어 보임 · 비밀번호 폼이 지워짐** (2026-09-10) | 둘 다 첫 실사용이 드러냈다. ① 공개 진입점의 `/v1/platform/*` 404 를 화면이 "표시할 항목이 없음" 으로 그렸다 — 세션을 열 때 HEAD 로 한 번 묻고 막혔으면 배너와 탭 본문이 이유를 말하게 했다(`test_the_screen_explains_a_blocked_platform_surface`). 이 설치는 **프로토타입 단계라 관제 전체를 밖에서 써야 한다는 운영자 결정으로 차단을 풀었다** — 남는 통제는 계정 잠금 · TLS · 앱 역할 검사. ② 15초 자동 갱신이 입력 중인 폼을 다시 그려 치던 글자를 지웠다 — 폼을 만지는 중이면 조용한 갱신은 기다린다(`test_auto_refresh_does_not_paint_over_a_form_being_edited`) |
+| **0.2.0 으로 올림** (2026-09-10) | 0.1.0 을 하루에 세 번 재배포하고서야 버전 규율이 없다는 것을 알았다. 버전을 올리고 자산 캐시 키를 `버전-내용해시` 로 바꿨다(`test_asset_cache_keys_follow_the_content` · `test_versioned_assets_are_immutable_and_the_index_is_not`). `.62` 는 `.env` 의 `LCC_VERSION` 을 함께 올려 `docker compose up --force-recreate` 로 새 태그의 이미지를 받았고, `/healthz` 0.2.0 · `app.js?v=0.2.0-2b5fc2a9` · `/ui/` no-cache · 키 있는 자산 immutable 을 공개 주소에서 확인했다. 0.1.0 이미지는 태그 그대로 남아 되돌리기는 `.env` 한 줄이다 |
+| **0.3.0 — 관제 UI 디자인 개편** (2026-09-10, 같은 날 네 번째 판) | 디자인 핸드오프의 구조(아이콘 레일 · 헤더 상태 필 · 카드 · 드로어 · 토스트 · 라이트/다크)를 바닐라 JS/CSS 로 옮기고 마이너를 올렸다. 로컬 데모에 대한 헤드리스 브라우저 스모크(34장면: 로그인 실패·성공 · 레일 아홉 페이지 · 테마 전환 · 드로어 열고 닫기 · 작업 상세와 원문 열람 · 입력 중 자동 갱신 가드 · 폰 너비 가로 스크롤 없음 · 테넌트 관리자·서비스 토큰 시야)가 콘솔 오류 0 · 4xx/5xx 0 으로 통과한 뒤 배포했다. hosub 빌드 → `.62` 에 `upgrade-62-0.3.0.sh`(sha 검증 → `backup.sh` → `docker load` → 파일 교체 → `.env` `LCC_VERSION` 0.3.0 → `compose up --force-recreate`) — healthz 4초 · doctor 통과. 공개 주소에서 `/healthz` 0.3.0 · `/ui` 308 · `/ui/` no-cache · `app.js?v=0.3.0-1ffc10f5` immutable · 키 없는 자산 no-cache · `/v1/platform/overview` 401 을 확인했다. 스모크가 잡은 것 둘: 새 로케일 키가 원문 그대로 보였다(서버가 기동 시점 카탈로그를 들고 있어서 — 재기동으로 해소, 배포에서는 이미지가 새로 뜨므로 해당 없음) · 헤더 부제가 한 줄에서 잘렸다(두 줄 클램프로). 0.2.0 이미지는 태그 그대로 남아 되돌리기는 `.env` 한 줄이다 |
+| **0.3.1 — 실제 노드 전환 · 노드 삭제** (2026-09-10, 같은 날 다섯 번째 판) | `.62` 를 데모 시드에서 실제 기계로 옮겼다. ① 유예 모드 해제(API, `grace_mode: false`) ② macstudio(Ollama · LAN 192.168.0.31 · internal · 40GB · 동시 2) 를 API 로 등록 — 등록 즉시 프로브가 모델 5개를 읽었다 ③ 사이트 설정(`config/roles.yaml` 을 qwen2.5 7b/14b/32b · bge-m3 로, `catalog.yaml` 을 실제 모델로, `nodes.yaml` 시드는 비움)을 앱의 `load_config` 로 로컬 검증한 뒤 올리고 재기동 ④ 노드를 지울 API 가 없어서 만들었다 — `DELETE /v1/platform/nodes/{node}` 와 묘비(`node_tombstones`), 시드 노드는 기동 때마다 들어오므로 DB 행 삭제만으로는 안 지워진다는 것을 코드에서 확인하고 설계했다 ⑤ 업그레이드 스크립트가 이 판부터 `config/` 를 보존한다(배포본 기본값은 `config.dist-0.3.1/` 에 옆에 풀고 `diff -rq`) — 그 전 세 판은 `config/` 를 통째로 갈아 끼웠다. 확인: 노드 1대 healthy · 승인 대기 0(옛 역할이 만든 demo-* 자동 설치 요청 2건은 Ollama 레지스트리에 없어 실패했고 guard-classifier 1건은 대기 — 셋 다 사유를 적어 거부) · 실제 잡 `summarize` 가 macstudio/qwen2.5:7b 에서 `ok`(입력 111 · 출력 43 토큰) · 공개 주소 `/healthz` 0.3.1 · 새 라우트 미인증 401 · doctor 남은 항목은 감사 내보내기 하나. 단일 호밍 경고 5건은 노드가 하나뿐이라 당연하다 — 두 번째 노드가 생기면 사라진다. Tailscale 을 `.62` 에 설치했고 로그인 URL 승인은 사람 몫이다 |
+| **0.4.0 — 클라이언트 페이지 · 사용자 계정 · 내 작업 목록** (2026-09-11) | 사람이 브라우저에서 LLM 을 쓰는 화면이 생겼다. `/client/` 를 같은 앱이 서빙하고(관제 UI 와 같은 규칙 · 자산 캐시 키 공유), 계정 역할 `user`(테넌트·서비스 귀속, 세션은 `service` 역할)와 `GET /v1/jobs`(범위는 테넌트·서비스·엔드유저), 테넌트 관리자의 `/v1/admin/accounts*` 가 함께 들어갔다. 검증: pytest 1746 통과 · 브라우저 스모크 콘솔 34장면 + 사용자 계정 탭 2장면 + 클라이언트 11장면(콘솔 오류 0 · 4xx/5xx 0) · 휠이 `static/client/` 를 담는지 테스트로 못박음(글롭을 빼면 실패). 배포: hosub 빌드 → `.62` 에 `upgrade-62-0.4.0.sh`(`config/` 보존 · 사이트 `roles.yaml` 에 `chat`(qwen2.5:14b · 300초)을 없을 때만 덧붙이고 **재기동 전에 새 이미지로 `load_config` 검증**) — healthz 4초 · doctor 통과. 스크립트가 잡은 것: 이미지 ENTRYPOINT 가 앱 CLI 라 `docker run … python` 이 `invalid choice: python` 으로 죽었다 → `--entrypoint python`; 검증 실패 분기가 설계대로 `roles.yaml` 을 되돌리고 멈췄고 컨테이너는 0.3.1 그대로였다(두 번째 실행에서 통과). 실노드 E2E(클라이언트 페이지가 부르는 API 순서 그대로): 테넌트 관리자가 사용자 `hosub` 생성(비밀번호는 `.62` 의 `client-user-credentials.txt` 600 에만) → 로그인(`service` 세션 · `account_role: user`) → `summarize` qwen2.5:7b `ok` 2.7초 · 가드 `email: audit`(이 사이트는 베이스라인이 audit 등급이라 기록만 하고 가리지 않는다) → `chat` 2턴 qwen2.5:14b `ok` 1.9초 · 6.0초, 두 번째 턴의 저장 프롬프트에 첫 턴과 표식이 그대로 → `GET /v1/jobs` scope=account · 관리자 필드 없음 · `GET /v1/jobs/{id}` 가 저장된 가드 판정을 돌려줌 → 토큰 모드 이름 없이 400 `end_user_required` · user 세션의 관리 면 403. 공개 주소: `/healthz` 0.4.0 · `/client` 308 · `/client/` no-cache · `client.js?v=0.4.0-899d2542` immutable · `/v1/jobs` 미인증 401. 실측이 바꾼 것 하나: 첫 대화 턴에서 qwen2.5:14b 가 한국어 질문에 **중국어로** 답했다 → `chat` 지시문에 "항상 한국어로만 답한다" 를 더했다(저장소 기본값·사이트 둘 다 · 재시도에서 한국어). 0.3.1 이미지는 그대로 남아 되돌리기는 `.env` 한 줄이고 `chat` 역할은 0.3.1 도 읽는다 |
+| **0.5.0 — 대화 API · 서비스 정책 수정 · 운영 3건** (2026-09-11) | `POST /v1/chat`(역할 `kind: chat` · 턴별 독립 마스킹 · 2단 분류는 제출당 1회 · 저장은 마스킹 JSON 트랜스크립트)과 `PUT /v1/admin/services/{id}`(콘솔 편집 드로어 · 역할 카탈로그)가 들어간 판. 검증: pytest 1811 통과 · 브라우저 스모크 — 클라이언트 11장면(`/v1/chat` 2턴 → 저장 트랜스크립트가 `kind=chat` 의 JSON 3턴 · 기록 상세가 턴 말풍선) · 콘솔 34+2 장면 회귀 · 서비스 정책 4장면(편집 드로어에서 classify 제외 → 저장 → 그 역할 403 `forbidden_role` · summarize 통과 → `*` 복원 → 서비스 추가) · 콘솔 대화 잡 표·드로어 2장면 — 콘솔 오류 0 · 4xx/5xx 0. 배포: hosub 빌드(73MB) → `.62` 에 `upgrade-62-0.5.0.sh` — `config/` 보존, 사이트 `roles.yaml` 의 `chat:` 블록을 `kind: chat` 블록으로 갈아 끼우고(`roles.yaml.bak-0.4.0`) **재기동 전에 새 이미지로 `load_config` 검증**(kind 단언) → healthz 4초 · doctor 통과. 실노드 E2E: `hosub` 로그인 → summarize qwen2.5:7b `ok` 149.9초(재기동 직후 노드가 헬스 2회 성공을 얻을 때까지 잡이 대기했다 — 맥스튜디오가 잠들어 있어 첫 성공이 +200초였고, 실패한 프로브는 로그에 남지 않는다) → `/v1/chat` 2턴 qwen2.5:14b `ok` 9.5초 · 22.6초, 둘 다 한국어 → `/v1/generate` 에 chat 역할은 400 `wrong_kind` · `messages` 안의 system 턴은 400 → `GET /v1/jobs` 행이 `kind=chat` · 마스킹 JSON 3턴 → `PUT` 으로 classify 제외 → 같은 세션의 classify 가 403 `forbidden_role` → `*` 복원 → 한도 0 은 400 · user 세션은 403 → 감사 `update_service` 2건. 공개 주소: `/healthz` 0.5.0 · `client.js?v=0.5.0-67872459` · `POST /v1/chat` 미인증 401. 운영 3건: ① 감사 사본 — hosub 의 `llmcc-audit-export.timer`(04:40 KST · Persistent · 접두 검사 · 180일)가 `/backup/llmcc-audit/` 로 당긴다, 첫 실행 440행 · `doctor` 경고 0(잡은 것: systemd 유닛의 줄 끝 주석이 `Persistent=true` 를 조용히 무시하게 했다 → 주석을 윗줄로 · 같은 결함이 hosub-backup.timer 에도 있다) ② hosub Caddy 배포 사본 둘(`/opt/hosub-trading`·`/opt/hosub-mcp` 의 `deploy/Caddyfile`)에 `import /etc/caddy/conf.d/*.caddy` 두 줄 — `caddy validate` 통과, 커밋은 그 저장소 몫(jw-mcp 블록은 여전히 라이브에만 있다) ③ `.62` 테일넷 호스트명 `llmcc`(`llmcc.tail95a635.ts.net` · 100.76.50.93). 되돌리기는 `.env` 한 줄 + `roles.yaml.bak-0.4.0` — 0.4.0 이미지는 `kind: chat` 을 모른다 |
+| **0.6.0 — 플러그인 개발 키트 · 토큰 회전 · 사전 검사** (2026-09-12) | 만드는 쪽의 도구가 생긴 판이다 — 런타임 SDK `clients/plugin.py`(처리 뒤 ack · `limit: 0` · 간격 · 401 대기) · 패키징 CLI `clients/lccp.py`(호스트 규칙을 AST 동일성으로 묶음 · 재현 가능 서명 번들) · 목 서버 트리거 플래그 · `serve --demo --plugin-dev` · 예제 둘 + systemd 템플릿, 호스트에는 `POST /v1/platform/plugins/inspect` · `…/{id}/rotate-token` · 이벤트 풀의 `limit: 0`. 검증: pytest 1926 통과 · 데모 스모크(개발 모드로 설치된 예제 둘 · 토큰 회전 드로어, 콘솔 오류 0). 배포: hosub 빌드(74MB, 스키마 변경 없음) → `.62` `upgrade-62-0.6.0.sh` — `keys/plugin-trust/` 를 만들고 hosub 의 `.pub` 을 넣음 → healthz 4초 · doctor 통과 · `trusted_keys 1` · 네 파일이 `/v1/client/` 에서 나감(인증 필요). **예제 플러그인 실가동**(hosub 에서 공개 주소로): `lccp keygen`(hosub, 비밀 키는 hosub 에만) → `build --sign` 둘(finish-log · daily-status `*/2` 변형) → `.62` 에서 inspect 둘 다 `signed` → 설치 → 켜기 → SDK 두 파일을 공개 주소에서 플러그인 자기 토큰으로 내려받아 저장소 원본과 바이트 일치 → `llmcc-plugin@finish-log`·`@daily-status`(DynamicUser · `EnvironmentFile` 600). ① 스케줄: 2분마다 tick 클레임(`late_by` 1~8초 · `last_run_at`·`jobs_created` 증가) ② 이벤트: 사용자 chat 1턴의 종결이 수 초 안에 finish-log 저널·JSONL 로(본문 키 없음 · `end_user` 해시) → `events_pending 0` ③ 재귀 방지: 플러그인이 만든 잡의 종결 8건(취소 7 · `ok` 1)이 커서만 밀고 finish-log 에 한 건도 안 옴 ④ 회전 훈련: `rotate-token` 유예 60초 → 만료 시각에 플러그인이 401 을 만나고 죽지 않고 대기(NRestarts 0) · 옛 토큰 401 / 새 토큰 200 → env 교체·재시작 → 다음 종결(event 20)이 새 토큰으로 옴. **정직하게 적을 것:** 실노드(`macstudio`, Ollama 192.168.0.31)가 창 대부분 `unhealthy`(ping 은 되고 11434 는 안 열림)라 사용자 chat 잡은 508초 뒤에도 `pending` 이었고, 이벤트 경로는 그 잡을 **취소**해(취소도 종결이다 — `status=cancelled`) 확인했다 · 노드가 잠깐 깨어 플러그인 잡 하나를 `ok` 로 끝냈고 그것은 재귀 방지대로 안 왔다 · `ok` 상태의 종결이 finish-log 에 오는 것은 이번 창에서 못 봤다(데모 호스트와 테스트에서는 봤다). 실가동이 드러낸 결함 셋을 고쳤다: 런타임이 클라이언트 타임아웃을 30초로 줄여 `generate(wait=30)` 이 서버보다 먼저 끊김(`TimeoutError`) → 클라이언트가 소켓 타임아웃을 `wait` 만큼 늘리고 런타임은 기본값(320초)을 따름 · tick 핸들러 실패를 "배치 미확정" 으로 말하던 로그 → "예정이 지나갔다" · daily-status 가 노드가 죽어 있으면 고아 잡을 남김 → 600초 뒤 취소하고 포기. 이 설치처의 Caddy 는 `/v1/platform/*` 를 **운영자 결정(2026-09-10, 파일에 기록)으로 열어 두었다** — topology §2 의 기본과 다르며 손대지 않았다. 끝에 둘 다 끄고(`activate false`) hosub 유닛을 정지했다 — 설치본·`/etc/llmcc-plugins/*.env`(600)·기록은 남겼다. 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.5.0`) + `force-recreate`, 신뢰 키는 남겨도 무해 |
+| **0.6.1 — 테넌트 온보딩** (2026-10-14) | "테넌트를 사용자에게 어떻게 할당하나" 라는 질문이 빈틈을 드러냈다 — 콘솔·API 로 만든 테넌트에는 서비스도 토큰도 없어 그 조직의 첫 관리자가 들어갈 길이 없었다(관리 라우트는 호출자 자기 테넌트에만 작동하고 `create_account` 는 서비스가 있어야 한다 · 부트스트랩의 `default` 만 `default-app` 과 토큰을 받았다). `POST /v1/platform/tenants` 가 기본 서비스 `<id>-app` 과 1회용 `tenant_admin` 토큰을 함께 만들고(DATA-9) 콘솔 「테넌트 추가」 드로어가 그 토큰을 한 번 보여 준다 — 그다음(서비스·사용자 계정·토큰)은 그 관리자의 몫이다([deployment §3.1b](deployment.md)). 검증: pytest 1930 통과(`test_a_new_tenant_starts_with_a_default_service_and_a_one_time_admin_token` · `test_a_new_tenant_admin_can_onboard_users_without_the_platform` · `test_the_tenant_drawer_shows_the_admin_token_once`) · 데모 스모크(플랫폼 admin 로그인 → 테넌트 추가 → 드로어에 56자 토큰과 `newco-app` 안내 → 닫으면 목록에 새 행, 콘솔 오류 0). 배포: hosub 빌드(74MB, `dcf9e75d…`, 스키마 변경 없음) → `.62` `upgrade-62-0.6.1.sh`(백업 스냅샷 테넌트 2 · 작업 0 → 이미지 load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → `LCC_VERSION` 0.6.1 → `force-recreate`) → healthz 4초 · `/ui/` 200 · 자산 `0.6.1-4a3cd94e` · `POST /v1/platform/tenants` 미인증 401 · doctor 통과(감사 체인 527행 · KEK 가 테넌트 2개의 DEK 를 풂). **온보딩 실측**(`.62` 안에서, 플랫폼 토큰은 파일에서 변수로만): 테넌트 `onboard-check` 201 → `service_id onboard-check-app` + 토큰(56자) → 그 토큰의 세션 = `tenant_admin` / `onboard-check` / `onboard-check-app` · 서비스 1건(`allow_roles *`) · 토큰 목록에 `tenant_admin` 하나(원값 없음) · `/v1/platform/tenants` 403 `forbidden_platform_admin` → 그 관리자가 사용자 `onboard-user` 를 만들고 → 로그인 200 → 세션 role `service` · `/v1/jobs` scope `account` · 역할 5개 → 감사에 `create_tenant`(detail 에 `service_id`) · `issue_token` · `create_account` · `login` → `DELETE …?confirm=` 200(토큰 2 · 계정 1 · 서비스 1 파기) → 남은 테넌트 `_platform`·`default` · 파기 뒤 그 토큰 401. **정직하게 적을 것:** doctor 가 "가드 유예 모드가 켜져 있습니다" 를 알렸다 — 0.3.1 에서 해제했던 것이 켜져 있고 9월 12일 업그레이드 때는 없던 알림이다. 이번 작업은 손대지 않았으니 운영자가 콘솔에서 확인할 것. hosub 의 예제 플러그인 유닛은 0.6.0 끝에 정지한 그대로다. 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.6.0`) + `force-recreate`(스키마 변경 없음) |
+| **0.7.0 — 발표 준비 판** (2026-10-21) | "곧 발표" 를 앞두고 라이브 사이트를 점검했다 — 노드(`macstudio`)는 건강했지만 작업·사용량이 **0건**이라 대시보드가 비어 있었고, 가드를 보여 줄 수단이 없었으며, 클라이언트 답변은 평문 그대로였다. 보이는 순서로 메웠다: 가드 미리보기(GUARD-14 · `POST /v1/admin/guard/preview` · 규칙·가드 탭 맨 위 카드 — 원문의 걸린 자리 · 경계별로 나가는 모양 · 규칙별 등급, 잡·탐지 기록 없음) · 사용량 추이(OPS-10 · `usage_series` · 개요 24시간 · 사용량 탭 24시간/7일/30일 요청·토큰, 축 하나·계열 하나) · 클라이언트 답변 서식(OPS-11 · 제한 마크다운을 DOM 으로 · 복사) · 시연 시나리오(OPS-12 · `examples/showcase/showcase.py` 장면 1~9 · `--seed` · [demo-script.md](demo-script.md)). 검증: pytest 1944 통과 · 데모 스모크(개요 추이 막대와 호버 읽기 줄 · 미리보기에 걸린 자리 3곳과 경계별 마스킹본 · 콘솔 오류 0) · 데모 호스트에서 장면 1~9 전부. 배포: hosub 빌드(74MB, `d3b03c16…`) → `.62` `upgrade-62-0.7.0.sh`(백업 → load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → `LCC_VERSION` 0.7.0 → `force-recreate`) → healthz 4초 · `/ui/` `/client/` 200 · 자산 `0.7.0-8d7bbb57` · 새 라우트 미인증 401 · doctor 통과(감사 체인 536행) · 공개 주소도 0.7.0. **시연 데이터 적재**(`.62`, `showcase.py --seed 24 --pace 1`): 24건 전부 `ok`, 164초 — summarize `qwen2.5:7b` 1.5~5.5초 · classify/chat `14b` 2~9초 · analyze(batch) `32b` 30초 · embed `bge-m3` 2초, 개인정보 섞인 문장 포함. **장면 실측**(`.62`): ② 요약 1.8초 ③ `credit_card: full` · `email: audit`, 저장된 마스킹본에 `[카드번호]` ④ 주민등록번호 `kr_rrn: full` — **번들 베이스라인의 패턴 규칙에는 block 이 하나도 없다**(번들의 block 은 2단 규칙 `undisclosed_financials` 의 경계 밖뿐 · 그 밖의 차단은 측정 뒤 승격) ⑤ 대화 두 턴(턴 3개 전송) ⑥ 임베딩 1024차원 ⑦ 배치 `32b` 24.7초 ⑧ 같은 키 → 같은 잡 ⑨ 관리자: 호출 32 · 토큰 7,143 · 성공률 100% · 평균 4.4초 · 미리보기 경계 둘 다 통과(마스킹본) · 사건 `credit_card` 6 · `email` 9 · `kr_rrn` 6. **정직하게 적을 것:** 가드 유예 모드는 배포 시점에 켜져 있었고 같은 날 운영자 요청으로 껐다(`POST /v1/platform/guard/grace-mode` `{"enabled": false}` → 세션 `guard_grace_mode false` · doctor 통과, 알림 0건 — 베이스라인의 패턴 규칙에는 block 이 없어 장면의 판정은 같고 빨간 필·배너가 사라진다) · 콘솔 사용량·작업·규칙 탭은 로그인한 테넌트의 것이라 플랫폼 `admin` 으로는 `_platform` 의 0 건이 보인다 → 발표는 `default` 테넌트 관리자 토큰 탭에서(대본에 적음) · 스크린샷은 로컬 데모의 것이고 공개 주소의 화면은 API 로만 확인했다 · hosub 의 플러그인 유닛은 정지 그대로 · `.62` 에 설치된 예제 플러그인은 `<0.7` 로 서명된 번들이지만 범위는 설치 때만 보므로 그대로 켤 수 있다. 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.6.1`) + `force-recreate`(스키마 변경 없음) |
+| **0.7.1 — 관제 UI 개편** (2026-11-02) | "디자인이 거의 없는" 관제 화면을 운영 관리자가 읽기 쉬운 콘솔로 다시 그렸다. 시안을 먼저 보이고 승인을 받은 뒤 옮겼고, 화면 구성·배선(id · 핸들러 · 라우트 · API 호출)은 그대로 두고 표현만 바꿨다 — 지운 파일·라우트 없음. 라벨 사이드바(플랫폼·테넌트 두 묶음 · 테넌트 묶음 머리에 지금 보는 테넌트 · 승인 대기 개수) · 상태 칩 상단 바와 마지막 갱신 시각 · 본문 머리(제목·설명·화면 동작) · 개요의 「확인할 일」 패널과 레인 보드(레인별 동시 슬롯·대기열·검사 창) · 축이 있는 추이 차트 · 가드 미리보기의 원문 대조(가려진 원문 · 대체 표지 · 기록만 하고 통과) · 노드·작업 표와 상세 드로어 · 60rem 미만 서랍 메뉴(폰 너비에서 작업 표의 첫 열 고정). 색은 뜻이 하나씩이다 — 호박색 = 사람이 손댈 것, 파랑 = 계기 읽기, 녹색·빨강 = 상태. 글꼴 셋은 `static/fonts` 에 동봉했다: Pretendard 는 예약 글꼴 이름(RFN)이 있어 저자의 공식 서브셋을 바이트 그대로 넣었고(그래서 woff2 합계가 약 0.58MB), Host Grotesk · Atkinson Hyperlegible Mono 는 라틴 서브셋, 셋 다 OFL-1.1 사본을 옆에 둔다. 휠 `package-data` 에 `fonts/*.woff2` · `fonts/*.txt` 를 더하고 `test_the_wheel_carries_the_bundled_fonts` 로 못박았다(스타일시트가 가리키는 파일 · 패밀리별 라이선스 사본까지). 로케일 키 38개 추가 · 문구 손질(두 카탈로그 각 452개) · 공유 색 토큰이 바뀌어 클라이언트 페이지의 강조색도 호박색이 됐다 · 발표 대본의 화면 묘사 세 곳을 새 화면에 맞췄다. 검증: pytest 1949 통과 · 디자인 린트(sloplint) 개편 전 FAIL 17 · REFLEX 45 → 0 · 0 · 개편 전후 id 대조 33/33 · 로컬 데모 헤드리스 스모크 콘솔 24장면(로그인 · 개요 기본/1280/다크 · 노드 · 테넌트와 추가 드로어 · 모델 · 베이스라인 · 알림 · 플러그인 · 계정 · 테넌트 관리자 개요 · 가드 라이트/다크 · 작업과 상세 드로어 라이트/다크 · 사용량 · 연결 · 데이터 · 폰 너비 개요·메뉴·작업) + 클라이언트 페이지 6장면 — 콘솔 오류 0(원래 있던 `/favicon.ico` 404 만). **정직하게 적을 것:** 시안의 「채널 추가」 버튼은 만들지 않았다 — 알림 채널은 환경 변수(`LCC_NOTIFY_WEBHOOK` · `LCC_SMTP_HOST`)로만 붙고 API 가 없어서, 빈 상태에 그 안내를 띄운다 · 플랫폼 관리자는 플랫폼 개요를, 테넌트 관리자는 테넌트 묶음의 「개요」(소비자 상태)를 본다. 라우트·API·스키마 변경이 없어 패치다. 배포(같은 날): hosub 빌드(75MB, `7a624ac3…`, 이미지 232MB · 번들 안 글꼴 9개) → `.62` `upgrade-62-0.7.1.sh`(sha 검증 → `backup.sh` 스냅샷 테넌트 3 · 작업 32 · 사용량 32 → load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → `LCC_VERSION` 0.7.1 → `force-recreate`) → healthz 4초 · `/ui/` `/client/` 200 · 자산 `0.7.1-35e06e80` · `/ui/fonts/*` 200 · 미인증 401(가드 미리보기 · 플랫폼 개요) · doctor 통과(감사 체인 553행 · KEK 가 테넌트 2개의 DEK 를 풂) · 공개 주소도 0.7.1 이고 실제 브라우저에서 글꼴이 `loaded`, 콘솔 오류 0. **정직하게 적을 것:** 글꼴이 `application/octet-stream` 으로 나간다 — 이미지의 파이썬에 `.woff2` 매핑이 없어서다. `nosniff` 가 붙어도 글꼴은 막히지 않아 그대로 로드되는 것을 확인했고, `font/woff2` 등록은 다음 판에 한다 · 0.7.0 이후 브랜치에 들어간 가드 수정 `f8e7aa9`(2단 분류기 탐지는 위치가 없어 그 필드 전체를 표지로 바꾼다 — 부분 마스킹의 꼬리도 남기지 않는다)가 이번 판에 함께 나갔다. 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.7.0`) + `force-recreate` |
+| **시연 준비 — 실가동 트래픽 · roxlogy 임시 전환** (2026-11-02, 0.7.1 그대로) | "실제 작동되고 있는 모습" 을 위해 운영 설치처에 두 가지를 띄웠다. 점검 때 24시간 호출이 0건이라(마지막 작업이 10월 21일) 콘솔의 추이가 비어 있었다. **① 실가동 트래픽** — default 테넌트에 전용 서비스 `demo-traffic`(허용 역할: 요약·분류·대화·임베딩, 토큰은 2026-11-04 00:00 KST 만료)을 만들고, `.62` 의 일시적 systemd 유닛 `llmcc-demo-traffic` 이 업무 시간 곡선(09–19시 약 25초 · 아침저녁 2분 · 밤 10분)으로 실제 노드에 요청을 흘린다. 배경 잡은 한 번에 하나만 띄운다(노드 한 칸은 시연자 몫) · 2026-11-03 23:00 KST 에 스스로 멈춘다 · 끄기는 `.62` 에서 `/root/llmcc/demo-traffic-62.sh stop`. **실측이 바꾼 것:** 32B 로 가는 분석을 섞자 7B·14B 가 메모리에서 밀려나 같이 들어간 요청이 수십 초 밀렸다 → 배경에서 32B 를 뺐다(분석 역할은 스마트 라우팅이라 짧은 질의도 때때로 complex(32B)로 간다). 7B·14B·bge-m3 셋은 함께 올라가 있고 서버 기록상 0.4~2초. **② roxlogy 임시 전환** — roxlogy(Vercel)는 hosub 공유 게이트웨이(`/llm`, :8603 — 이 제품의 전신)로 `coach_feedback`(32B) 하나만 부른다(30일 477건, 오전 9시 집중). `.62` 사이트 `roles.yaml` 에 `coach_feedback`(32B · 배치 · 300초 · temperature 0.4)·`analyze_workout`(14B · 배치 · 240초)을 더하고(백업 `roles.yaml.bak-0.7.1-pre-roxlogy`, 새 이미지로 `load_config` 검증 뒤 재기동 4초) 테넌트 `roxlogy` · 서비스 `roxlogy-app`(허용 역할 셋 · 분당 30회) · 서비스 토큰(`.62` 의 600 파일)을 만들었다. hosub Caddy 의 `/llm` route 에 `import /etc/caddy/llm-roxlogy-switch.caddy`(root:caddy 640) 한 줄 — roxlogy 의 기존 토큰으로 온 `POST /v1/generate` 와 16자리 작업 조회만 `.62` 로 넘기며 토큰을 바꿔 끼우고, 기존 게이트웨이 작업(12자리 id)과 tnm·trading 은 그대로 :8603 이다. **roxlogy 코드·Vercel 은 손대지 않았다.** 검증: 가드 미리보기에 roxlogy 최근 요청 12건 → 걸린 규칙 0 · 프롬프트 변화 0 · 공개 경로로 같은 모양의 요청 → 16자리 id, 15초 뒤 `ok`(32B), 콘솔의 roxlogy 테넌트에 잡힘 · 12자리 조회 200 · tnm 은 계속 늘고 기존 게이트웨이의 roxlogy 유입은 0. **정직하게 적을 것:** 재기동 순간 실가동 트래픽 프로세스가 조회 연결 오류로 죽었다 — 조회 오류를 잡고 유닛에 `Restart=on-failure` 를 걸어 다시 띄웠다(8분 공백) · roxlogy 의 오전 9시 묶음(32B)이 지나는 동안에는 7B·14B 가 밀려 시연 요청이 몇 초 느려질 수 있다. **되돌리기:** hosub 에서 `sudo python3 /opt/hosub-mcp/build/deploy62/roxlogy-caddy-switch.py drain`(새 요청만 기존 게이트웨이로, 남은 LLMCC 작업 조회는 유지) → 10분 뒤 `… off`(import 줄 · 토큰 파일 제거, validate 뒤 reload). `.62` 의 역할 · 테넌트는 남겨도 무해 — 지우려면 백업 `roles.yaml` 복원 + 재기동, 토큰 폐기 |
+| **0.7.2 — 카드번호 문맥 단서** (2026-11-02) | 시연 준비 중 "홍길동 고객의 카드번호 2222-2222-0222-2222 으로 조회 해줘" 가 마스킹 없이, 기록도 없이 노드로 갔다. 카드 규칙은 Luhn 이 맞아야 카드로 보는데 이 번호는 체크섬이 틀렸고(합 44), 주민번호 규칙과 달리 체크섬 실패를 남기는 칸도 없었다 — 사람이 지어낸 번호는 열에 아홉이 그렇다. 체크섬을 빼면 주문번호·타임스탬프가 전부 카드가 되므로, 신호를 숫자 밖의 **"카드번호" 라는 말**에서 얻는다(상용 DLP 의 근접 키워드와 같은 발상). 규칙 키 `context`(정규식 — 매치 바로 앞 `context_window` 글자 안에서 찾는다, 기본 24) · `context_action` 을 더하고, 단서가 되살린 매치는 세 번째 확신도라 세 번째 id `credit_card:context` 로 낸다(통과 `credit_card` · 실패 `:unverified` 와 섞이지 않는다). 번들 단서는 `$` 로 끝나 "바로 앞" 만 본다 — "카드번호는 …" · "신용카드 …" · "card number is …" 는 가리고, "카드 결제 주문번호 …" · "카드번호와 주문번호 …" 처럼 사이에 다른 말이 끼면 예전처럼 버린다. 체크섬 없는 단서 · 빈 문자열에 걸리는 단서 · 등급을 안 적은 단서 · 범위 밖 창 크기는 기동 시점에 거절한다. 곁들여 메운 빈칸: 유예 모드가 `checksum_failed_action`·`context_action` 의 `block` 은 내리지 않았다 — 같은 사다리로 `full` 로 내린다. 검증: pytest 1972 통과 · 신고된 문장이 경계 둘 다 "홍길동 고객의 카드번호 [카드번호] 으로 조회 해줘" 로 나간다(`test_a_luhn_failing_card_right_after_the_word_card_is_masked`) · 단서가 떨어져 있으면 그대로(`test_without_the_word_right_before_a_luhn_failure_is_still_dropped`). **사이트 `config/` 는 업그레이드가 보존한다** — 번들의 새 `guard.yaml` 이 저절로 들어가지 않으므로 설치처마다 `credit_card` 에 세 줄을 옮긴다. 배포(같은 날): hosub 빌드(75MB, `741bbf05…`, 이미지 232MB) → `.62` `upgrade-62-0.7.2.sh`(sha 검증 → 사이트 `guard.yaml` 이 0.7.1 배포본과 바이트까지 같은지 먼저 확인 — 다르면 아무것도 안 건드리고 멈춘다 → `backup.sh` 스냅샷 테넌트 4 · 작업 178 · 사용량 177 → load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → 사이트 `guard.yaml` 을 0.7.2 배포본으로, 원래 파일은 `guard.yaml.bak-0.7.1`(차이는 카드 단서 7줄과 `63315cb` 의 주석 3줄) → 새 이미지로 사이트 설정 읽기: 카드 단서 full · 창 24 · 역할 8 → `LCC_VERSION` 0.7.2 → `force-recreate` 17:57:49) → healthz 4초 · `/ui/` `/client/` 200 · 자산 `0.7.2-35e06e80` · 미리보기 미인증 401 · doctor 통과(감사 체인 610행 · KEK 가 테넌트 3개의 DEK 를 풂) · 공개 주소도 0.7.2. **실서버 실측:** 신고된 문장 → 미리보기 `credit_card:context: full`, 경계 둘 다 "홍길동 고객의 카드번호 [카드번호] 으로 조회 해줘" · 같은 문장을 실제 요청으로(시연 트래픽 서비스 · 요약) → `ok`(7B), 노드로 간 프롬프트(저장된 마스킹본)도 같은 문장 · 탐지 기록 `credit_card:context` full(경계 둘 다). 재기동이 다른 것을 건드리지 않았다 — 실가동 트래픽 유닛은 재시작 0회로 이어서 돌았고(17:57:49 끝 → 17:57:50 보냄), roxlogy 분기는 공개 `/llm` 으로 16자리 조회 → LLMCC 의 `job_not_found` · 12자리 → 기존 게이트웨이의 `not_found` 로 그대로다. 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.7.1`) + `force-recreate` — `guard.yaml` 은 그대로 둬도 된다(0.7.1 은 새 키를 무시한다) |
+| **0.7.3 — 클라이언트 빈 화면 안내** (2026-11-03) | 발표 당일 "클라이언트 페이지에서 할 수 있는 일이 아무것도 없다" 는 보고. 프롬프트 화면(「요청」 탭)은 있었지만 **쓸 수 있는 역할이 하나도 없는 계정에게는 말없이 숨겨져** 「기록」·「계정」 탭만 남았다. 운영 설치처의 계정 셋 중 둘이 그랬다 — `admin`(플랫폼 관리자)과 `test1`(사용자 계정인데 플랫폼 테넌트에 만들어짐)은 둘 다 플랫폼의 `console` 서비스에 묶이고, 그 서비스는 설계상 허용 역할이 비어 있다(사용량은 테넌트에 잡혀야 한다). 테넌트에 만든 `hosub` 만 「요청」·「대화」가 보였다. 고친 것: ① 「요청」 탭은 역할이 없어도 남아 이유와 할 일을 말한다 — 플랫폼 계정이면 "테넌트의 사용자 계정으로 로그인하세요", 아니면 "이 계정의 서비스 '<id>'에 허용된 역할이 없습니다 — 테넌트 관리자에게". 대화 역할만 있는 서비스는 예전처럼 대화 탭이 첫 화면이다 ② 플랫폼 테넌트에 `user` 계정을 만드는 요청은 400 `user_account_needs_tenant` — API(플랫폼·테넌트)와 CLI 가 모두 지나는 `create_account` 에서 막는다. 검증: pytest 1975 통과(`test_the_ask_tab_explains_itself_when_the_account_has_no_role` · `test_a_user_account_cannot_live_in_the_platform_tenant`) · 로컬 데모 헤드리스: `admin` 으로 로그인 → 탭 「요청 / 기록 / 계정」, 「요청」에 안내 카드 · 테넌트 서비스 토큰 → 「요청 / 대화 / 기록 / 계정」과 역할 카드 넷(예전 그대로), 콘솔 오류 0. **정직하게 적을 것:** 이미 있는 `test1` 은 그대로 남는다 — 새 화면이 그 계정에게 이유를 말할 뿐이고, 정리는 운영자가 테넌트 쪽에 다시 만든 뒤 옛 계정을 끈다 · 진단 중 자격 파일의 값 가림 처리가 형식(`password  값`)을 못 맞춰 `hosub` 비밀번호가 작업 도구 출력에 한 번 찍혔다 — 저장소·채팅 본문에는 옮기지 않았고, 비밀번호 변경을 권했다. 배포(같은 날, 발표 전): hosub 빌드(75MB, `c89efb28…`, 이미지 232MB) → `.62` `upgrade-62-0.7.3.sh`(sha 검증 → `backup.sh` 스냅샷 테넌트 4 · 작업 1282 · 사용량 1281 → load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → 새 이미지로 사이트 설정 읽기: 역할 8 · 가드 규칙 23 · 카드 단서 full → `LCC_VERSION` 0.7.3 → `force-recreate` 15:45:00) → healthz 4초 · `/ui/` `/client/` 200 · 클라이언트 자산 `0.7.3-5122c337`(새 안내 함수 포함) · 플랫폼 테넌트에 사용자 계정 만들기 → 400 `user_account_needs_tenant`, 계정 목록은 그대로 셋 · doctor 통과(감사 체인 874행 · KEK 가 테넌트 3개의 DEK 를 풂) · 공개 주소도 0.7.3. 재기동 영향: 실가동 트래픽은 재기동 순간 조회 한 번이 끊겼지만(15:45:04) 그 작업이 살아남아 15:45:37 `ok`, 다음 요청 15:45:38 — 유닛 재시작 0회 · roxlogy 분기 그대로(16자리 → LLMCC `job_not_found` · 12자리 → 기존 게이트웨이). 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.7.2`) + `force-recreate` |
+| **운영 — 시험 테넌트 `test` · `test1` 이전** (2026-11-03, 0.7.3 그대로) | `test1`(사용자)이 플랫폼 테넌트의 `console` 서비스(허용 역할 없음)에 만들어져 클라이언트 페이지에서 아무것도 못 했다. 테넌트 `test`(이름 "테스트", ko-KR → 가드 팩 `ko_KR`)를 정식 API(`POST /v1/platform/tenants`)로 만들고 — 기본 서비스 `test-app`, 1회 발급 테넌트 관리자 토큰은 `.62` 의 600 파일 — `test-app` 의 허용 역할을 범용 다섯(요약·분류·분석·대화·임베딩)으로 좁혔다(`PUT /v1/admin/services/test-app` — roxlogy 전용 역할은 뺀다). **계정을 옮기는 API 는 없다** — 아이디·비밀번호를 그대로 두려고 컨테이너 안에서 이 제품의 저장소 코드로 `test1` 행의 테넌트·서비스를 `test`/`test-app` 으로 바꾸고, 옛 세션 1개를 끊고, 감사에 `move_account`(전후 값 · 사유)를 남겼다. 직전 백업 `llmcc-backup-20261103-154946.tgz` · doctor 통과(감사 체인 879행). `test1` 은 같은 비밀번호로 다시 로그인하면 「요청」·「대화」가 보인다. 되돌리기: 같은 방식으로 `_platform`/`console` 로 — 테넌트는 남겨도 무해. 계정 이전을 정식 기능(감사 · 세션 폐기 포함)으로 넣을지는 다음 판에서 정한다 |
+| **0.7.4 — 콘솔 「감사」 화면** (2026-11-03) | "프롬프트 감사 자료는 어디서 보나" 에 화면이 답하지 못했다 — 관리 감사 기록은 API(`GET /v1/admin/audit`)와 내보내기 JSON 으로만 봤고, 가드 탭은 검토 대기 탐지만 보였다. 테넌트 묶음에 「감사」(작업 바로 아래)를 더했다: ① 관리 감사 기록 — 시각 · 누가 · 동작 · 대상 · 내용 · 결과, 필터 「전체 / 원문 열람 / 계정·토큰 / 규칙·설정」. "누가" 는 감사의 actor(토큰 id)를 그 테넌트의 토큰 목록으로 풀어, 계정 세션이면 아이디를, 아니면 토큰 앞자리와 역할을 보인다(못 풀면 값 그대로) · 동작은 이름표가 있는 25개만 한국어로, 나머지는 코드 그대로 ② 가드 탐지 전체 이력 — 시각 · 규칙 · 단계 · 등급 · 경계 · 탐지 수 · 작업 · 서비스 · 검토. 매 요청 남는 2단 분류기 정상 표지(`_classifier_ok`)는 접고 수만 말한다(실패 표지는 보인다). 원문은 이 화면에서 열지 않는다 — 열람 사실만 보인다. 새 라우트 없음(이미 있던 API 셋만). 검증: pytest 1976 통과(`test_the_audit_page_shows_who_did_what_and_what_the_guard_caught`) · 로컬 데모 헤드리스: 카드번호가 든 요청 + 원문 열람 1회 → 감사 3행(원문 열람 1 · 토큰 발급 2), 탐지 4행(`credit_card:context` full · `email` audit, 경계 둘 다), 분류기 정상 표지 2건 접힘, 「원문 열람」 필터가 그 한 줄만 남김, 폰 너비 가로 넘침 없음, 콘솔 오류 0. 배포(같은 날): hosub 빌드 → `.62` `upgrade-62-0.7.4.sh`(sha 검증 → `backup.sh` 스냅샷 테넌트 5 · 작업 1328 · 사용량 1327 → load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → 새 이미지로 사이트 설정 읽기 → `LCC_VERSION` 0.7.4 → `force-recreate` 16:07:43) → healthz 4초 · `/ui/` `/client/` 200 · 콘솔 자산 `0.7.4-63448697`(감사 화면 포함) · 감사 화면이 읽는 API 를 테넌트마다: `default` 감사 33행 · 탐지 48행(분류기 정상 표지 152건 접힘 — 접지 않았다면 이력의 4분의 3이 표지였다) · `test` 감사 8행 · 탐지 2행 · `roxlogy` 감사 4행 · 탐지 0행 · doctor 통과(감사 체인 896행 · KEK 가 테넌트 4개의 DEK 를 풂) · 공개 주소도 0.7.4 · 실가동 트래픽 재시작 0회로 이어짐 · roxlogy 분기 그대로. 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.7.3`) + `force-recreate` |
+| **0.7.5 — 플랫폼 관리자 테넌트 보기** (2026-11-03) | "admin 이 플랫폼 테넌트에 있어서 test 테넌트 정보를 볼 수 없다 — admin 은 슈퍼유저로 모두 봐야 한다." 테넌트 관리 API 23개가 모두 요청 토큰의 테넌트만 봤다. 플랫폼 관리자는 원래 테넌트를 만들고 관리자 계정을 꽂을 수 있으니(그 권한으로 계정을 하나 더 만들어 들어가면 되는 일) 새 권한이 아니라 **기록이 남는 지름길**로 열었다: `/v1/admin/*` 에 `X-LCC-Tenant: <테넌트>` — 진입점 `_tenant_admin` 하나에서 플랫폼 관리자에게만 듣고(다른 역할은 403 `forbidden_platform_admin`, 없는 테넌트 404, 자기 테넌트면 아무 일 없음), 로케일 팩·한도·원문 복호화가 읽는 테넌트 행도 고른 테넌트로 바꾼다. **들여다본 테넌트의 감사에 `platform_view`** — 읽기는 플랫폼의 다른 경계 넘기와 같은 5분 창으로 합치고(15초마다 갱신하는 콘솔이 읽기마다 한 줄씩 쌓지 않게), 쓰기는 방법·경로를 적는다. 쓰기 자체는 각 핸들러가 원래대로 감사를 남기고 행위자는 플랫폼 토큰이다. 콘솔: 테넌트 묶음 머리의 「볼 테넌트」(플랫폼 관리자에게만 고르기 상자) · 머리글은 `/v1/admin/*` 에만 · 보는 동안 화면마다 배너와 「플랫폼으로 돌아가기」 · 고른 값은 세션 스토리지, 로그아웃이 지운다 · 감사 화면은 그 행위자를 "플랫폼 관리자" 로 보인다 (`api()` 는 클라이언트 페이지와 글자 그대로 같아야 해서 `scopeHeaders()` 자리를 두 파일에 두고, 클라이언트 쪽은 언제나 빈 값이다). 검증: pytest 1985 통과(`test_the_platform_admin_can_view_another_tenant` · `test_only_the_platform_admin_can_view_another_tenant` · `test_a_platform_view_is_recorded_in_the_viewed_tenant` · `test_the_platform_admin_reads_a_raw_prompt_of_the_viewed_tenant_on_the_record`) · `/v1/admin/*` 라우트 23개가 전부 그 진입점을 지나는지 대조 · 로컬 데모 헤드리스: admin 로그인 → 「볼 테넌트」 목록 Platform·Default·Acme·Globex → Acme 를 고르면 작업 1행과 배너, Acme 감사 첫 줄이 "플랫폼 관리자 — 플랫폼 열람"(읽기 둘이 한 줄로 합쳐짐), 머리글은 `/v1/admin/*` 요청에만 붙고 플랫폼 경로에는 0건, 「돌아가기」로 `_platform` 복귀·배너 사라짐, 콘솔 오류 0. 배포(같은 날): hosub 빌드 → `.62` `upgrade-62-0.7.5.sh`(sha 검증 → 백업 → load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → 새 이미지로 사이트 설정 읽기 → `LCC_VERSION` 0.7.5 → `force-recreate` 16:23:13) → healthz 4초 · `/ui/` `/client/` 200 · 콘솔 자산 `0.7.5-119e383d` · 실서버에서 플랫폼 관리자 토큰으로: 머리글 없이 작업 0건(`_platform`) · `X-LCC-Tenant: test` → test 의 작업 3건 · test 감사에 `platform_view` 1행(읽기 둘이 합쳐져 `repeats` 2) · `default` 테넌트 관리자가 머리글을 보내면 403 `forbidden_platform_admin` · 없는 테넌트 404 · doctor 통과(감사 체인 988행 · KEK 가 테넌트 4개의 DEK 를 풂) · 공개 주소도 0.7.5 · 실가동 트래픽 재시작 0회 · roxlogy 분기 그대로. 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.7.4`) + `force-recreate` |
+| **0.7.6 — 테넌트 한도 · 가드 규칙 화면** (2026-11-03) | "테넌트에 예산, 요청 한도, 가드 설정을 하는 화면이 보이지 않음." 한도 칸(`budget_usd_per_month` · `rate_limit_per_min`)은 테넌트 행에 있고 집행(CLUSTER-6 · AUTH-3)도 돌았지만 **바꾸는 길이 없었다** — 명세는 `PUT /v1/admin/settings` 를 그 표면으로 적어 놓고 핸들러는 로케일·보존 기간만 받았다. 가드 규칙은 API(`PUT` · `DELETE /v1/admin/guard/rules`)만 있고 화면은 표뿐이었다(명세는 저장을 `POST` 라 적었다). 한도: 같은 설정 경로에 두 칸 — **플랫폼 관리자만**(테넌트 관리자가 보내면 403 `forbidden_platform_admin` — 자기 한도를 올릴 수 있으면 한도가 아니다), 다른 테넌트는 0.7.5 의 `X-LCC-Tenant` 로. 콘솔: 설정 → 연결 정보 맨 위 「테넌트 한도」 카드(테넌트 관리자에게는 읽기 전용) · 플랫폼 「테넌트」 표의 「한도」. 가드: 「규칙 추가」(패턴 · 문맥) · 규칙 표의 「등급 올리기」(바닥은 지금 등급 — 기본 규칙은 id 와 등급만 보내고 서버가 베이스라인의 종류·패턴·체크섬·이름표·팩을 채운다) · 「이 테넌트가 더하거나 올린 규칙」 표의 삭제(올린 기본 규칙은 기본 등급으로). 켜진 기본 규칙 id 로 새 규칙을 만들면 거절한다 — 병합이 기본 패턴을 남겨 입력한 패턴이 안 듣는다. 곁들여 메운 빈칸 넷: ① **예산 0 은 "유료 경로 금지"** 인데 콘솔이 한도를 참·거짓으로 읽어 0 을 "한도 없음" 으로 보였고, 그렇게 채워진 폼(기존 서비스 편집 포함)을 저장하면 0 이 null(무제한)로 바뀌었다 → `hasLimit` · `limitValue` ② 설정 PUT 이 로케일을 쓴 뒤 보존 기간을 검증해, 거절된 요청이 로케일만 바꾸고 감사도 남기지 않았다 → 전부 검증한 뒤 쓴다 ③ JSON 파서가 받아 주는 `NaN` · `Infinity` 예산을 거절한다 ④ 검토 0건으로 막힌 차단 저장이 "오탐률(0.000)이 임계(0.020)를 넘어" 라고 했다 → 두 조건(검토한 건수와 최소 · 오탐률과 기준)을 숫자로, 409 에 `min_reviews`. 검증: pytest 2001 통과(`test_the_platform_admin_sets_tenant_limits` · `test_a_tenant_admin_cannot_raise_its_own_limits` · `test_a_refused_settings_request_changes_nothing` · `test_a_baseline_rule_grade_is_raised_with_its_id_and_grade_only` · `test_a_zero_limit_is_a_limit_on_screen` · `test_a_block_refused_for_lack_of_reviews_says_so`) · 로컬 데모 헤드리스: admin 이 Acme 를 골라 한도 $0.00 · 30/분 저장 → 다시 연 폼의 예산 칸 "0" · 테넌트 표도 같은 값 · email 「등급 올리기」 선택지 audit~block → full/full, 다시 열면 full·block 만 · 기본 id 로 추가는 거절 · `order_no` 추가 · credit_card → block 은 "검토한 탐지 0건(최소 20건)" · 삭제하면 audit 로 · Acme 테넌트 관리자 화면에는 편집 버튼 0개. 배포(같은 날): hosub 빌드(75MB, `761f7c2d…`, 이미지 232MB) → `.62` `upgrade-62-0.7.6.sh`(sha 검증 → 백업 스냅샷 테넌트 5 · 작업 1432 · 사용량 1431 → load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → 새 이미지로 사이트 설정 읽기: 역할 8 · 가드 규칙 23 → `LCC_VERSION` 0.7.6 → `force-recreate` 16:57:49) → healthz 4초 · `/ui/` `/client/` 200 · 자산 `0.7.6-253a0015`(한도 카드 · 등급 올리기 · `hasLimit` 들어 있음). **실서버 test 테넌트 실측:** 한도 지금 없음/없음 → 플랫폼 관리자가 머리글로 같은 값 저장 200 · test 테넌트 관리자가 자기 분당 한도를 올리면 403 `forbidden_platform_admin`, 값 그대로 · 손대지 않은 audit 기본 규칙 `email` 을 id·등급만으로 full/full 201(저장본에 패턴, 팩 common) → 검토 없이 block 409 `insufficient_reviews`(새 메시지) → 삭제 200 → audit/audit, 테넌트 규칙 0개로 처음과 같다 · doctor 통과(감사 체인 1122행 · KEK 가 테넌트 4개의 DEK 를 풂) · 공개 주소도 0.7.6 · 실가동 트래픽 재시작 0회(16:57:40 에 보낸 잡이 재기동을 건너 16:57:57 에 끝) · roxlogy 분기는 16자리 → LLMCC `job_not_found` · 12자리 → 기존 게이트웨이 `not_found` 그대로. 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.7.5`) + `force-recreate` — 정한 한도는 테넌트 행에 남아 그대로 듣는다 |
+| **0.8.0 — 계정의 테넌트 고르기 · 옮기기** (2026-11-06) | "사용자 계정을 생성하는데 테넌트를 지정할 수 없음, 사용자 계정의 테넌트를 수정도 할 수 있어야 함." 사용자 계정 탭은 「볼 테넌트」에 조용히 만들었고(플랫폼 관리자는 그것을 몰랐다), 관리자 계정 탭은 테넌트·서비스를 글자로 적게 했다(틀리면 404). 계정을 옮기는 길은 없었다 — 11월 3일 test1 은 컨테이너 안에서 행을 직접 고쳐 옮겼다. 서버: `POST /v1/platform/accounts/{username}/move`(플랫폼 관리자만 — 테넌트를 가로지른다) · 아이디·비밀번호·역할 그대로 · 놓일 자리는 만들 때와 같은 규칙(`user` 는 `_platform` 불가 · 테넌트와 그 서비스가 실재 · 서비스를 비우면 `<테넌트>-app`) · 행을 먼저 바꾸고 옛 테넌트의 세션을 끊는다(거꾸로면 그 사이 로그인이 살아남는다) · 감사 `move_account` 는 두 테넌트에 모두 · 같은 자리면 아무것도 하지 않는다. `GET /v1/platform/accounts` 가 폼 선택지(테넌트별 서비스와 허용 역할)를 같이 준다 · CLI `account move`. 콘솔: 두 계정 탭 모두 테넌트·서비스를 실재하는 것 중에서 고른다(user 는 플랫폼 테넌트를 못 고르고, 허용 역할이 빈 서비스는 미리 경고) · 테넌트 관리자에게는 만들 테넌트가 고정으로 보인다 · 행마다 「테넌트 변경」(플랫폼 관리자, 자기 계정 제외) · 「관리자 계정」 탭 → 「전체 계정」. 새 관리 라우트라 마이너다 — 예제 플러그인 범위 `>=0.6,<0.9`. 검증: pytest 2011 통과(`test_the_platform_moves_an_account_to_another_tenant` · `test_a_move_is_recorded_in_both_tenants` · `test_a_move_follows_the_creation_rules` · `test_the_account_command_moves_an_account_between_tenants` · `test_accounts_are_placed_in_a_tenant_picked_from_real_ones`) · 로컬 데모 헤드리스: 전체 계정 → 계정 만들기(역할 user 가 기본, 테넌트 선택지에서 `_platform` 막힘, default/default-app 이 기본, platform_admin 으로 바꾸면 `_platform`/console) → acme 에 kim 생성("acme 테넌트에 계정을 만들었습니다") → 「테넌트 변경」으로 globex/globex-web → 같은 자리는 "바꾼 것이 없습니다" · admin 자기 행에는 버튼 없음 · 사용자 계정 탭(플랫폼 관리자)은 역할 칸을 숨기고 테넌트를 고른다 · 테넌트 관리자는 "테넌트 Acme (acme)" 고정, 버튼 없음 · 콘솔 오류 0. 배포(같은 날): hosub 빌드(75MB, `4e857365…`, 이미지 232MB) → `.62` `upgrade-62-0.8.0.sh`(sha 검증 → 백업 스냅샷 테넌트 5 · 작업 1782 · 사용량 1781 → load → 파일 교체 — `.env`·`keys/`·`config/` 보존 → 새 이미지로 사이트 설정 읽기: 역할 8 · 가드 규칙 23 → `LCC_VERSION` 0.8.0 → `force-recreate` 16:40:16) → healthz 4초 · `/ui/` `/client/` 200 · 자산 `0.8.0-5e0bc6d9`(테넌트 고르기 · 테넌트 변경 들어 있음). **실서버 실측 — 계정은 실제로 옮기지 않았다(test1 의 세션을 끊지 않으려고):** 폼 선택지에 테넌트 넷과 그 서비스 · test1(user, test/test-app)을 같은 자리로 → 200 `moved: false` · 끊은 세션 0 · user 를 `_platform` 으로 → 400 `user_account_needs_tenant` · test 테넌트 관리자가 옮기려 하면 403 `forbidden_platform_admin` · 없는 계정 404 · test1 그대로 · 예제 플러그인 둘은 9월 12일부터 꺼진 그대로(업그레이드와 무관) · doctor 통과(감사 체인 1262행 · KEK 가 테넌트 4개의 DEK 를 풂) · 공개 주소도 0.8.0 · roxlogy 분기는 16자리 → LLMCC `job_not_found` · 12자리 → 기존 게이트웨이 `not_found` 그대로 · 시연 트래픽 유닛은 11월 3일 23:00 끝 시각에 스스로 멈춘 상태(보냄 1666 · 성공 1665). 되돌리기는 `.env` 한 줄(`LCC_VERSION=0.7.6`) + `force-recreate` — 옮겨 둔 계정은 옮긴 자리에 남는다 |
+
+---
+
+## 6. 알고 넘어가는 것
+
+첫 배포에서 특히 설명이 필요한 것만 — 전체는 [README 부채 표](../README.md#열어두는-부채).
+
+- **관리 신원은 로컬 계정뿐이다.** 관제 UI 는 `admin` 계정으로 들어가지만 IdP·MFA 가 없다. 관리자 퇴사는 계정 정지(`account disable`)와 토큰 폐기로 사람이 처리한다
+- **컨트롤 플레인은 1대다**(SPOF). 의도한 선택이고 Scale 프로파일에서 푼다
+- **토큰 처리율은 보여 주기만 하고 한도로 걸지 않는다.** 설치처 분포를 본 뒤 건다
+- **플러그인은 플랫폼 테넌트 전용이다.** 토큰 회전·재발급은 0.6.0 부터 `rotate-token` 으로 한다 — 콘솔 「토큰 회전」은 유예 60분
+  ([plugin-authoring §5](plugin-authoring.md), [plugin-exploration §11](plugin-exploration.md))
+- **가드 2단·라우팅 분류기는 인증(certify)이 끝나야 판정한다.** 기동 직후 `doctor` 가
+  `model_not_certified` 를 경고하는 것은 정상이고, 스케줄러가 자동 인증한다
+- **첫 설치처(2026-09-10)는 2코어·4GB 노트북이고 Wi-Fi 로 붙어 있다.** 컨트롤 플레인은
+  31MB 로 돌지만, 유선이 가능해지면 옮기는 편이 낫다 — 게이트웨이의 가용성이 무선 품질에 매인다
